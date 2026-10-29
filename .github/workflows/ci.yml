@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      # The published pi types are the contract: ExtensionContext carries only
+      # cwd + sessionManager, ExtensionAPI has no cwd. A field that exists only
+      # in a fork's types fails here instead of on a user's machine.
+      - run: npm ci --no-audit --no-fund
+      - run: npx tsc -p tsconfig.json --noEmit
