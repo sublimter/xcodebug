@@ -148,7 +148,12 @@ function resolveAgentDir(ctx: ExtensionContext): string {
     const sessionDir = ctx.sessionManager?.getSessionDir?.();
     if (typeof sessionDir === "string" && sessionDir.length > 0) {
       const parent = dirname(sessionDir);
-      if (basename(parent) === "sessions") return dirname(parent);
+      // Default layout is `<agentDir>/sessions/<encoded-cwd>`, so the agent dir is
+      // the grandparent. A host run with an explicit session store (`--session-dir`
+      // or PI_CODING_AGENT_SESSION_DIR) points getSessionDir straight at that store
+      // with no per-cwd level, and the analogue of the agent dir is its parent.
+      // Without this branch such a host made every action that writes a log throw.
+      return basename(parent) === "sessions" ? dirname(parent) : parent;
     }
   } catch {
     // No session manager in this context; try the environment override.
