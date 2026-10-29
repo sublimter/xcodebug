@@ -1,0 +1,51 @@
+{
+  "name": "xcodebug-extension",
+  "version": "1.0.0",
+  "description": "Build, install and launch an iOS app on a physical device and read its console inside the agent session (pi / omp extension)",
+  "keywords": [
+    "pi-package",
+    "ios",
+    "xcode",
+    "device",
+    "debugging",
+    "console",
+    "devicectl"
+  ],
+  "author": "codebaby <liuxingsky555@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sublimter/xcodebug.git"
+  },
+  "homepage": "https://github.com/sublimter/xcodebug#readme",
+  "bugs": {
+    "url": "https://github.com/sublimter/xcodebug/issues"
+  },
+  "files": [
+    "*.ts",
+    "README.md",
+    "GUIDE.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "omp": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5"
+  }
+}

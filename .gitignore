@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Build/publish artifacts
+*.tgz
+dist/
+
+# Editor and OS noise
+.DS_Store
+*.swp
+
+# Local runtime output
+*.log
