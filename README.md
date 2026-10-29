@@ -23,9 +23,13 @@ The extension is a directory with `index.ts` plus a `pi` manifest; either instal
 it as a package or drop the directory in place.
 
 ```bash
-# as a package (writes to ~/.pi/agent/settings.json)
-pi install /path/to/xcodebug          # or npm:/git: once published
-pi install /path/to/xcodebug -l       # project scope: .pi/settings.json
+# from npm (writes to ~/.pi/agent/settings.json)
+pi install npm:xcodebug-extension
+pi install npm:xcodebug-extension -l      # project scope: .pi/settings.json
+
+# pin a version, or install from a checkout
+pi install npm:xcodebug-extension@1.0.0
+pi install /path/to/xcodebug
 ```
 
 Or copy the directory into the global extensions dir, which the engine discovers
