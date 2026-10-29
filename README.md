@@ -24,11 +24,11 @@ it as a package or drop the directory in place.
 
 ```bash
 # from npm (writes to ~/.pi/agent/settings.json)
-pi install npm:xcodebug-extension
-pi install npm:xcodebug-extension -l      # project scope: .pi/settings.json
+pi install npm:xcodebug
+pi install npm:xcodebug -l      # project scope: .pi/settings.json
 
 # pin a version, or install from a checkout
-pi install npm:xcodebug-extension@1.0.0
+pi install npm:xcodebug@1.0.0
 pi install /path/to/xcodebug
 ```
 

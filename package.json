@@ -1,15 +1,18 @@
 {
-  "name": "xcodebug-extension",
+  "name": "xcodebug",
   "version": "1.0.0",
   "description": "Build, install and launch an iOS app on a physical device and read its console inside the agent session (pi / omp extension)",
   "keywords": [
     "pi-package",
+    "pi-extension",
     "ios",
     "xcode",
-    "device",
-    "debugging",
-    "console",
-    "devicectl"
+    "xcodebuild",
+    "devicectl",
+    "ios-device",
+    "device-debugging",
+    "log-capture",
+    "oslog"
   ],
   "author": "codebaby <liuxingsky555@gmail.com>",
   "license": "MIT",
