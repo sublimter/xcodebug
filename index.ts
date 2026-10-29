@@ -1967,16 +1967,25 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // earlier run may still be live for another app. Stopping a single
       // arbitrary one would leave bridges streaming after the user asked for
       // silence, so the no-selector form closes every running capture.
+      // `stop` is the last step of a run, often after the app was terminated or
+      // exited on its own - in which case the captures already ended and there is
+      // nothing left to close. That is the state the caller asked for, so it
+      // reports success; only an explicitly named capture that never existed is
+      // an error (requireCapture throws for that).
       const targets = params.captureId
         ? [requireCapture(params.captureId)]
         : [...state.captures.values()].filter((c) => c.running);
       if (targets.length === 0) {
         const known = [...state.captures.values()].map((c) => `${c.id} (${c.mode}, ended)`);
-        throw new Error(
-          known.length > 0
-            ? `Nothing is running. Ended captures: ${known.join(", ")}`
-            : "No active capture. Run xcodebug with action=launch (or action=syslog) first.",
-        );
+        return {
+          content: [{
+            type: "text",
+            text: known.length > 0
+              ? `nothing to stop - every capture has already ended: ${known.join(", ")}`
+              : "nothing to stop - no capture has been started in this session",
+          }],
+          details: { captures: [...state.captures.values()].map((capture) => capture.status()) },
+        };
       }
       for (const capture of targets) stopCapture(capture, !keepApp);
       for (const capture of targets) await capture.waitForExit(5_000);
