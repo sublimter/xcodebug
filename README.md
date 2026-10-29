@@ -32,6 +32,15 @@ pi install npm:xcodebug@1.0.0
 pi install /path/to/xcodebug
 ```
 
+**Upgrading from `xcodebug-extension`:** the package was renamed, so both names
+register the same `xcodebug` tool and the loader refuses to start the second one
+(`Tool "xcodebug" conflicts with ...`). Remove the old package first:
+
+```bash
+pi remove npm:xcodebug-extension
+pi install npm:xcodebug
+```
+
 Or copy the directory into the global extensions dir, which the engine discovers
 on startup:
 
