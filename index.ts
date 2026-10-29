@@ -136,10 +136,13 @@ interface SessionState {
  * path would drop build and console logs somewhere nobody looks.
  */
 function resolveAgentDir(ctx: ExtensionContext): string {
-  // Declared on ExtensionContext, but not every runtime populates it: read it as
-  // unknown so the missing case is handled instead of asserted away.
-  const direct: unknown = ctx.agentDir;
-  if (typeof direct === "string" && direct.length > 0) return direct;
+  // `agentDir` is not part of the published ExtensionContext (pi 1.4.0 has only
+  // `cwd` and `sessionManager`); some hosts add it. `in` keeps this compiling
+  // against the published types while still honouring a host that supplies it.
+  if ("agentDir" in ctx) {
+    const direct = ctx.agentDir;
+    if (typeof direct === "string" && direct.length > 0) return direct;
+  }
 
   try {
     const sessionDir = ctx.sessionManager?.getSessionDir?.();
@@ -165,18 +168,21 @@ function resolveAgentDir(ctx: ExtensionContext): string {
 /**
  * The project directory every file lookup is anchored to.
  *
- * `pi.cwd` is the documented anchor, but not every runtime supplies it: pi 1.4.0
- * builds the extension API without it, so `detectContainer(undefined)` walked
- * nowhere and `build`/`launch` failed with "No scheme found. Container: (none)"
- * even when run from inside the workspace. Read it as unknown and fall back the
- * same way `resolveAgentDir` does - first the tool context, then the process cwd,
- * which is where the runtime itself was started from.
+ * The anchor is the tool context's `cwd`, which the published types declare and
+ * every host populates. `pi.cwd` is not in the published `ExtensionAPI` (pi 1.4.0
+ * omits it), so it is only consulted when a host happens to add it; the process
+ * cwd is the last resort. Reading the wrong one here is not cosmetic:
+ * `detectContainer(undefined)` walks nowhere, and build/launch then fail with
+ * "No scheme found. Container: (none)" even from inside the workspace.
  */
 function resolveProjectRoot(pi: ExtensionAPI, ctx?: ExtensionContext): string {
-  const fromPi: unknown = pi.cwd;
-  if (typeof fromPi === "string" && fromPi.length > 0) return fromPi;
-  const fromCtx: unknown = ctx?.cwd;
+  // `ctx.cwd` is the published field; `pi.cwd` is an addition some hosts carry.
+  const fromCtx = ctx?.cwd;
   if (typeof fromCtx === "string" && fromCtx.length > 0) return fromCtx;
+  if ("cwd" in pi) {
+    const fromPi = pi.cwd;
+    if (typeof fromPi === "string" && fromPi.length > 0) return fromPi;
+  }
   return process.cwd();
 }
 
@@ -2148,9 +2154,18 @@ export default function xcodebug(pi: ExtensionAPI): void {
    * action word is honoured when present (/xcodebug logs, /xcodebug stop);
    * anything else is treated as the goal of a launch.
    */
+  // `argumentHint` is a host addition (the published RegisteredCommand has only
+  // name/description/handler). Spreading a typed object passes it through to hosts
+  // that read it and is ignored by those that do not, which keeps this compiling
+  // against the published types without dropping the hint where it is supported.
+  const commandExtras: { argumentHint?: string } = {
+    argumentHint:
+      '[what to verify] | [what to verify] command="cd /repo && npm run test:xxx" | <action> [key=value ...]',
+  };
+
   pi.registerCommand("xcodebug", {
     description: "Build, install and launch the current project on a device, then stream its console; command=\"<shell line>\" runs a test command to completion and stops the capture",
-    argumentHint: "[what to verify] | [what to verify] command=\"cd /repo && npm run test:xxx\" | <action> [key=value ...]",
+    ...commandExtras,
     handler: async (args, ctx) => {
       const parsed = parseCommandArgs(args);
       ctx.ui.notify(`xcodebug: ${parsed.action}${parsed.match ? ` (${parsed.match})` : ""}…`, "info");

@@ -63,17 +63,26 @@ The only engine import is a type import, erased at compile time:
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 ```
 
-That is the official specifier; the engine's loader also aliases
-`@code-yeongyu/senpi` and the `@mariozechner/*` names to the same module, so
-either typechecks, but naming the official one keeps this file independent of a
-single distribution. `typebox` is the other dependency, for tool parameter
-schemas. Everything else is `node:` built-ins.
+That is the official specifier; loaders also alias `@code-yeongyu/senpi` and the
+`@mariozechner/*` names to the same module. `typebox` is the other dependency,
+for tool parameter schemas. Everything else is `node:` built-ins.
 
-The agent directory is not read from a constant: `ctx.agentDir` when the runtime
-supplies it, else the parent of `ctx.sessionManager.getSessionDir()` (every
-brand stores sessions at `<agentDir>/sessions/<encoded-cwd>`), else a
-`*_CODING_AGENT_DIR` environment override. If none of those exist the extension
-fails with that list rather than writing logs to a guessed path.
+The extension is written against the **published** types, and that is enforced:
+it typechecks against `@earendil-works/pi-coding-agent@1.4.0`, whose
+`ExtensionContext` carries only `cwd` and `sessionManager` and whose
+`ExtensionAPI` has no `cwd`. Hosts that add more - `ctx.agentDir`, `pi.cwd`,
+`argumentHint` on a command - are supported without depending on them:
+
+```typescript
+if ("agentDir" in ctx) { /* host supplies it */ }
+```
+
+So the same file runs unchanged on every distribution, and a host that omits
+those fields loses nothing: the project root falls back to `ctx.cwd`, and the
+agent directory to the session directory's parent (every brand stores sessions at
+`<agentDir>/sessions/<encoded-cwd>`), then to a `*_CODING_AGENT_DIR` environment
+override. If none of those exist the extension fails naming what was missing
+rather than writing logs to a guessed path.
 
 ## Configure (optional)
 
