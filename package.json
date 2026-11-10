@@ -26,6 +26,7 @@
   },
   "files": [
     "*.ts",
+    "mcp/",
     "README.md",
     "GUIDE.md",
     "LICENSE"
