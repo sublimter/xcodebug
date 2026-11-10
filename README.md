@@ -57,39 +57,86 @@ extension: pi has no reload command at all, and omp's `/reload-plugins` only
 clears plugin discovery, not the imported module graph. Editing `index.ts` while
 a session is running therefore has no effect on that session.
 
-## Codex CLI (MCP)
+## Claude Code and Codex (MCP)
 
-Codex has no in-process extension API; tools reach it as MCP servers. `mcp/server.ts`
-is that adapter: it loads `index.ts` with a stub host and serves the tool it
-registers, so the extension itself is unchanged and behaves identically under pi
-and Codex.
+Neither client has an in-process extension API - tools reach them as MCP servers.
+`mcp/server.ts` is that adapter: it loads `index.ts` with a stub host and serves
+the tool it registers, so it exposes the same actions and arguments as the pi
+extension rather than a parallel implementation.
+
+### Set up (once per machine)
 
 ```bash
-codex mcp add xcodebug -- node /path/to/xcodebug/mcp/server.ts
+npm i -g xcodebug          # >= 1.1.0, the first release that ships mcp/
+codex  mcp add xcodebug -- node "$(npm root -g)/xcodebug/mcp/server.ts"
+claude mcp add xcodebug -- node "$(npm root -g)/xcodebug/mcp/server.ts"
 ```
 
-The same command works for any MCP client, e.g. Claude Code:
+Working from a checkout instead? Point both at `mcp/server.ts` in the repo:
 
 ```bash
+codex  mcp add xcodebug -- node /path/to/xcodebug/mcp/server.ts
 claude mcp add xcodebug -- node /path/to/xcodebug/mcp/server.ts
 ```
 
-Three things differ from the pi setup:
+`node` >= 22.18 is enough: the imports carry explicit `.ts` extensions and the
+package declares `"type": "module"`, so there is no build step and no Bun.
 
-- **The launch directory is the project root.** The server inherits its cwd from
-  whoever starts it, so `changes`/`launch` operate on the project the client was
-  started in.
-- **`push` is refused.** MCP has no channel that injects content into a running
-  turn, and neither client renders `notifications/message`: measured on Codex and
-  on Claude Code, where the model reported that nothing arrived on its own
-  between two tool calls. Pass `push=off` (the default here) and read with
-  `action=logs`, which is cursor-based and returns only new lines.
-  `wait match="..."` still blocks until an expected line appears.
-- **`node` >= 22.18 is enough.** The imports carry explicit `.ts` extensions and
-  the package declares `"type": "module"`, so no build step and no Bun is needed.
+Check that the client picked it up:
+
+```bash
+codex  mcp list     # xcodebug  node …
+claude mcp list     # xcodebug: … ✔ Connected
+```
+
+### Use
+
+Start the client **in the project directory**. The server inherits its cwd, and
+that directory is the project root every action resolves against.
+
+```bash
+cd ~/myapp          # holds the .xcworkspace or .xcodeproj
+codex               # or: claude
+```
+
+Then ask for the outcome; the model calls the tool:
+
+```text
+Build and launch on my device, then show me the console.
+```
+
+The actions that matter in this mode:
+
+```text
+action=launch device=<udid>     build + install + launch; the capture starts
+action=logs since=0             incremental read - the cursor is per capture
+action=logs grep=Weather        narrow to one subsystem
+action=wait match="..."         block until a line appears
+action=status                   captures, line counts, log paths
+action=stop                     close every running capture
+```
+
+### What differs from pi
+
+| | pi / omp / omo | Claude Code / Codex |
+|---|---|---|
+| how the tool is exposed | registered in-process | MCP server process |
+| status line, widget | yes | none |
+| `push` | mirrors new lines into the session | refused |
+| capture state | in the session | in the server process |
+| lifetime | the session | the client process |
+
+- **`push` is refused on purpose.** MCP has no channel that injects content into a
+  running turn, and neither client renders `notifications/message` - measured on
+  both, where the model reported that nothing arrived on its own between two tool
+  calls. Read with `action=logs` or `action=wait`; both are pull-based, and the
+  cursor means you only pay for new lines.
+- **Captures end with the client.** The server is a child of Codex/Claude, so
+  quitting the client stops the bridges. Relaunch next session.
 
 Logs land in `~/.xcodebug/logs/xcodebug/`, or under `XCODEBUG_AGENT_DIR` when set.
-The tool response also reports the exact path.
+Every response also reports the exact path, so the model can read the file once a
+run is over.
 
 ## Requirements
 
@@ -99,6 +146,7 @@ The tool response also reports the exact path.
 | `idevicesyslog` from libimobiledevice | optional; only `syslog` and the dual-channel safety net |
 | git | change detection; without a repo every run rebuilds |
 | CocoaPods | optional; only projects with a `Podfile` |
+| Node >= 22.18 | only for the MCP clients (Claude Code, Codex); pi runs the extension itself |
 
 `xcodebug action=doctor` reports which of these are present.
 
