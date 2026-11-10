@@ -80,8 +80,9 @@ Three things differ from the pi setup:
   whoever starts it, so `changes`/`launch` operate on the project the client was
   started in.
 - **`push` is refused.** MCP has no channel that injects content into a running
-  turn, so pushed log lines cannot arrive - Codex was measured not rendering MCP
-  notifications either. Pass `push=off` (the default here) and read with
+  turn, and neither client renders `notifications/message`: measured on Codex and
+  on Claude Code, where the model reported that nothing arrived on its own
+  between two tool calls. Pass `push=off` (the default here) and read with
   `action=logs`, which is cursor-based and returns only new lines.
   `wait match="..."` still blocks until an expected line appears.
 - **`node` >= 22.18 is enough.** The imports carry explicit `.ts` extensions and
