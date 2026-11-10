@@ -83,7 +83,9 @@ export function runCommand(
       const next = current + chunk;
       if (next.length <= maxBytes) return next;
       truncated = true;
-      return next.slice(-Math.floor(maxBytes * 0.75));
+      // `slice(-0)` is `slice(0)`, which would keep the whole buffer: clamp to at
+      // least one character so a tiny cap still truncates.
+      return next.slice(-Math.max(1, Math.floor(maxBytes * 0.75)));
     };
 
     const finish = (code: number): void => {

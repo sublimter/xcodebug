@@ -7,15 +7,17 @@
  * tool's execute. index.ts stays untouched, which is what keeps the pi path
  * behaving exactly as verified across pi, omp and omo.
  *
- * Run it with bun, not node: the extension uses extensionless relative imports
- * (`./capture`) that Bun resolves and Node's ESM loader does not.
+ * Run it with node (>= 22.18) or bun: the extension's imports carry explicit
+ * `.ts` extensions and the package declares "type": "module", so Node's ESM
+ * loader resolves them with no build step.
  *
- *   codex mcp add xcodebug -- bun /path/to/xcodebug/mcp/server.ts
+ *   codex mcp add xcodebug -- node /path/to/xcodebug/mcp/server.ts
  *
  * The protocol is hand-written JSON-RPC over stdio because only three methods are
  * needed (initialize, tools/list, tools/call); the official SDK would add ~97
  * transitive packages to every install, including the pi users who never run MCP.
  */
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -40,7 +42,7 @@ interface RegisteredTool {
   execute(
     toolCallId: string,
     params: unknown,
-    signal: undefined,
+    signal: AbortSignal | undefined,
     onUpdate: undefined,
     ctx: ExtensionContextLike,
   ): Promise<ToolResult>;
@@ -58,6 +60,12 @@ interface StubPi {
 const AGENT_DIR = process.env.XCODEBUG_AGENT_DIR ?? join(homedir(), ".xcodebug");
 const PROTOCOL_VERSION = "2024-11-05";
 
+// Reported to clients on initialize; read from the package so a version bump does
+// not leave the handshake advertising the previous release.
+const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+  version: string;
+};
+
 let registered: RegisteredTool | undefined;
 const stubPi: StubPi = {
   cwd: process.cwd(),
@@ -71,10 +79,10 @@ const stubPi: StubPi = {
   },
 };
 
-// Dynamic import is required: the extension is loaded as a plugin at run time, and
-// the specifier is extensionless because Bun resolves it while a static import
-// would force a build step. The cast is the adapter boundary: the extension
-// declares the full ExtensionAPI, this server supplies only the members it reads.
+// Dynamic import because the extension is a plugin: it is loaded at run time,
+// once the stub host exists, rather than imported for its side effects at start
+// up. The cast is the adapter boundary: the extension declares the full
+// ExtensionAPI, this server supplies only the members it reads.
 const extensionModule = (await import("../index.ts")) as unknown as {
   default(pi: StubPi): void;
 };
@@ -102,7 +110,7 @@ function replyError(id: unknown, code: number, message: string): void {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`);
 }
 
-async function callTool(args: Record<string, unknown>): Promise<ToolResult> {
+async function callTool(args: Record<string, unknown>, signal: AbortSignal): Promise<ToolResult> {
   // `defaultPushMode` defaults to "context", but this transport cannot deliver
   // pushed lines. Refusing an explicit request beats accepting it and going quiet.
   if (args.push !== undefined && args.push !== "off") {
@@ -111,7 +119,7 @@ async function callTool(args: Record<string, unknown>): Promise<ToolResult> {
       isError: true,
     };
   }
-  return tool.execute("mcp", { ...args, push: "off" }, undefined, undefined, ctx);
+  return tool.execute("mcp", { ...args, push: "off" }, signal, undefined, ctx);
 }
 
 async function handle(message: Record<string, unknown>): Promise<void> {
@@ -125,7 +133,7 @@ async function handle(message: Record<string, unknown>): Promise<void> {
     reply(id, {
       protocolVersion: requested ?? PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: "xcodebug", version: "1.0.0" },
+      serverInfo: { name: "xcodebug", version: pkg.version },
     });
     return;
   }
@@ -143,10 +151,16 @@ async function handle(message: Record<string, unknown>): Promise<void> {
       replyError(id, -32602, `Unknown tool "${params.name ?? ""}"`);
       return;
     }
+    // Registered before the call starts so a cancellation that arrives while it
+    // runs finds the controller; `finally` keeps the map from growing.
+    const controller = new AbortController();
+    inflight.set(id, controller);
     try {
-      reply(id, await callTool(params.arguments ?? {}));
+      reply(id, await callTool(params.arguments ?? {}, controller.signal));
     } catch (error) {
       reply(id, { content: [{ type: "text", text: (error as Error).message }], isError: true });
+    } finally {
+      inflight.delete(id);
     }
     return;
   }
@@ -156,6 +170,8 @@ async function handle(message: Record<string, unknown>): Promise<void> {
 // Requests are serialized: a capture's state is a plain map, and two overlapping
 // calls (launch + stop) would interleave mutations on it.
 let queue: Promise<void> = Promise.resolve();
+/** Calls running right now, so a cancellation can reach the one it names. */
+const inflight = new Map<unknown, AbortController>();
 createInterface({ input: process.stdin }).on("line", (line) => {
   const text = line.trim();
   if (text.length === 0) return;
@@ -164,6 +180,14 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     message = JSON.parse(text) as Record<string, unknown>;
   } catch {
     replyError(null, -32700, "Parse error");
+    return;
+  }
+  // Handled here rather than in handle(): the queue serializes calls, so a
+  // cancellation queued behind the very call it targets could never arrive in
+  // time. It is a notification, so nothing is sent back.
+  if (message.method === "notifications/cancelled") {
+    const requestId = (message.params as { requestId?: unknown } | undefined)?.requestId;
+    inflight.get(requestId)?.abort();
     return;
   }
   queue = queue.then(() => handle(message)).catch((error: unknown) => {
