@@ -7,11 +7,12 @@
  * tool's execute. index.ts stays untouched, which is what keeps the pi path
  * behaving exactly as verified across pi, omp and omo.
  *
- * Run it with node (>= 22.18) or bun: the extension's imports carry explicit
- * `.ts` extensions and the package declares "type": "module", so Node's ESM
- * loader resolves them with no build step.
+ * Run it with bun. Node can load this file from a checkout, but not from
+ * node_modules: it refuses to strip types there
+ * (ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING), and that is where npm installs
+ * the package.
  *
- *   codex mcp add xcodebug -- node /path/to/xcodebug/mcp/server.ts
+ *   codex mcp add xcodebug -- bun /path/to/xcodebug/mcp/server.ts
  *
  * The protocol is hand-written JSON-RPC over stdio because only three methods are
  * needed (initialize, tools/list, tools/call); the official SDK would add ~97

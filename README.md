@@ -68,24 +68,27 @@ extension rather than a parallel implementation.
 
 ```bash
 npm i -g xcodebug          # >= 1.1.0, the first release that ships mcp/
-codex  mcp add xcodebug -- node "$(npm root -g)/xcodebug/mcp/server.ts"
-claude mcp add xcodebug -- node "$(npm root -g)/xcodebug/mcp/server.ts"
+codex  mcp add xcodebug -- bun "$(npm root -g)/xcodebug/mcp/server.ts"
+claude mcp add xcodebug -- bun "$(npm root -g)/xcodebug/mcp/server.ts"
 ```
 
 Working from a checkout instead? Point both at `mcp/server.ts` in the repo:
 
 ```bash
-codex  mcp add xcodebug -- node /path/to/xcodebug/mcp/server.ts
-claude mcp add xcodebug -- node /path/to/xcodebug/mcp/server.ts
+codex  mcp add xcodebug -- bun /path/to/xcodebug/mcp/server.ts
+claude mcp add xcodebug -- bun /path/to/xcodebug/mcp/server.ts
 ```
 
-`node` >= 22.18 is enough: the imports carry explicit `.ts` extensions and the
-package declares `"type": "module"`, so there is no build step and no Bun.
+Bun is required ([bun.sh](https://bun.sh)). The sources are TypeScript, and Node
+refuses to strip types for files under `node_modules`
+(`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) - which is exactly where npm
+installs the package, so `node` cannot start an installed copy. Bun loads the
+same file from either location, so one command covers both.
 
 Check that the client picked it up:
 
 ```bash
-codex  mcp list     # xcodebug  node …
+codex  mcp list     # xcodebug  bun …
 claude mcp list     # xcodebug: … ✔ Connected
 ```
 
@@ -146,9 +149,10 @@ run is over.
 | `idevicesyslog` from libimobiledevice | optional; only `syslog` and the dual-channel safety net |
 | git | change detection; without a repo every run rebuilds |
 | CocoaPods | optional; only projects with a `Podfile` |
-| Node >= 22.18 | only for the MCP clients (Claude Code, Codex); pi runs the extension itself |
+| Bun | only for the MCP clients (Claude Code, Codex); pi runs the extension itself |
 
-`xcodebug action=doctor` reports which of these are present.
+`xcodebug action=doctor` reports the Xcode toolchain, the capture tools, the
+active config and the log directory.
 
 ## Imports
 
