@@ -27,7 +27,9 @@ import { createInterface } from "node:readline";
 interface ExtensionContextLike {
   cwd: string;
   agentDir: string;
-  ui: { notify(): void; setStatus(): void; setWidget(): void };
+  /** The status ticker in index.ts only runs when this is set. */
+  hasUI?: boolean;
+  ui: { notify(): void; setStatus(key: string, text?: string): void; setWidget(): void };
 }
 
 interface ToolResult {
@@ -94,11 +96,44 @@ if (!registered) {
 }
 const tool = registered;
 
-const ctx: ExtensionContextLike = {
-  cwd: process.cwd(),
-  agentDir: AGENT_DIR,
-  ui: { notify() {}, setStatus() {}, setWidget() {} },
-};
+function sendNotification(method: string, params: unknown): void {
+  process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
+}
+
+// While an action runs, index.ts repaints its status line once a second. That is
+// the same cadence MCP progress wants, so the status text becomes the progress
+// message instead of being dropped. `hasUI` is what makes that ticker run at all.
+function makeCtx(progressToken: unknown): { ctx: ExtensionContextLike; close(): void } {
+  let step = 0;
+  let active = true;
+  const report = (text: string | undefined): void => {
+    if (!active) return;
+    if (progressToken === undefined || progressToken === null) return;
+    if (text === undefined || text === "") return;
+    step += 1;
+    sendNotification("notifications/progress", { progressToken, progress: step, message: text });
+  };
+  return {
+    ctx: {
+      cwd: process.cwd(),
+      agentDir: AGENT_DIR,
+      hasUI: true,
+      ui: {
+        notify() {},
+        setStatus(_key, text) {
+          report(text);
+        },
+        setWidget() {},
+      },
+    },
+    // The status ticker keeps running while a capture is alive, which outlives
+    // the call that started it. Without closing, the adapter would keep
+    // reporting progress for a request that already answered.
+    close() {
+      active = false;
+    },
+  };
+}
 
 // Typebox attaches symbol metadata; JSON round-tripping leaves a plain schema.
 const inputSchema = JSON.parse(JSON.stringify(tool.parameters)) as Record<string, unknown>;
@@ -111,7 +146,11 @@ function replyError(id: unknown, code: number, message: string): void {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`);
 }
 
-async function callTool(args: Record<string, unknown>, signal: AbortSignal): Promise<ToolResult> {
+async function callTool(
+  args: Record<string, unknown>,
+  signal: AbortSignal,
+  progressToken: unknown,
+): Promise<ToolResult> {
   // `defaultPushMode` defaults to "context", but this transport cannot deliver
   // pushed lines. Refusing an explicit request beats accepting it and going quiet.
   if (args.push !== undefined && args.push !== "off") {
@@ -120,7 +159,12 @@ async function callTool(args: Record<string, unknown>, signal: AbortSignal): Pro
       isError: true,
     };
   }
-  return tool.execute("mcp", { ...args, push: "off" }, signal, undefined, ctx);
+  const progress = makeCtx(progressToken);
+  try {
+    return await tool.execute("mcp", { ...args, push: "off" }, signal, undefined, progress.ctx);
+  } finally {
+    progress.close();
+  }
 }
 
 async function handle(message: Record<string, unknown>): Promise<void> {
@@ -147,7 +191,11 @@ async function handle(message: Record<string, unknown>): Promise<void> {
     return;
   }
   if (method === "tools/call") {
-    const params = (message.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
+    const params = (message.params ?? {}) as {
+      name?: string;
+      arguments?: Record<string, unknown>;
+      _meta?: { progressToken?: unknown };
+    };
     if (params.name !== "xcodebug") {
       replyError(id, -32602, `Unknown tool "${params.name ?? ""}"`);
       return;
@@ -157,7 +205,7 @@ async function handle(message: Record<string, unknown>): Promise<void> {
     const controller = new AbortController();
     inflight.set(id, controller);
     try {
-      reply(id, await callTool(params.arguments ?? {}, controller.signal));
+      reply(id, await callTool(params.arguments ?? {}, controller.signal, params._meta?.progressToken));
     } catch (error) {
       reply(id, { content: [{ type: "text", text: (error as Error).message }], isError: true });
     } finally {

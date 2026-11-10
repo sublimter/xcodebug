@@ -1691,6 +1691,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
 
       if (!appPath) throw new Error("launch requires appPath, or a scheme to build.");
       executable ??= params.processName ?? (await readBundleExecutable(appPath));
+      setRunPhase(`installing on ${device.name}`);
       const install = await installApp(device, appPath, { timeoutMs: 180_000, signal });
       if (!install.ok) {
         return { content: [{ type: "text", text: install.message }], details: install, isError: true };
@@ -1714,6 +1715,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // stdout/stderr (plus os_log via OS_ACTIVITY_DT_MODE) and keeps running
       // until the app exits. A second plain launch would create a second,
       // short-lived instance and leave a stale pid behind.
+      setRunPhase(`launching ${resolvedBundleId}`);
       const capture = new Capture({
         mode: "console",
         deviceId: device.id,
