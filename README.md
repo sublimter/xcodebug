@@ -65,20 +65,27 @@ registers, so the extension itself is unchanged and behaves identically under pi
 and Codex.
 
 ```bash
-codex mcp add xcodebug -- bun /path/to/xcodebug/mcp/server.ts
+codex mcp add xcodebug -- node /path/to/xcodebug/mcp/server.ts
+```
+
+The same command works for any MCP client, e.g. Claude Code:
+
+```bash
+claude mcp add xcodebug -- node /path/to/xcodebug/mcp/server.ts
 ```
 
 Three things differ from the pi setup:
 
-- **Bun is required, not Node.** The extension uses extensionless relative
-  imports (`./capture`); Bun resolves them and Node's ESM loader does not.
 - **The launch directory is the project root.** The server inherits its cwd from
-  whoever starts it, so `changes`/`launch` operate on the project Codex was
+  whoever starts it, so `changes`/`launch` operate on the project the client was
   started in.
 - **`push` is refused.** MCP has no channel that injects content into a running
-  turn, so pushed log lines cannot arrive. Pass `push=off` (the default here) and
-  read with `action=logs`, which is cursor-based and returns only new lines.
+  turn, so pushed log lines cannot arrive - Codex was measured not rendering MCP
+  notifications either. Pass `push=off` (the default here) and read with
+  `action=logs`, which is cursor-based and returns only new lines.
   `wait match="..."` still blocks until an expected line appears.
+- **`node` >= 22.18 is enough.** The imports carry explicit `.ts` extensions and
+  the package declares `"type": "module"`, so no build step and no Bun is needed.
 
 Logs land in `~/.xcodebug/logs/xcodebug/`, or under `XCODEBUG_AGENT_DIR` when set.
 The tool response also reports the exact path.

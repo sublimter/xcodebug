@@ -7,9 +7,9 @@
  */
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { asRecord, asString, lastLines, runCommand, timestamp } from "./exec";
-import { BuildProgressTracker, formatProgress } from "./progress";
-import type { DeviceInfo } from "./devices";
+import { asRecord, asString, lastLines, runCommand, timestamp } from "./exec.ts";
+import { BuildProgressTracker, formatProgress } from "./progress.ts";
+import type { DeviceInfo } from "./devices.ts";
 
 export interface BuildTarget {
   workspace?: string;

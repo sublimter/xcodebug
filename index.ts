@@ -16,12 +16,12 @@ import { basename, dirname, join } from "node:path";
 // one distribution of the engine.
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Capture, type LogLine } from "./capture";
-import { describeDevices, findProcessPid, listDevices, lookupProcess, resolveDevice, type DeviceInfo } from "./devices";
-import { lastLines, runCommand, timestamp } from "./exec";
-import { buildForDevice, consoleLaunchArgs, installApp, terminateApp, type BuildTarget } from "./xcode";
-import { checkPodLockSync, describeChanges, detectChanges, runPodInstall, type ChangeReport } from "./changes";
-import { clearArchives } from "./archive";
+import { Capture, type LogLine } from "./capture.ts";
+import { describeDevices, findProcessPid, listDevices, lookupProcess, resolveDevice, type DeviceInfo } from "./devices.ts";
+import { lastLines, runCommand, timestamp } from "./exec.ts";
+import { buildForDevice, consoleLaunchArgs, installApp, terminateApp, type BuildTarget } from "./xcode.ts";
+import { checkPodLockSync, describeChanges, detectChanges, runPodInstall, type ChangeReport } from "./changes.ts";
+import { clearArchives } from "./archive.ts";
 
 const CAPTURE_PREFIX = "xcodebug";
 const PUSH_INTERVAL_MS = 4_000;

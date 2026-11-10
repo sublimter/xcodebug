@@ -7,7 +7,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream, type WriteStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { timestamp } from "./exec";
+import { timestamp } from "./exec.ts";
 
 const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
 const MAX_BUFFER_LINES = 20_000;

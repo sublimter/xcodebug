@@ -75,7 +75,7 @@ const stubPi: StubPi = {
 // the specifier is extensionless because Bun resolves it while a static import
 // would force a build step. The cast is the adapter boundary: the extension
 // declares the full ExtensionAPI, this server supplies only the members it reads.
-const extensionModule = (await import("../index")) as unknown as {
+const extensionModule = (await import("../index.ts")) as unknown as {
   default(pi: StubPi): void;
 };
 extensionModule.default(stubPi);

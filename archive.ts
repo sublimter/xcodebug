@@ -16,7 +16,7 @@
  */
 import { mkdir, readdir, rm, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { runCommand, timestamp } from "./exec";
+import { runCommand, timestamp } from "./exec.ts";
 
 export interface ArchiveResult {
   ok: boolean;

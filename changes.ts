@@ -12,7 +12,7 @@
  */
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
-import { runCommand } from "./exec";
+import { runCommand } from "./exec.ts";
 
 const SOURCE_EXTENSIONS = new Set([
   ".swift", ".h", ".m", ".mm", ".c", ".cc", ".cpp", ".metal",

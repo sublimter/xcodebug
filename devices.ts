@@ -4,7 +4,7 @@
  * devicectl accepts a uuid, ecid, serial number, udid, name or DNS name, so
  * every identifier we keep is accepted verbatim by later commands.
  */
-import { asRecord, asString, runCommand } from "./exec";
+import { asRecord, asString, runCommand } from "./exec.ts";
 
 export interface DeviceInfo {
   /** CoreDevice identifier (uuid) — accepted by devicectl. */
