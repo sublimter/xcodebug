@@ -1874,6 +1874,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       const matches: LogLine[] = [];
       const seen = new Set<number>();
       let finished = false;
+      let cancelled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let unsubscribeLine: () => void = () => {};
       let unsubscribeExit: () => void = () => {};
@@ -1883,6 +1884,9 @@ export default function xcodebug(pi: ExtensionAPI): void {
       const settle = (timedOut: boolean): string => {
         const cursor = capture.status().cursor;
         if (matches.length === 0) {
+          // Abort also settles through `finish`, so say what happened instead of
+          // reporting a timeout that never elapsed.
+          if (cancelled) return `cancelled while waiting for "${needle}" (cursor ${cursor})`;
           return timedOut
             ? `timed out after ${timeoutMs / 1000}s waiting for "${needle}" (cursor ${cursor})`
             : `capture ended before "${needle}" appeared (cursor ${cursor})`;
@@ -1925,7 +1929,10 @@ export default function xcodebug(pi: ExtensionAPI): void {
         });
         unsubscribeExit = capture.onExit(() => setTimeout(() => finish(false), 0));
         timer = setTimeout(() => finish(true), timeoutMs);
-        onAbort = (): void => finish(true);
+        onAbort = (): void => {
+          cancelled = true;
+          finish(true);
+        };
         signal?.addEventListener("abort", onAbort, { once: true });
 
         for (const line of capture.read({ since, limit: 500, grep: needle }).lines) collect(line);
