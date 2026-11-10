@@ -334,7 +334,10 @@ export async function runPodInstall(
     signal: options.signal,
   });
   const durationMs = Date.now() - started;
-  const output = `$ pod install --no-repo-update (cwd ${podfileDir})\n\n${result.stdout}\n${result.stderr}`;
+  const dropped = result.truncated
+    ? "[xcodebug] output exceeded the size cap; the beginning was dropped and this log keeps the tail.\n\n"
+    : "";
+  const output = `$ pod install --no-repo-update (cwd ${podfileDir})\n\n${dropped}${result.stdout}\n${result.stderr}`;
   // The log directory is created lazily by whatever wrote a log first; pod
   // install can be the very first thing a run does, so ensure it here.
   await mkdir(dirname(options.logFile), { recursive: true });

@@ -105,7 +105,12 @@ export async function buildForDevice(
     },
   });
   clearInterval(heartbeat);
-  await writeFile(logFile, `$ xcodebuild ${args.join(" ")}\n\n${result.stdout}\n${result.stderr}`);
+  // Say so when the cap cut the head: a log that silently starts mid-build reads
+  // like a truncated file the user has to explain away.
+  const dropped = result.truncated
+    ? "[xcodebug] output exceeded the size cap; the beginning was dropped and this log keeps the tail.\n\n"
+    : "";
+  await writeFile(logFile, `$ xcodebuild ${args.join(" ")}\n\n${dropped}${result.stdout}\n${result.stderr}`);
 
   const durationMs = Date.now() - started;
   if (result.code !== 0) {

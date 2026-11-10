@@ -11,6 +11,15 @@ export interface CommandResult {
   stderr: string;
   code: number;
   timedOut: boolean;
+  /**
+   * True when a stream exceeded `maxBytes` and its beginning was dropped.
+   *
+   * The head is what gets dropped because the useful end of a build is the end:
+   * a 12MB cap on a four-minute build used to keep thousands of identical
+   * compile commands and throw away the `error:` diagnostics and the verdict,
+   * leaving a log that says BUILD FAILED and nothing else.
+   */
+  truncated: boolean;
 }
 
 export interface CommandOptions {
@@ -33,6 +42,7 @@ export function runCommand(
     let stderr = "";
     let timedOut = false;
     let settled = false;
+    let truncated = false;
 
     // `detached` puts the child in its own process group so the whole tree can
     // be signalled at once. `sh -lc "cd x && npm test"` runs the real work as a
@@ -66,15 +76,22 @@ export function runCommand(
           }, timeoutMs)
         : undefined;
 
-    const append = (current: string, chunk: string): string =>
-      current.length >= maxBytes ? current : (current + chunk).slice(0, maxBytes);
+    // Keep the tail, not the head: a build's diagnostics and verdict are at the
+    // end. Trim in blocks (down to 75% of the cap) so a long build re-copies the
+    // buffer a few times instead of once per chunk, and so memory stays bounded.
+    const append = (current: string, chunk: string): string => {
+      const next = current + chunk;
+      if (next.length <= maxBytes) return next;
+      truncated = true;
+      return next.slice(-Math.floor(maxBytes * 0.75));
+    };
 
     const finish = (code: number): void => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
-      resolve({ stdout, stderr, code, timedOut });
+      resolve({ stdout, stderr, code, timedOut, truncated });
     };
 
     child.stdout?.setEncoding("utf8");
