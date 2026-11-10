@@ -1,6 +1,6 @@
 {
   "name": "xcodebug",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "Build, install and launch an iOS app on a physical device and read its console inside the agent session (pi / omp extension)",
   "keywords": [
