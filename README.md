@@ -141,6 +141,40 @@ Logs land in `~/.xcodebug/logs/xcodebug/`, or under `XCODEBUG_AGENT_DIR` when se
 Every response also reports the exact path, so the model can read the file once a
 run is over.
 
+## Xcode's own MCP
+
+Xcode 27.1 ships an MCP server of its own (`xcrun mcpbridge`) with 54 tools:
+workspace and project editing, build/run/stop, tests, previews, the debugger,
+build settings, String Catalogs, crash and performance reports, and device
+interaction (tap, swipe, screenshot, UI hierarchy). One of those tools does the
+same job as this extension, so pick deliberately rather than registering both by
+habit:
+
+```bash
+claude mcp add --transport stdio xcode -- xcrun mcpbridge
+codex  mcp add xcode -- xcrun mcpbridge
+```
+
+Xcode asks for permission the first time an agent opens a project;
+`xcrun mcp-server status` reports what has been granted.
+
+`GetConsoleOutput` is the one that overlaps, and it is not a substitute:
+
+| | Xcode `GetConsoleOutput` | xcodebug |
+|---|---|---|
+| source | the launch session `RunProject` created | any capture this extension started |
+| positioning | `tailLimit` only - the last N lines | a cursor per capture; `since` resumes exactly |
+| already-running app | only apps Xcode launched | `syslog` attaches without a relaunch |
+
+So: **Xcode for anything that drives the IDE or the screen, xcodebug for the log
+stream.** `GetConsoleOutput` answers "what did the last 500 lines say"; this
+extension answers "what arrived since cursor 1694" - including from an app that
+nobody launched from Xcode.
+
+`RunProject` and `DeviceInteractionInstallAndRun` also build, install and launch.
+They target whatever run destination Xcode has selected; `launch` takes a udid
+directly.
+
 ## Requirements
 
 | Need | Why |
@@ -508,6 +542,43 @@ xcodebug action=restart
 xcodebug action=await command="cd /repo && npm run test:weather"
 /xcodebug await command="cd /repo && npm run test:weather"
 ```
+
+### Reading logs from a cursor
+
+Every `logs` read returns a cursor: an absolute line index into that capture.
+Pass it back as `since` and the next read starts exactly where the last one
+stopped, with no overlap and no gap for as long as the cursor is still inside
+the buffer.
+
+```text
+xcodebug action=logs since=0 limit=2
+  2 line(s) (1692 older omitted) · cursor 1694
+
+xcodebug action=logs since=1694
+  (no new lines since 1694; capture cursor is 1694)
+
+xcodebug action=logs since=1694 limit=3
+  3 line(s) (6135 older omitted) · cursor 7832
+```
+
+The in-memory ring buffer holds 20k lines; the file under
+`<agentDir>/logs/xcodebug/` holds everything, so a long run stays readable after
+the buffer rolls over.
+
+### `syslog`: attach without relaunching
+
+`launch` restarts the app because `devicectl --console` has to start it. When the
+app is already running and the state you want to observe would not survive a
+restart, attach instead:
+
+```text
+xcodebug action=syslog processName=MyApp
+```
+
+This runs `idevicesyslog -p <ProcessName>` and leaves the app running. It needs
+`idevicesyslog` from libimobiledevice (`action=doctor` reports whether it is
+present), and it reads the device log for that process - `print` output still
+only comes from the console bridge, per the table at the top.
 
 ### Pushing logs into the conversation
 
