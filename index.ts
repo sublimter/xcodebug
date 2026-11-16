@@ -26,6 +26,7 @@ import { clearArchives } from "./archive.ts";
 const CAPTURE_PREFIX = "xcodebug";
 const PUSH_INTERVAL_MS = 4_000;
 const PUSH_MAX_LINES = 80;
+const MAX_ENDED_CAPTURES = 10;
 /** How long a verification run may go quiet before we ask the user about it. */
 const SILENCE_NOTICE_MS = 60_000;
 /**
@@ -51,6 +52,8 @@ interface ProjectConfig {
 
 interface SessionState {
   captures: Map<string, Capture>;
+  /** Permanently ended captures, ordered by completion time for bounded history. */
+  endedCaptures: Set<string>;
   activeCaptureId?: string;
   pushTimers: Map<string, ReturnType<typeof setInterval>>;
   pushCursors: Map<string, number>;
@@ -751,6 +754,7 @@ type ToolParams = {
 export default function xcodebug(pi: ExtensionAPI): void {
   const state: SessionState = {
     captures: new Map(),
+    endedCaptures: new Set(),
     pushTimers: new Map(),
     pushCursors: new Map(),
     companions: new Map(),
@@ -870,11 +874,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     refreshStatus();
   };
 
-  /**
-   * Release everything tied to a capture. Called from every path that ends one
-   * (explicit stop, app exit, shutdown) so per-capture bookkeeping cannot pile
-   * up across repeated launches in one session.
-   */
+  /** Release live bookkeeping and retain only the most recent ended captures. */
   const releaseCapture = (capture: Capture): void => {
     stopPush(capture.id);
     stopWatchdog(capture.id);
@@ -883,8 +883,12 @@ export default function xcodebug(pi: ExtensionAPI): void {
     state.lastLineAt.delete(capture.id);
     state.silenceNotified.delete(capture.id);
     state.pushCursors.delete(capture.id);
-    // The capture itself stays in `state.captures`: its log file is still on
-    // disk and `logs`/`status` must be able to read it after the app exits.
+    state.endedCaptures.add(capture.id);
+    while (state.endedCaptures.size > MAX_ENDED_CAPTURES) {
+      const oldest = state.endedCaptures.values().next().value!;
+      state.endedCaptures.delete(oldest);
+      state.captures.delete(oldest);
+    }
     if (state.activeCaptureId === capture.id) state.activeCaptureId = undefined;
     if (![...state.captures.values()].some((c) => c.running)) stopStatusTicker();
     refreshStatus();
@@ -936,8 +940,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     // The syslog channel is a companion of the console capture; stop it too so
     // one "stop" does not leave a second bridge running.
     unlinkCompanion(capture);
-    // The capture stays in `state.captures` so its log file remains readable,
-    // but the push bookkeeping is finished and must not linger.
+    // Recent ended captures remain readable, but their live bookkeeping must stop.
     state.recentLines.delete(capture.id);
     state.lastLineAt.delete(capture.id);
     state.silenceNotified.delete(capture.id);
@@ -1135,7 +1138,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // healthy, and losing it silently would leave the console channel with no
       // backup - exactly the gap dual-channel exists to cover.
       if (capture.stoppedByUser) {
-        if (state.activeCaptureId === capture.id) state.activeCaptureId = undefined;
+        releaseCapture(capture);
         return;
       }
       // Always hand off. If a reconnect loop is already running it returns at
@@ -2278,6 +2281,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       capture.stop(false);
     }
     state.captures.clear();
+    state.endedCaptures.clear();
     state.activeCaptureId = undefined;
   });
 }

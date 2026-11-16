@@ -279,7 +279,7 @@ run. Set `installPods=false` to skip it deliberately.
 ## One-shot: `/xcodebug <what to verify>`
 
 ```text
-/xcodebug 验证天气添加城市
+/xcodebug verify adding a city in Weather
 ```
 
 Detects the workspace from the current directory (walking up, so a nested cwd
@@ -346,7 +346,7 @@ what the app does while **a person** drives the phone: slow to reproduce and
 never quite identical twice.
 
 ```text
-/xcodebug 分析天气添加城市 command="cd /repo && npm run test:weather"
+/xcodebug analyze adding a city in Weather command="cd /repo && npm run test:weather"
 ```
 
 | Without `command=` | With `command=` |
@@ -369,7 +369,7 @@ That single line does the whole linkage run:
 2. run the shell line to completion (blocking);
 3. stop the capture it was watching;
 4. report the exit code, the app-side cursor, and the log path - with the
-   phrase `分析天气添加城市` attached as the goal the analysis must answer.
+   phrase `analyze adding a city in Weather` attached as the goal the analysis must answer.
 
 `command=` is a **second phase appended to the main action**, never an action of
 its own. That ordering is the point: a command is only meaningful when the app is
@@ -390,7 +390,7 @@ xcodebug action=await command="cd /repo && npm run test:weather"
 /xcodebug await command="cd /repo && npm run test:weather" timeoutSeconds=900
 ```
 
-A bare `/xcodebug` (or `/xcodebug 分析xxx`) has **no deadline**: it launches,
+A bare `/xcodebug` (or `/xcodebug analyze <scenario>`) has **no deadline**: it launches,
 streams, and waits for you. Nothing stops it except `stop`, a new launch of the
 same app, or the app exiting.
 
@@ -545,10 +545,10 @@ xcodebug action=await command="cd /repo && npm run test:weather"
 
 ### Reading logs from a cursor
 
-Every `logs` read returns a cursor: an absolute line index into that capture.
-Pass it back as `since` and the next read starts exactly where the last one
-stopped, with no overlap and no gap for as long as the cursor is still inside
-the buffer.
+Every `logs` read returns a cursor: the latest absolute line index in that
+capture. Pass it as `since` to exclude lines at or before that index. Reads
+return the newest matching lines up to `limit`; if the response says older
+lines were omitted, advancing to its cursor skips those lines too.
 
 ```text
 xcodebug action=logs since=0 limit=2
@@ -561,9 +561,12 @@ xcodebug action=logs since=1694 limit=3
   3 line(s) (6135 older omitted) · cursor 7832
 ```
 
-The in-memory ring buffer holds 20k lines; the file under
-`<agentDir>/logs/xcodebug/` holds everything, so a long run stays readable after
-the buffer rolls over.
+Each capture retains at most 20k lines and 4 MiB of text in memory (counted as
+UTF-16 bytes, excluding object overhead). A line larger than that text budget
+is written to disk and delivered to live subscribers but not retained for
+`logs`. The session keeps the most recent 10 ended captures; active captures
+and captures reconnecting after a bridge failure are not evicted. Older capture
+IDs leave `logs`/`status`, while their retained disk segments remain available.
 
 ### `syslog`: attach without relaunching
 
@@ -594,14 +597,25 @@ useful, e.g. `xcodebug action=launch match=MySDK push=wake`.
 
 ### Files
 
-Every capture also writes a full log to
-`<agentDir>/logs/xcodebug/<mode>-<bundleId>-<YYYY-MM-DD_HH-mm-ss-SSS>.log`, so
-nothing is lost when the in-memory ring buffer (20k lines) rolls over.
+Every capture writes timestamped logs under
+`<agentDir>/logs/xcodebug/<mode>-<bundleId>-<YYYY-MM-DD_HH-mm-ss-SSS>.log`.
+It rotates through that base path plus `.1` and `.2`, replacing the oldest
+segment after three segments. Each segment targets 50 MiB and keeps complete
+lines (a single larger line may exceed that size). Logging continues after
+rotation; it no longer stops at the first 50 MiB. Capture status details list
+successfully opened paths in chronological order as `logFiles`; `logFile` stays
+the stable base path. Reconnecting appends to the current segment.
 
-The app's bundle id is part of the name because several apps are debugged in
-one session; the timestamp carries milliseconds so a relaunch of the same app
-cannot reuse the previous run's file (files are opened in append mode, so a
-collision would interleave two runs with no way to tell them apart).
+Disk writes apply backpressure to both capture pipes, so a slow disk pauses
+ingestion instead of accumulating an unlimited write queue. After the bridge
+exits, capture shutdown allows up to two seconds for the pipes and pending file
+writes to drain. If they remain blocked, it destroys the streams, reports a
+drain-timeout error in capture status, and completes shutdown; pending logs may
+be truncated.
+
+The bundle id separates apps, and the timestamp includes milliseconds to
+separate runs. Segment limits apply per capture: old runs are not automatically
+deleted from disk when their capture IDs leave the in-memory history.
 
 A successful build clears `<agentDir>/logs/xcodebug/archive/` first, so snapshots
 from a previous binary cannot be mistaken for the run that is starting.
