@@ -27,8 +27,8 @@ it as a package or drop the directory in place.
 pi install npm:xcodebug
 pi install npm:xcodebug -l      # project scope: .pi/settings.json
 
-# pin a version, or install from a checkout
-pi install npm:xcodebug@1.0.0
+# explicitly select the latest release, or install from a checkout
+pi install npm:xcodebug@latest
 pi install /path/to/xcodebug
 ```
 
@@ -67,7 +67,7 @@ extension rather than a parallel implementation.
 ### Set up (once per machine)
 
 ```bash
-npm i -g xcodebug          # >= 1.1.0, the first release that ships mcp/
+npm i -g xcodebug@latest   # installs the latest published release
 codex  mcp add xcodebug -- bun "$(npm root -g)/xcodebug/mcp/server.ts"
 claude mcp add xcodebug -- bun "$(npm root -g)/xcodebug/mcp/server.ts"
 ```
