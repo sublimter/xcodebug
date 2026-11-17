@@ -266,17 +266,6 @@ should list it and `/mcp` should show `xcodebug` connected. The official
 [personal plugin loading rules](https://code.claude.com/docs/en/plugins/create#make-a-plugin-load-in-every-session)
 describe this installation mechanism.
 
-#### Try it for one session instead
-
-To test without persistent installation, start Claude with the plugin path:
-
-```bash
-claude --plugin-dir "$XCODEBUG_DIR/claude"
-```
-
-The flag applies only to that session. A later plain `claude` launch will not
-load the display unless it is also installed as described above.
-
 #### Use and expected display
 
 From your app's working directory, use the installed skill in the same Claude
@@ -327,8 +316,7 @@ Codex does not load this Claude-only Mod.
 
 To disable the persistent display, run
 `claude plugin disable xcodebug-live@skills-dir` and restart Claude; enable it
-again with the matching `enable` command. For a temporary flag-only setup,
-omit `--plugin-dir` on the next launch instead. Capturing and the shared skill
+again with the matching `enable` command. Capturing and the shared skill
 remain available without the display.
 
 ### What differs from pi

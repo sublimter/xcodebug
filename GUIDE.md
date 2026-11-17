@@ -74,10 +74,8 @@ It then loads with ordinary `claude` startup. The MCP connection and shared
 skill alone do not load it. Confirm `xcodebug-live@skills-dir` in
 `claude plugin list`, then restart Claude and check `/plugin` and `/mcp`.
 
-To try it for one session without installing, use
-`claude --plugin-dir /path/to/xcodebug/claude`. Keep the `xcodebug` MCP server
-pointed at the same updated checkout or installed package. This flag is not
-remembered by the next plain `claude` launch.
+Keep the `xcodebug` MCP server pointed at the same updated checkout or installed
+package as the Mod.
 
 The band shows build/install/launch phases, including the rebuild within
 `restart`, even when a capture is already running. Capture continues in the
