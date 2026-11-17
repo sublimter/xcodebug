@@ -1,0 +1,6 @@
+{
+  "name": "xcodebug-live",
+  "version": "0.1.0",
+  "description": "Live xcodebug build status and console tail above the Claude Code prompt",
+  "author": { "name": "sublimter" }
+}

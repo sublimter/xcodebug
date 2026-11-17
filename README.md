@@ -59,10 +59,10 @@ a session is running therefore has no effect on that session.
 
 ## Claude Code and Codex (MCP)
 
-Neither client has an in-process extension API - tools reach them as MCP servers.
-`mcp/server.ts` is that adapter: it loads `index.ts` with a stub host and serves
-the tool it registers, so it exposes the same actions and arguments as the pi
-extension rather than a parallel implementation.
+The shared actions reach both clients through MCP. `mcp/server.ts` loads
+`index.ts` with a stub host and serves the tool it registers, so it exposes the
+same actions and arguments as the pi extension rather than a parallel
+implementation. Claude Code can also load the optional native display below.
 
 ### Set up (once per machine)
 
@@ -199,13 +199,145 @@ Claude Code and Codex each start their own server, so a capture created in one
 client cannot be read or stopped in the other. Stay in the same client session
 for `launch` → `logs`/`wait` → `restart`/`stop`.
 
+### Claude Code live display
+
+The live band needs three separate components: the `xcodebug` MCP server runs
+the actions, the [shared skill](#install-the-manual-entry-point) provides
+`/xcodebug`, and the `xcodebug-live` Mod draws above the prompt. Connecting MCP
+or installing the skill alone does **not** load the Mod.
+
+#### Prerequisites
+
+Use Claude Code **2.1.323 or later** in an interactive terminal. Choose a checkout
+or installed package that contains both the Mod and the updated MCP adapter:
+
+```bash
+XCODEBUG_DIR=/path/to/xcodebug
+# For an npm package containing this feature:
+# XCODEBUG_DIR="$(npm root -g)/xcodebug"
+claude --version
+test -f "$XCODEBUG_DIR/claude/.claude-plugin/plugin.json"
+test -f "$XCODEBUG_DIR/mcp/server.ts"
+```
+
+If either file is missing, obtain a package or checkout containing the feature
+before continuing; an older published release may not include it. Keep the MCP
+registration named `xcodebug` and point it at `mcp/server.ts` from this same
+root, using Bun. Follow [Set up](#set-up-once-per-machine) to register it, or
+inspect an existing registration with `claude mcp get xcodebug`.
+
+#### Install once for ordinary Claude sessions
+
+Claude loads personal skills-directory plugins on startup. The display plugin
+uses its own path, separate from the `xcodebug` skill. Run this in your shell
+after setting `XCODEBUG_DIR` above:
+
+```bash
+(
+  source="$XCODEBUG_DIR/claude"
+  dest="$HOME/.claude/skills/xcodebug-live"
+  test -f "$source/.claude-plugin/plugin.json" || {
+    printf 'Missing Mod manifest: %s\n' "$source" >&2
+    exit 1
+  }
+  if test -e "$dest" || test -L "$dest"; then
+    test -L "$dest" && test "$dest" -ef "$source" || {
+      printf 'Existing plugin path: %s\n' "$dest" >&2
+      exit 1
+    }
+  else
+    mkdir -p "$(dirname "$dest")" && ln -s "$source" "$dest" || exit 1
+  fi
+)
+```
+
+This skips a correct existing link and refuses to overwrite another file,
+directory, wrong link or broken link. Keep the source directory in place.
+Check discovery, then start a new session normally:
+
+```bash
+claude plugin list     # xcodebug-live@skills-dir, enabled
+claude
+```
+
+If this plugin was previously disabled, enable it with
+`claude plugin enable xcodebug-live@skills-dir`. In the new session, `/plugin`
+should list it and `/mcp` should show `xcodebug` connected. The official
+[personal plugin loading rules](https://code.claude.com/docs/en/plugins/create#make-a-plugin-load-in-every-session)
+describe this installation mechanism.
+
+#### Try it for one session instead
+
+To test without persistent installation, start Claude with the plugin path:
+
+```bash
+claude --plugin-dir "$XCODEBUG_DIR/claude"
+```
+
+The flag applies only to that session. A later plain `claude` launch will not
+load the display unless it is also installed as described above.
+
+#### Use and expected display
+
+From your app's working directory, use the installed skill in the same Claude
+session:
+
+```text
+/xcodebug launch scheme=MyApp
+/xcodebug status
+/xcodebug logs limit=100
+/xcodebug stop
+```
+
+During build, install, launch, and the rebuild within `restart`, the band shows
+the current phase and elapsed time. An operation's phase takes priority over
+an existing capture; capture continues in the background. When the operation
+finishes, fails, or is cancelled, the band returns to the running capture's
+line count and latest four log lines.
+
+It refreshes every second even between turns and clears when no operation or
+capture is running. An empty band is normal in that idle state. Build
+percentages are estimates; installation shows elapsed time, not an installation
+percentage. These lines are displayed to you without entering model context
+or starting model turns; use `logs`/`wait` when Claude needs to analyze them.
+
+The Mod calls the read-only `xcodebug_ui` tool on the existing connection.
+These in-memory reads bypass the action queue, so a build or `wait` cannot
+block the reads. Polling does not change the active capture or log cursors,
+and request progress still stops when its originating call returns. No second
+server or status files are created. The Mod leaves an existing statusLine alone;
+Codex does not load this Claude-only Mod.
+
+#### If the band is missing
+
+1. Run `claude plugin list` and check `/plugin` in the affected session.
+   `xcodebug-live` must be loaded; seeing the `/xcodebug` skill or a connected
+   MCP server does not establish that. Check `/plugin`'s Errors tab if loading
+   failed. Safe mode, disabled Mods/hooks or managed settings can prevent it.
+2. Check `/mcp` for the server named exactly `xcodebug`. An unavailable band or
+   unknown `xcodebug_ui` tool usually means a missing connection or an older
+   adapter. Inspect `claude mcp get xcodebug` to check the path.
+3. Use `/xcodebug status` to check that a capture is running in this session.
+   Captures in another client/session cannot populate this band's snapshot.
+   With no running capture or published phase, the band is intentionally empty.
+4. After updating the package, changing the server path or installing the Mod,
+   restart Claude so both components load together. `/reload-plugins` can reload
+   the Mod's files but does not restart the existing MCP server. `-p` sessions
+   do not draw the band.
+
+To disable the persistent display, run
+`claude plugin disable xcodebug-live@skills-dir` and restart Claude; enable it
+again with the matching `enable` command. For a temporary flag-only setup,
+omit `--plugin-dir` on the next launch instead. Capturing and the shared skill
+remain available without the display.
+
 ### What differs from pi
 
 | | pi / omp / omo | Claude Code / Codex |
 |---|---|---|
 | how the tool is exposed | registered in-process | MCP server process |
 | manual entry point | native `/xcodebug` | shared skill: `/xcodebug` in Claude, `$xcodebug` in Codex |
-| status line, widget | yes | request progress if the client renders it; no native widget |
+| status line, widget | yes | Claude: optional live Mod above; otherwise request progress when rendered |
 | `push` | mirrors new lines into the session | refused |
 | capture state | in the session | in the server process |
 | lifetime | the session | the client process |

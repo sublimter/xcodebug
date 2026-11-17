@@ -29,6 +29,7 @@
     "*.ts",
     "mcp/",
     "skills/",
+    "claude/",
     "README.md",
     "GUIDE.md",
     "LICENSE"

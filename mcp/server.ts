@@ -29,7 +29,7 @@ interface ExtensionContextLike {
   agentDir: string;
   /** The status ticker in index.ts only runs when this is set. */
   hasUI?: boolean;
-  ui: { notify(): void; setStatus(key: string, text?: string): void; setWidget(): void };
+  ui: { notify(): void; setStatus(key: string, text?: string): void; setWidget(key: string, rows?: string[]): void };
 }
 
 interface ToolResult {
@@ -96,6 +96,16 @@ if (!registered) {
 }
 const tool = registered;
 
+// The native Claude mod reads this without joining the mutating action queue.
+// Keep the last repaint alive after tools/call ends; only progress is request-scoped.
+const uiSnapshot: { status?: string; rows: string[] } = { rows: [] };
+const uiTool = {
+  name: "xcodebug_ui",
+  description: "Read the current display snapshot for the xcodebug Claude Code mod. For capture details or log analysis use xcodebug with action=status or action=logs.",
+  inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+};
+
 function sendNotification(method: string, params: unknown): void {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
 }
@@ -121,9 +131,12 @@ function makeCtx(progressToken: unknown): { ctx: ExtensionContextLike; close(): 
       ui: {
         notify() {},
         setStatus(_key, text) {
+          uiSnapshot.status = text;
           report(text);
         },
-        setWidget() {},
+        setWidget(_key, rows) {
+          uiSnapshot.rows = rows ?? [];
+        },
       },
     },
     // The status ticker keeps running while a capture is alive, which outlives
@@ -187,7 +200,7 @@ async function handle(message: Record<string, unknown>): Promise<void> {
     return;
   }
   if (method === "tools/list") {
-    reply(id, { tools: [{ name: "xcodebug", description: tool.description, inputSchema }] });
+    reply(id, { tools: [{ name: "xcodebug", description: tool.description, inputSchema }, uiTool] });
     return;
   }
   if (method === "tools/call") {
@@ -229,6 +242,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     message = JSON.parse(text) as Record<string, unknown>;
   } catch {
     replyError(null, -32700, "Parse error");
+    return;
+  }
+  // UI reads must remain responsive during a build/install/wait and must never
+  // replace state.uiCtx with the context of a polling call.
+  if (message.method === "tools/call" &&
+      (message.params as { name?: string } | undefined)?.name === uiTool.name) {
+    if (message.id !== undefined) {
+      reply(message.id, { content: [{ type: "text", text: JSON.stringify(uiSnapshot) }] });
+    }
     return;
   }
   // Handled here rather than in handle(): the queue serializes calls, so a

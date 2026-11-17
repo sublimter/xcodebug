@@ -767,24 +767,24 @@ export default function xcodebug(pi: ExtensionAPI): void {
   /**
    * Paint the live verification state: a footer line that is always visible and
    * a widget above the editor with the most recent log lines. Both are cleared
-   * when no capture is running, so a finished task leaves no stale chrome.
+   * when no operation or capture is running, so a finished task leaves no stale chrome.
    */
   const refreshStatus = (): void => {
     const ctx = state.uiCtx;
     if (!ctx?.hasUI) return;
-    const running = [...state.captures.values()].filter((c) => c.running);
-    if (running.length === 0) {
-      const phase = state.runPhase;
-      if (!phase) {
-        ctx.ui.setStatus("xcodebug", undefined);
-        ctx.ui.setWidget("xcodebug", undefined);
-        return;
-      }
+    const phase = state.runPhase;
+    if (phase) {
       const secs = Math.round((Date.now() - phase.startedAt) / 1000);
       ctx.ui.setStatus("xcodebug", `🔨 xcodebug · ${phase.label} · ${secs}s`);
       ctx.ui.setWidget("xcodebug", ["Xcodebug · running", `  ${phase.label}`, `  ${secs}s`], {
         placement: "aboveEditor",
       });
+      return;
+    }
+    const running = [...state.captures.values()].filter((c) => c.running);
+    if (running.length === 0) {
+      ctx.ui.setStatus("xcodebug", undefined);
+      ctx.ui.setWidget("xcodebug", undefined);
       return;
     }
 
@@ -1560,6 +1560,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       const device = await resolveDeviceParam(params.device, projectRoot);
       const appPath = params.appPath;
       if (!appPath) throw new Error("install requires appPath (or use action=build first).");
+      setRunPhase(`installing on ${device.name}`);
       const outcome = await installApp(device, appPath, { timeoutMs: (params.timeoutSeconds ?? 180) * 1000, signal });
       return {
         content: [{ type: "text", text: `${outcome.message}\napp: ${appPath}\ndevice: ${device.name}` }],
