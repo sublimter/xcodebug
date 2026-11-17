@@ -69,14 +69,14 @@ extension rather than a parallel implementation.
 ```bash
 npm i -g xcodebug@latest   # installs the latest published release
 codex  mcp add xcodebug -- bun "$(npm root -g)/xcodebug/mcp/server.ts"
-claude mcp add xcodebug -- bun "$(npm root -g)/xcodebug/mcp/server.ts"
+claude mcp add --scope user xcodebug -- bun "$(npm root -g)/xcodebug/mcp/server.ts"
 ```
 
 Working from a checkout instead? Point both at `mcp/server.ts` in the repo:
 
 ```bash
 codex  mcp add xcodebug -- bun /path/to/xcodebug/mcp/server.ts
-claude mcp add xcodebug -- bun /path/to/xcodebug/mcp/server.ts
+claude mcp add --scope user xcodebug -- bun /path/to/xcodebug/mcp/server.ts
 ```
 
 Bun is required ([bun.sh](https://bun.sh)). The sources are TypeScript, and Node
@@ -92,6 +92,51 @@ codex  mcp list     # xcodebug  bun …
 claude mcp list     # xcodebug: … ✔ Connected
 ```
 
+### Install the manual entry point
+
+Connecting MCP makes the tool available to the model; it does not register a
+`/xcodebug` command in either client. The shared
+[xcodebug skill](skills/xcodebug/SKILL.md) adds an explicit entry point:
+`/xcodebug` in Claude Code, `$xcodebug` in Codex, or Codex's `/skills` picker.
+
+Both clients can read the same skill directory through user-level symlinks:
+
+```bash
+XCODEBUG_DIR="/absolute/path/to/xcodebug"  # a checkout containing the skill
+# For an npm package that includes the skill, use this instead:
+# XCODEBUG_DIR="$(npm root -g)/xcodebug"
+
+(
+  source="$XCODEBUG_DIR/skills/xcodebug"
+  test -f "$source/SKILL.md" || { printf 'Skill not found: %s\n' "$source/SKILL.md" >&2; exit 1; }
+  for dest in "$HOME/.agents/skills/xcodebug" "$HOME/.claude/skills/xcodebug"; do
+    if test -e "$dest" || test -L "$dest"; then
+      if ! test -L "$dest" || ! test "$dest" -ef "$source"; then
+        printf 'Existing skill path: %s; inspect it before installing.\n' "$dest" >&2
+        exit 1
+      fi
+    fi
+  done
+  mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills" || exit 1
+  for dest in "$HOME/.agents/skills/xcodebug" "$HOME/.claude/skills/xcodebug"; do
+    test -L "$dest" || ln -s "$source" "$dest" || exit 1
+  done
+)
+```
+
+Some published packages predate the skill. If the `test -f` check fails, use a
+checkout containing `skills/xcodebug/SKILL.md`. The commands check both target
+paths before installing, skip symlinks already pointing to this skill, and stop
+on other existing files, directories or symlinks, including broken links.
+Keep the checkout or npm package at the linked path. Updating that source updates
+the shared skill for both clients.
+
+Start a new Claude Code or Codex session after installing. The skill uses the
+MCP connection already configured above; it does not start a separate server or
+replace the native pi command. Both manual and model-selected invocation remain
+available. See the clients' [Claude Code skill documentation](https://code.claude.com/docs/en/skills)
+and [Codex skill documentation](https://learn.chatgpt.com/docs/build-skills).
+
 ### Use
 
 Start the client **in the project directory**. The server inherits its cwd, and
@@ -102,7 +147,32 @@ cd ~/myapp          # holds the .xcworkspace or .xcodeproj
 codex               # or: claude
 ```
 
-Then ask for the outcome; the model calls the tool:
+Enter these in the client's chat input, not in your shell, after installing the skill:
+
+| Operation | Claude Code | Codex |
+|---|---|---|
+| Build, install and launch with defaults | `/xcodebug` | `$xcodebug` |
+| Show capture status | `/xcodebug status` | `$xcodebug status` |
+| Check the toolchain | `/xcodebug doctor` | `$xcodebug doctor` |
+| List devices | `/xcodebug devices` | `$xcodebug devices` |
+| Build, install and launch | `/xcodebug launch scheme=MyApp` | `$xcodebug launch scheme=MyApp` |
+| Read filtered logs | `/xcodebug logs grep="Weather Sync" limit=100` | `$xcodebug logs grep="Weather Sync" limit=100` |
+| Wait for an event | `/xcodebug wait match="sync complete" timeoutSeconds=30` | `$xcodebug wait match="sync complete" timeoutSeconds=30` |
+| Rebuild and rerun the last launch | `/xcodebug restart` | `$xcodebug restart` |
+| Stop capture, leave the app running | `/xcodebug stop` | `$xcodebug stop` |
+
+A bare skill invocation calls `{"action":"launch"}`: it builds as needed, installs,
+launches and starts capturing using the server's project/device defaults. Use
+`status` to inspect captures without launching. An explicit action maps directly
+to MCP arguments: `logs grep="Weather Sync" limit=100`
+becomes `{"action":"logs","grep":"Weather Sync","limit":100}`. The skill keeps
+quoted strings, numeric and boolean parameters, and JSON arrays/objects in their
+tool-schema types. Add `captureId=...` to read or stop a specific capture.
+
+The skill is a model instruction, not a direct RPC command: the model makes the
+tool call and the client's permission rules still apply. It should execute the
+requested action and report its result, rather than just explain how to do it.
+Natural-language goals can also select the skill:
 
 ```text
 Build and launch on my device, then show me the console.
@@ -119,12 +189,23 @@ action=status                   captures, line counts, log paths
 action=stop                     close every running capture
 ```
 
+If the entry point is missing, check the symlink and restart the client. If the
+skill is found but the MCP tool is missing, check `claude mcp list` or Codex's
+`/mcp`; installing the skill alone does not connect MCP. A `Called
+xcodebug.xcodebug` line is a tool-call record, not a command to type.
+
+Capture IDs, cursors and the last launch belong to one MCP server process.
+Claude Code and Codex each start their own server, so a capture created in one
+client cannot be read or stopped in the other. Stay in the same client session
+for `launch` → `logs`/`wait` → `restart`/`stop`.
+
 ### What differs from pi
 
 | | pi / omp / omo | Claude Code / Codex |
 |---|---|---|
 | how the tool is exposed | registered in-process | MCP server process |
-| status line, widget | yes | none |
+| manual entry point | native `/xcodebug` | shared skill: `/xcodebug` in Claude, `$xcodebug` in Codex |
+| status line, widget | yes | request progress if the client renders it; no native widget |
 | `push` | mirrors new lines into the session | refused |
 | capture state | in the session | in the server process |
 | lifetime | the session | the client process |

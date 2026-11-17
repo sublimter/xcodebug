@@ -4,6 +4,14 @@ Task-oriented walkthrough. [README.md](README.md) is the authoritative reference
 for every parameter, the change-detection rules and the capture internals; this
 file only shows the flows you will actually type.
 
+The `/xcodebug` examples use the native pi/omp command or the installed Claude
+Code skill. In Codex, replace `/xcodebug` with `$xcodebug`. Claude Code and Codex
+need both the MCP connection and the shared skill; follow
+[README.md § Install the manual entry point](README.md#install-the-manual-entry-point).
+Enter these commands in the client's chat input. A bare `/xcodebug` (`$xcodebug`
+in Codex) builds as needed, installs, launches and starts capturing with defaults.
+Use `/xcodebug status` (`$xcodebug status` in Codex) to inspect current captures.
+
 Debug a real iOS device: build, install, launch, and read the app's console
 (stdout/stderr + os_log) inside the agent session. No jailbreak, no LLDB attach,
 no paid account.
@@ -20,9 +28,11 @@ model must answer — not a log filter.
 
 ## Two surfaces
 
-**Slash command** (for humans)
+**User entry point** (native command in pi/omp; installed skill in Claude Code/Codex)
 
 ```text
+/xcodebug
+/xcodebug status
 /xcodebug launch scheme=MyApp
 /xcodebug logs grep=MySDK
 /xcodebug stop
@@ -48,11 +58,15 @@ suggests, so they are repeated here:
 
 ## How logs reach the conversation
 
-`push` decides whether new lines are mirrored into the session: `context`
+In pi/omp, `push` decides whether new lines are mirrored into the session: `context`
 (default, queued for the next turn), `off` (pull with `logs`/`wait`), `wake`
 (starts a turn). A device console is a firehose; each push carries at most 80
 lines and reports how many older lines it dropped. Narrow it with `match`, e.g.
 `action=launch match=MySDK push=wake`.
+
+Claude Code and Codex use pull reads through MCP: `logs` for an incremental read,
+or `wait` for an expected line. `push=context` and `push=wake` are refused there;
+installing the skill does not add background log delivery.
 
 ## Running a command alongside a capture
 

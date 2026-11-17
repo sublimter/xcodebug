@@ -28,6 +28,7 @@
   "files": [
     "*.ts",
     "mcp/",
+    "skills/",
     "README.md",
     "GUIDE.md",
     "LICENSE"
