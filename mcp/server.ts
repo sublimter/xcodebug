@@ -18,7 +18,7 @@
  * needed (initialize, tools/list, tools/call); the official SDK would add ~97
  * transitive packages to every install, including the pi users who never run MCP.
  */
-import { readFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -99,6 +99,53 @@ const tool = registered;
 // The native Claude mod reads this without joining the mutating action queue.
 // Keep the last repaint alive after tools/call ends; only progress is request-scoped.
 const uiSnapshot: { status?: string; rows: string[] } = { rows: [] };
+
+// Every xcodebug_ui call runs the client's tool hooks, so a mod that polled it
+// once a second ran them once a second for as long as a capture lived. The same
+// snapshot goes to a file the mod reads between calls. One file per process:
+// several sessions each run their own server.
+const UI_DIR = join(AGENT_DIR, "ui");
+let uiFile: string | undefined = join(UI_DIR, `${process.pid}.json`);
+// Advances on every repaint, which happens once a second while anything is
+// shown; a reader that sees it stand still knows this process stopped painting.
+let uiSeq = 0;
+
+function publishUi(): void {
+  if (!uiFile) return;
+  uiSeq += 1;
+  try {
+    mkdirSync(UI_DIR, { recursive: true });
+    // Renamed into place so a reader never sees half a snapshot.
+    writeFileSync(`${uiFile}.tmp`, JSON.stringify({ ...uiSnapshot, seq: uiSeq }));
+    renameSync(`${uiFile}.tmp`, uiFile);
+  } catch (error) {
+    // A repaint must not take the action down with it. Without the file the
+    // mod is told nothing about it and keeps calling xcodebug_ui.
+    console.error("xcodebug-mcp: live display file unavailable:", (error as Error).message);
+    uiFile = undefined;
+  }
+}
+publishUi();
+process.on("exit", () => {
+  if (uiFile) rmSync(uiFile, { force: true });
+});
+// Claude Code ends a stdio server with SIGINT. Left to the default, a signal
+// ends the process without the handler above; the exit codes are the shell's.
+process.on("SIGINT", () => process.exit(130));
+process.on("SIGTERM", () => process.exit(143));
+// A server that was killed outright never ran it either. Its file is named after
+// a process that no longer exists, which is how the next server to start finds it.
+try {
+  for (const name of readdirSync(UI_DIR)) {
+    try {
+      process.kill(Number.parseInt(name, 10), 0);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") rmSync(join(UI_DIR, name), { force: true });
+    }
+  }
+} catch {
+  // No directory to sweep: publishUi() could not create it and said so.
+}
 const uiTool = {
   name: "xcodebug_ui",
   description: "Read the current display snapshot for the xcodebug Claude Code mod. For capture details or log analysis use xcodebug with action=status or action=logs.",
@@ -132,10 +179,12 @@ function makeCtx(progressToken: unknown): { ctx: ExtensionContextLike; close(): 
         notify() {},
         setStatus(_key, text) {
           uiSnapshot.status = text;
+          publishUi();
           report(text);
         },
         setWidget(_key, rows) {
           uiSnapshot.rows = rows ?? [];
+          publishUi();
         },
       },
     },
@@ -249,7 +298,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (message.method === "tools/call" &&
       (message.params as { name?: string } | undefined)?.name === uiTool.name) {
     if (message.id !== undefined) {
-      reply(message.id, { content: [{ type: "text", text: JSON.stringify(uiSnapshot) }] });
+      reply(message.id, {
+        content: [{ type: "text", text: JSON.stringify({ ...uiSnapshot, seq: uiSeq, file: uiFile }) }],
+      });
     }
     return;
   }

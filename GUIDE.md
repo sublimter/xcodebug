@@ -81,8 +81,9 @@ The band shows build/install/launch phases, including the rebuild within
 `restart`, even when a capture is already running. Capture continues in the
 background; after the operation finishes, fails, or is cancelled, the band
 returns to the running capture's line count and latest four console lines.
-It refreshes once a second between turns and clears when no operation or
-capture is running. It does not send those lines to the model; use `logs`/`wait`
+It refreshes once a second, between turns too, while an operation or capture is
+running, then clears and stops reading; an idle session makes no reads. It does
+not send those lines to the model; use `logs`/`wait`
 for analysis.
 See [Claude Code live display](README.md#claude-code-live-display) for version
 requirements, upgrade/disable steps and missing-display troubleshooting.

@@ -284,17 +284,32 @@ an existing capture; capture continues in the background. When the operation
 finishes, fails, or is cancelled, the band returns to the running capture's
 line count and latest four log lines.
 
-It refreshes every second even between turns and clears when no operation or
-capture is running. An empty band is normal in that idle state. Build
+It refreshes every second, between turns too, from a build, install, launch,
+restart, syslog or await call until no operation or capture is running, then
+clears and stops reading. A session that starts or reloads the Mod reads once
+and resumes a capture already running. Calls that only read or end something
+(`doctor`, `devices`, `changes`, `status`, `logs`, `wait`, `stop`, `terminate`)
+do not start it unless they carry a `command`, and an idle session makes no
+reads. An empty band is normal in
+that idle state. Build
 percentages are estimates; installation shows elapsed time, not an installation
 percentage. These lines are displayed to you without entering model context
 or starting model turns; use `logs`/`wait` when Claude needs to analyze them.
 
-The Mod calls the read-only `xcodebug_ui` tool on the existing connection.
-These in-memory reads bypass the action queue, so a build or `wait` cannot
-block the reads. Polling does not change the active capture or log cursors,
-and request progress still stops when its originating call returns. No second
-server or status files are created. The Mod leaves an existing statusLine alone;
+The Mod calls the read-only `xcodebug_ui` tool on the existing connection once
+when a display starts. That in-memory read bypasses the action queue, so a
+build or `wait` cannot block it. A tool call runs the session's `PreToolUse`
+and `PostToolUse` hooks, so the reads after it come from a file instead: the
+server keeps the same snapshot in `~/.xcodebug/ui/<pid>.json`, names it in the
+`xcodebug_ui` answer and removes it when it exits; one left by a server that
+was killed is removed by the next server to start. Each call that starts a
+display asks the server again, as does a file that is missing or stops
+changing; with an older server that names no file the Mod calls the tool on
+every read. After three failed reads in a row it
+stops and clears the band until the next such call. Reading does not change the
+active capture or log cursors, and request progress still stops when its
+originating call returns. No second server is started. The Mod leaves an
+existing statusLine alone;
 Codex does not load this Claude-only Mod.
 
 #### If the band is missing
