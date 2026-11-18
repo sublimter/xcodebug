@@ -124,10 +124,10 @@ XCODEBUG_DIR="/absolute/path/to/xcodebug"  # a checkout containing the skill
 )
 ```
 
-Some published packages predate the skill. If the `test -f` check fails, use a
-checkout containing `skills/xcodebug/SKILL.md`. The commands check both target
-paths before installing, skip symlinks already pointing to this skill, and stop
-on other existing files, directories or symlinks, including broken links.
+If the installed package does not contain `skills/xcodebug/SKILL.md`, use a
+checkout that contains it. The commands check both target paths before installing,
+skip symlinks already pointing to this skill, and stop on other existing files,
+directories or symlinks, including broken links.
 Keep the checkout or npm package at the linked path. Updating that source updates
 the shared skill for both clients.
 
@@ -220,9 +220,9 @@ test -f "$XCODEBUG_DIR/claude/.claude-plugin/plugin.json"
 test -f "$XCODEBUG_DIR/mcp/server.ts"
 ```
 
-If either file is missing, obtain a package or checkout containing the feature
-before continuing; an older published release may not include it. Keep the MCP
-registration named `xcodebug` and point it at `mcp/server.ts` from this same
+If either file check fails, use a checkout containing the Mod and its updated
+MCP adapter. Keep the MCP registration named `xcodebug` and point it at
+`mcp/server.ts` from this same
 root, using Bun. Follow [Set up](#set-up-once-per-machine) to register it, or
 inspect an existing registration with `claude mcp get xcodebug`.
 
@@ -341,15 +341,15 @@ remain available without the display.
 | how the tool is exposed | registered in-process | MCP server process |
 | manual entry point | native `/xcodebug` | shared skill: `/xcodebug` in Claude, `$xcodebug` in Codex |
 | status line, widget | yes | Claude: optional live Mod above; otherwise request progress when rendered |
-| `push` | mirrors new lines into the session | refused |
+| `push` | mirrors new lines into the session | `off` only; `context` and `wake` refused |
 | capture state | in the session | in the server process |
 | lifetime | the session | the client process |
 
-- **`push` is refused on purpose.** MCP has no channel that injects content into a
-  running turn, and neither client renders `notifications/message` - measured on
-  both, where the model reported that nothing arrived on its own between two tool
-  calls. Read with `action=logs` or `action=wait`; both are pull-based, and the
-  cursor means you only pay for new lines.
+- **The adapter refuses `push=context` and `push=wake`.** It does not implement
+  background log delivery into model context. Read with `action=logs` or
+  `action=wait`; these pull reads are separate from the Claude Mod's user-visible
+  display. Cursor reads exclude earlier indices, but a limited read can omit
+  lines; see [Reading logs from a cursor](#reading-logs-from-a-cursor).
 - **Captures end with the client.** The server is a child of Codex/Claude, so
   quitting the client stops the bridges. Relaunch next session.
 
@@ -499,8 +499,10 @@ run. Set `installPods=false` to skip it deliberately.
 ```
 
 Detects the workspace from the current directory (walking up, so a nested cwd
-works), rebuilds when the tree changed, installs, launches, and streams the
-console into this session. The phrase is a goal for the model, not a log filter.
+works), rebuilds when the tree changed, installs, launches, and starts capturing.
+Native pi/omp can push logs into the conversation; Claude Code and Codex use
+`logs`/`wait` pull reads through MCP. The optional Claude Mod displays a console
+tail to the user, not to the model. The phrase is a goal, not a log filter.
 
 - **CocoaPods vs plain project** is decided by `Podfile`/`Podfile.lock`: a
   CocoaPods project uses its `.xcworkspace`, a plain project its `.xcodeproj`.
@@ -690,32 +692,36 @@ app (a curl, a fixture import, a codegen step) has no such constraint.
 
 Verification is a loop: run, read the log, conclude, stop, edit the code, run
 again. Each `launch` or `syslog` retires the previous cycle's capture for that same
-app **before** the new bridge starts, so the two never push the same app's lines
-into one conversation; other apps keep streaming, so several apps can be
-debugged in one session.
+app **before** the new bridge starts, avoiding duplicate capture streams for that
+app; other apps' captures are preserved, so several apps can be debugged in one
+session.
 
-- **Stop once the log has answered the question.** Keeping a capture alive after
-  the conclusion only floods the session.
+- **Stop once the log has answered the question.** Keeping a capture alive consumes
+  resources; with native push enabled, it also keeps sending log batches.
 - **Do not stop while the user has not acted yet.** Silence there means nothing
   has been tried, not that the run is over: say what to do on the phone and keep
   listening.
-- A capture ends on its own when the app process exits. A run whose app the user
-  deliberately closed is not reconnected.
+- A console capture ends when the app process is confirmed gone, and its syslog
+  companion is stopped too. A standalone `syslog` capture is not bound to the
+  app's lifetime and keeps reconnecting; stop it explicitly when finished.
 - A dropped console bridge otherwise reconnects indefinitely. An inconclusive
   probe (USB unplugged, `devicectl` timeout) is **not** treated as "the app exited".
 - `idevicesyslog` can go silent with its process still alive; a 30s watchdog kills
   it and the exit hook reattaches. Reattachment has exactly one owner, so the
   watchdog and the exit hook can never both assume the other is handling it.
-- After 60s with no new lines the run says so once and keeps capturing.
-- A footer line and a widget above the editor show the live state, e.g.
-  `📖 xcodebug · capturing · 7895 lines · 42s · /xcodebug stop to end`, plus the
-  last few log lines and how many channels are streaming.
-- Pushed log batches are **hidden from the transcript** (`display: false`) but
-  still delivered to the model, which is the only consumer that needs every
-  line. The screen keeps one status line instead of a wall of log frames.
-- `/xcodebug stop` (or `action=stop`) closes **every running capture** - the
-  console bridge and its syslog companion, plus any other app still streaming.
-  Pass `captureId=` to close one. `keepApp=false` also terminates the app.
+- In native pi/omp push modes, after 60s with no new lines the run says so once
+  and keeps capturing. MCP users use `logs`/`wait` to inspect quiet captures.
+- In pi/omp, a footer line and a widget above the editor show the live state,
+  e.g. `📖 xcodebug · capturing · 7895 lines · 42s · /xcodebug stop to end`, plus
+  recent log lines and the number of streaming channels. Claude Code can instead
+  load the [live display Mod](#claude-code-live-display).
+- Native pushed log batches are **hidden from the transcript** (`display: false`)
+  but delivered to the model, subject to the per-batch limit. MCP does not push
+  batches; the Claude Mod's display does not add logs to model context.
+- `/xcodebug stop` (or `action=stop`) without `captureId` closes **every running
+  capture**. An ID scopes the stop to that target; a console primary's syslog
+  companion is stopped too. Other apps' captures are unaffected by a targeted
+  stop. `keepApp=false` also terminates the app.
 
 ## Usage
 
@@ -801,7 +807,8 @@ only comes from the console bridge, per the table at the top.
 
 ### Pushing logs into the conversation
 
-`push` controls whether new lines are mirrored into the session:
+In native pi/omp, `push` controls whether new lines are mirrored into the session.
+The MCP adapter accepts only `off`; Claude Code and Codex use `logs`/`wait`.
 
 - `context` (default) — new lines are queued for the next turn (does not start one).
 - `off` — pull with `logs`/`wait` only.

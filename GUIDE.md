@@ -50,9 +50,10 @@ The 14 actions and their parameters are tabulated in
 [README.md § Usage](README.md#usage). Two of them differ from what the name
 suggests, so they are repeated here:
 
-- `stop` closes **every running capture** (the console bridge and its syslog
-  companion, plus any other app still streaming). Pass `captureId=` to close one.
-  `keepApp=true` is the default and leaves the app running.
+- `stop` without `captureId` closes **every running capture**. With an ID, it
+  stops that target; stopping a console primary also stops its syslog companion.
+  Other apps' captures are unaffected by a targeted stop. `keepApp=true` is the
+  default and leaves the app running.
 - `restart` replays the last launch of this session — device, scheme, goal and
   the `command=` it carried — and forces a rebuild.
 
@@ -229,19 +230,26 @@ xcodebug action=await command="cd /repo && npm run test:weather"
 Every capture is mirrored to
 `<agentDir>/logs/xcodebug/<mode>-<bundleId>-<YYYY-MM-DD_HH-mm-ss-SSS>.log`.
 
-`agentDir` comes from the host (`ctx.agentDir`, else the parent of the session
-directory), so each brand writes under its own prefix (`.pi` / `.omp` / `.omo` /
-`.senpi`); the extension hardcodes none of them. The bundle id is in the name
-because several apps are debugged in one session, and the timestamp carries
-milliseconds because relaunching the same app within a second would otherwise
-interleave two runs in one file. The in-memory ring buffer keeps the last 20k
-lines; the file on disk is complete.
+In pi/omp, `agentDir` comes from the host (`ctx.agentDir`, else the parent of the
+session directory), so each brand writes under its own prefix (`.pi` / `.omp` /
+`.omo` / `.senpi`). MCP defaults to `~/.xcodebug`, overridden by
+`XCODEBUG_AGENT_DIR`. The bundle id separates apps, and the timestamp includes
+milliseconds to separate runs.
+
+Memory retains at most 20k lines and 4 MiB of text. Disk logging rotates through
+the base path plus `.1` and `.2`, retaining three segments targeting 50 MiB each;
+older segments are overwritten. Complete lines are kept, so a single oversized
+line can exceed a segment's target size. Shutdown allows two seconds to drain
+pending writes; a drain timeout can truncate logs. Neither memory nor disk is
+a lossless archive of the whole run. See [retention](README.md#reading-logs-from-a-cursor)
+and [disk files](README.md#files) for details and the `logFiles` path list.
 
 ## Three rules of use
 
-1. **Stop once the log has answered the question.** A capture left running only
-   keeps flooding the session.
+1. **Stop once the log has answered the question.** A capture left running keeps
+   consuming capture resources; native push modes also keep sending log batches.
 2. **Do not stop while the user has not acted yet.** Silence there means "not
    tried yet", not "finished" — say what to tap and keep listening.
-3. **A capture ends on its own when the app process exits.** Do not reconnect a
-   run whose app the user deliberately closed.
+3. **A console capture ends when the app process is confirmed gone.** Its syslog
+   companion is stopped too. A standalone `syslog` capture is not bound to the
+   app's lifetime and keeps reconnecting; stop it explicitly when finished.
