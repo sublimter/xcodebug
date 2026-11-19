@@ -10,7 +10,7 @@
  * Pod membership is derived from the repo's own podspecs (`source_files`
  * globs), so it follows whatever layout the podspec declares.
  */
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
 import { runCommand } from "./exec.ts";
 
@@ -61,17 +61,36 @@ export interface ChangeReport {
   needsBuild: boolean;
 }
 
+/**
+ * Is this of a type a project compiles as soon as it sees the file? A new one
+ * in a pod then needs `pod install`, which is the only question this answers.
+ */
+function isSource(path: string): boolean {
+  const lower = path.toLowerCase();
+  if (lower.endsWith("podfile") || lower.endsWith("podfile.lock") || lower.endsWith(".podspec")) return true;
+  if (lower.includes(".xcodeproj/") || lower.includes(".xcworkspace/")) return true;
+  const dot = lower.lastIndexOf(".");
+  return dot >= 0 && SOURCE_EXTENSIONS.has(lower.slice(dot));
+}
+
+/**
+ * Types no build reads, though a working session writes them into a repository:
+ * notes, logs, crash reports, patches.
+ */
+const NEVER_BUILT = new Set([".md", ".log", ".ips", ".patch", ".diff"]);
+
 function isRelevant(path: string): boolean {
   const normalized = `/${path.replace(/\\/g, "/")}`;
   if (IGNORED_SEGMENTS.some((segment) => normalized.includes(segment))) return false;
   // Agent state is not app source: a session file or skill under a config dir
   // must not trigger a device build.
   if (AGENT_STATE_DIRS.some((dir) => normalized.includes(`/${dir}/`))) return false;
-  const lower = path.toLowerCase();
-  if (lower.endsWith("podfile") || lower.endsWith("podfile.lock") || lower.endsWith(".podspec")) return true;
-  if (lower.includes(".xcodeproj/") || lower.includes(".xcworkspace/")) return true;
-  const dot = lower.lastIndexOf(".");
-  return dot >= 0 && SOURCE_EXTENSIONS.has(lower.slice(dot));
+  // Anything else git reports can feed the build: a Podfile.rb, an .xcconfig,
+  // an image dropped into a folder the project takes whole. A build that is
+  // reused must not be older than its inputs, so the list is of what is known
+  // not to be one, and an unknown type costs a rebuild instead of a stale app.
+  const dot = path.lastIndexOf(".");
+  return dot < 0 || !NEVER_BUILT.has(path.slice(dot).toLowerCase());
 }
 
 /** Expand one glob (braces, **, *) into a RegExp over repo-relative paths. */
@@ -157,16 +176,77 @@ function podsForPath(path: string, pods: PodEntry[]): string[] {
  *
  * `git status` keeps reporting the same path after a second edit, so hashing
  * paths alone would silently skip a rebuild. mtime + size changes on every
- * write and costs one stat per changed file.
+ * write and costs one stat per changed file. Whether the change is staged is
+ * left out: `git add` does not alter what gets built.
  */
 async function fileSignature(repoRoot: string, file: ChangedFile): Promise<string> {
-  if (file.deleted) return `${file.status}:${file.path}:deleted`;
+  if (file.deleted) return `${file.path}:deleted`;
   try {
-    const info = await stat(join(repoRoot, file.path));
-    return `${file.status}:${file.path}:${info.mtimeMs}:${info.size}`;
+    const path = join(repoRoot, file.path);
+    const info = await stat(path);
+    // A directory here is a submodule: one entry however much changed inside
+    // it, and nothing on the entry itself tells two of its states apart.
+    if (info.isDirectory()) return `${file.path}:${(await directorySignature(path)) ?? "unreadable"}`;
+    return `${file.path}:${info.mtimeMs}:${info.size}`;
   } catch {
-    return `${file.status}:${file.path}:missing`;
+    return `${file.path}:missing`;
   }
+}
+
+/**
+ * Fingerprint a directory git says nothing about: every file's path, time and size.
+ *
+ * It serves both ends of a build that lie outside the repository's view - a pod
+ * installed from a local path elsewhere, and the built app - where the question
+ * is the same: is this still what it was? Undefined when the directory is
+ * missing or changes under the walk, which is never "the same as before".
+ */
+export async function directorySignature(root: string): Promise<string | undefined> {
+  const files: string[] = [];
+  const pending = [root];
+  for (let dir = pending.pop(); dir !== undefined; dir = pending.pop()) {
+    try {
+      for (const entry of await readdir(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!IGNORED_SEGMENTS.includes(`/${entry.name}/`)) pending.push(path);
+          continue;
+        }
+        // Not followed: a link is recorded as itself, so one that points at a
+        // directory, or at nothing, does not make the whole tree unreadable.
+        const info = await lstat(path);
+        files.push(`${path}:${info.mtimeMs}:${info.size}`);
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  return hashString(files.sort().join("\n"));
+}
+
+/**
+ * The directories outside the repository that a container's Podfile.lock
+ * installs pods from (`:path` entries). An edit there changes what gets built
+ * and leaves `git status` exactly as it was.
+ */
+async function outsidePodDirs(containerPath: string, repoRoot: string): Promise<string[]> {
+  const dir = dirname(resolve(containerPath));
+  let lock: string;
+  try {
+    lock = await readFile(join(dir, "Podfile.lock"), "utf8");
+  } catch {
+    return [];
+  }
+  // Compared as real paths: git reports the repository's, and a path reached
+  // through a link (/tmp, /var) would otherwise always look like another place.
+  const root = await realpath(repoRoot).catch(() => repoRoot);
+  const dirs = new Set<string>();
+  for (const match of lock.matchAll(/^\s+:path:\s*"?([^"\n]+?)"?\s*$/gm)) {
+    const path = resolve(dir, match[1]);
+    const real = await realpath(path).catch(() => path);
+    if (real !== root && !real.startsWith(`${root}/`)) dirs.add(real);
+  }
+  return [...dirs].sort();
 }
 
 export function hashString(value: string): string {
@@ -242,7 +322,12 @@ export async function checkPodLockSync(
   return { synced: false, podfileDir: dir, reason: "Podfile.lock differs from Pods/Manifest.lock" };
 }
 
-export async function detectChanges(cwd: string): Promise<ChangeReport> {
+/**
+ * `containerPath` is the .xcworkspace/.xcodeproj the run targets. With it, the
+ * fingerprint also covers pods that container installs from outside the
+ * repository; without it, only what git can see.
+ */
+export async function detectChanges(cwd: string, containerPath?: string): Promise<ChangeReport> {
   const root = await runCommand("git", ["rev-parse", "--show-toplevel"], { cwd, timeoutMs: 30_000 });
   if (root.code !== 0) {
     return {
@@ -294,15 +379,27 @@ export async function detectChanges(cwd: string): Promise<ChangeReport> {
   for (const file of changed) {
     if (file.deleted) continue;
     const isNew = file.untracked || file.status.includes("A");
-    if (!isNew) continue;
+    // Only a file the generated Pods project would compile needs it regenerated.
+    if (!isNew || !isSource(file.path)) continue;
     const matched = podsForPath(file.path, pods);
     if (matched.length === 0) continue;
     newComponentFiles.push({ ...file, pods: matched });
     for (const pod of matched) podsNeedingInstall.add(pod);
   }
 
+  // The committed tree is part of the identity: after a commit, a pull or a
+  // checkout the working tree can be clean again while holding other code than
+  // was last built. The tree rather than the commit, so that rewording a commit
+  // or switching to a branch with the same content costs no rebuild.
+  const head = await runCommand("git", ["rev-parse", "HEAD^{tree}"], { cwd: repoRoot, timeoutMs: 30_000 });
   const signatures = await Promise.all(changed.map((file) => fileSignature(repoRoot, file)));
-  const fingerprint = hashString(signatures.sort().join("\n"));
+  const outside = containerPath ? await outsidePodDirs(containerPath, repoRoot) : [];
+  const outsideSignatures = await Promise.all(
+    outside.map(async (dir) => `${dir}:${(await directorySignature(dir)) ?? "unreadable"}`),
+  );
+  const fingerprint = hashString(
+    [head.code === 0 ? head.stdout.trim() : "no commit", ...signatures.sort(), ...outsideSignatures].join("\n"),
+  );
 
   return {
     repoRoot,
@@ -358,7 +455,7 @@ export function describeChanges(report: ChangeReport): string {
   if (report.unavailable) {
     return `change detection unavailable (${report.reason ?? "unknown"}); assuming a rebuild is needed`;
   }
-  if (report.changed.length === 0) return "no build-relevant changes";
+  if (report.changed.length === 0) return "no uncommitted build-relevant changes";
   const lines = [`${report.changed.length} build-relevant change(s)`];
   for (const file of report.changed.slice(0, 15)) {
     lines.push(`  ${file.status} ${file.path}`);

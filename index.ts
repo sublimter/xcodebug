@@ -16,12 +16,12 @@ import { basename, dirname, join } from "node:path";
 // one distribution of the engine.
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Capture, type LogLine } from "./capture.ts";
-import { describeDevices, findProcessPid, listDevices, lookupProcess, resolveDevice, type DeviceInfo } from "./devices.ts";
+import { Capture, matchesFilter, type FoundLine } from "./capture.ts";
+import { describeDevices, findProcessPid, listDevices, lookupProcess, pullCrashReport, resolveDevice, type DeviceInfo } from "./devices.ts";
 import { lastLines, runCommand, timestamp } from "./exec.ts";
-import { buildForDevice, consoleLaunchArgs, installApp, terminateApp, type BuildTarget } from "./xcode.ts";
-import { checkPodLockSync, describeChanges, detectChanges, runPodInstall, type ChangeReport } from "./changes.ts";
-import { clearArchives } from "./archive.ts";
+import { buildForDevice, consoleLaunchArgs, installApp, terminateApp, type BuildOutcome, type BuildTarget } from "./xcode.ts";
+import { checkPodLockSync, describeChanges, detectChanges, directorySignature, runPodInstall, type ChangeReport } from "./changes.ts";
+import { clearArchives, pruneLogs } from "./archive.ts";
 
 const CAPTURE_PREFIX = "xcodebug";
 const PUSH_INTERVAL_MS = 4_000;
@@ -36,6 +36,31 @@ const SILENCE_NOTICE_MS = 60_000;
  * producing lines, so only the syslog side needs this.
  */
 const SYSLOG_SILENCE_MS = 30_000;
+/**
+ * When to look for a crash report after a console bridge goes down, each
+ * counted from the attempt before. The device needs a few seconds to write one:
+ * 8s after a watchdog kill, measured.
+ */
+const CRASH_REPORT_DELAYS_MS = [2_000, 4_000, 8_000, 16_000];
+/**
+ * A report is dated by the phone's clock and a bridge's end by this machine's.
+ * Without some slack, a phone running slightly behind would date the report of
+ * the crash that took the bridge down to before it went.
+ */
+const DEVICE_CLOCK_SKEW_MS = 5_000;
+/**
+ * How long a log outlives its last write. Every run leaves a build log of
+ * several megabytes and a capture log beside it, and nothing else removes them.
+ */
+const LOG_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * Actions that work whatever state `.xcodebug.json` is in: `doctor` reports it,
+ * and reading or stopping a capture never uses it. Every other action refuses a
+ * config that does not parse, because running as if there were none uses the
+ * defaults the file was written to override. Listed as exemptions so that an
+ * action added later refuses too.
+ */
+const CONFIG_FREE_ACTIONS = new Set(["doctor", "devices", "logs", "wait", "status", "stop", "await"]);
 
 interface ProjectConfig {
   workspace?: string;
@@ -57,8 +82,15 @@ interface SessionState {
   activeCaptureId?: string;
   pushTimers: Map<string, ReturnType<typeof setInterval>>;
   pushCursors: Map<string, number>;
-  /** Fingerprint of the working tree at the last successful build in this session. */
-  lastBuiltFingerprint?: string;
+  /**
+   * What this session built, per target and device: the tree each build was made
+   * from, and its product as the build left it. A map, because one session
+   * debugs several apps and the build of one says nothing about another. The
+   * last entry is the most recent build.
+   */
+  builds: Map<string, { fingerprint: string; appPath: string; product: string; bundleId?: string; executable?: string }>;
+  /** Old logs are cleared once per session, by its first run. */
+  logsPruned?: boolean;
   /** Key of the new-component-file set pod install has already handled. */
   installedPodsFingerprint?: string;
   /** console capture id -> parallel syslog capture id. */
@@ -211,11 +243,21 @@ function archiveWorkDir(ctx: ExtensionContext): string {
  * disk. A new build is the natural boundary: whatever happened before it
  * belongs to a different binary.
  */
-async function clearArchiveBeforeNewRun(ctx: ExtensionContext): Promise<string> {
+async function clearArchiveBeforeNewRun(ctx: ExtensionContext): Promise<string | undefined> {
   const { removed, freedBytes } = await clearArchives(archiveWorkDir(ctx));
-  if (removed === 0) return "archive: nothing to clear";
+  // Archiving is off, so there is normally nothing here; only say so when a
+  // snapshot from an older version was actually removed.
+  if (removed === 0) return undefined;
   const mb = (freedBytes / 1024 / 1024).toFixed(0);
   return `archive: cleared ${removed} snapshot(s), freed ${mb} MB`;
+}
+
+/** A build is another run's only when target, configuration and device all match. */
+function buildKeyOf(target: BuildTarget, device: DeviceInfo): string {
+  return JSON.stringify([
+    target.workspace, target.project, target.scheme, target.configuration, target.derivedDataPath,
+    device.udid ?? device.id,
+  ]);
 }
 
 async function readBundleExecutable(appPath: string): Promise<string | undefined> {
@@ -240,10 +282,19 @@ async function readBundleIdentifier(appPath: string): Promise<string | undefined
 }
 
 async function readConfig(cwd: string): Promise<ProjectConfig> {
+  const path = join(cwd, ".xcodebug.json");
+  let text: string;
   try {
-    return JSON.parse(await readFile(join(cwd, ".xcodebug.json"), "utf8")) as ProjectConfig;
+    text = await readFile(path, "utf8");
   } catch {
     return {};
+  }
+  try {
+    return JSON.parse(text) as ProjectConfig;
+  } catch (error) {
+    // Reading a config that does not parse as "no config" runs with the very
+    // defaults it was written to override - another scheme, another device.
+    throw new Error(`${path} is not valid JSON: ${(error as Error).message}`);
   }
 }
 
@@ -503,26 +554,102 @@ function resolveBuildTarget(config: ProjectConfig, params: {
   };
 }
 
-function formatLogLines(capture: Capture, since: number, limit: number, grep?: string): {
-  text: string;
-  cursor: number;
-  total: number;
-} {
-  const read = capture.read({ since, limit, grep });
-  if (read.lines.length === 0) {
-    return { text: `(no new lines since ${since}; capture cursor is ${read.cursor})`, cursor: read.cursor, total: 0 };
+/**
+ * `match`/`grep` as the reads take them: a substring, or a pattern when the
+ * caller set `regex`. A pattern is what lets one wait cover both outcomes
+ * ("sync (done|failed)"), where a substring can only ever name one.
+ */
+function toFilter(text: string | undefined, regex: boolean | undefined): string | RegExp | undefined {
+  if (!text || !regex) return text;
+  try {
+    return new RegExp(text);
+  } catch (error) {
+    throw new Error(`"${text}" is not a valid regular expression: ${(error as Error).message}`);
   }
-  const body = read.lines
+}
+
+/**
+ * What a reply owes its reader when the lines asked for start before the buffer
+ * does: without it "no match" reads as "never logged" when the line was only
+ * evicted. `missing` is absent for a read that did not look on disk.
+ */
+function evictedNote(read: { evicted: number; missing?: number }, logFile: string): string {
+  if (read.evicted === 0) return "";
+  if (read.missing === undefined) {
+    return `\nnote: ${read.evicted} older line(s) are no longer in memory; read them from ${logFile}`;
+  }
+  const found = read.evicted - read.missing;
+  const parts = [
+    found > 0 ? `${found} line(s) no longer in memory were searched in ${logFile}` : "",
+    // Overwritten by rotation, or never written: either way this read cannot speak for them.
+    read.missing > 0 ? `${read.missing} line(s) are in neither memory nor the log files and were not searched` : "",
+  ];
+  return `\nnote: ${parts.filter(Boolean).join("; ")}`;
+}
+
+/**
+ * The last thing a capture logged that xcodebug did not write itself.
+ *
+ * devicectl reports a death in its own words ("App terminated due to signal 9.")
+ * as it exits; when it said nothing, the app's last line is the next best lead.
+ */
+function lastWords(capture: Capture): string | undefined {
+  const lines = capture.read({ limit: 20 }).lines.filter((line) => !line.text.startsWith("[xcodebug]"));
+  return lines.at(-1)?.text.slice(0, 200);
+}
+
+/**
+ * What is settled about a capture that ended on its own: why, and the crash
+ * report its app left on the device. Empty while neither is known.
+ */
+function endedNote(capture: Capture): string {
+  const reason = capture.endReason ? ` · ${capture.endReason}` : "";
+  return `${reason}${capture.crashReport ? ` · crash report: ${capture.crashReport}` : ""}`;
+}
+
+/**
+ * The same for a reply that finds a console bridge already down. Whether the app
+ * died or only the bridge dropped is settled a moment after the bridge goes;
+ * until then the capture's last line is what there is to go on.
+ */
+function whyEnded(capture: Capture): string {
+  const last = capture.endReason ? undefined : lastWords(capture);
+  return `${last ? ` · last line: "${last}"` : ""}${endedNote(capture)}`;
+}
+
+/** Host time of a line, for lining a log up with a test runner's own output. */
+function clock(at: number): string {
+  const date = new Date(at);
+  const pad = (value: number, width = 2): string => String(value).padStart(width, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)} `;
+}
+
+async function formatLogLines(
+  capture: Capture,
+  options: { since: number; limit: number; grep?: string | RegExp; times?: boolean },
+): Promise<{ text: string; cursor: number; total: number }> {
+  const { since, limit, grep } = options;
+  // A filtered read looks on disk for what the buffer dropped. An unfiltered one
+  // returns the newest lines anyway, so the dropped ones only add to "omitted".
+  const read = grep ? await capture.search({ since, limit, grep }) : capture.read({ since, limit });
+  const total = grep ? read.total : read.total + read.evicted;
+  const note = evictedNote(read, capture.logFile);
+  if (read.lines.length === 0) {
+    const what = grep ? `no line matching ${typeof grep === "string" ? `"${grep}"` : grep}` : "no new lines";
+    return { text: `(${what} since ${since}; capture cursor is ${read.cursor})${note}`, cursor: read.cursor, total: 0 };
+  }
+  const lines: FoundLine[] = read.lines;
+  const body = lines
     .map((line) => {
       // In console mode devicectl's own status lines arrive on stdout while the
       // app's output arrives on stderr, so only stdout needs a label.
       const tag = capture.mode === "console" && line.stream === "out" ? "[devicectl] " : "";
-      return `${String(line.index).padStart(6, " ")} ${tag}${line.text}`;
+      return `${String(line.index).padStart(6, " ")} ${options.times ? clock(line.at) : ""}${tag}${line.text}`;
     })
     .join("\n");
-  const omitted = read.total - read.lines.length;
-  const header = `${read.lines.length} line(s)${omitted > 0 ? ` (${omitted} older omitted)` : ""} · cursor ${read.cursor}`;
-  return { text: `${header}\n${body}`, cursor: read.cursor, total: read.total };
+  const omitted = total - lines.length;
+  const header = `${lines.length} line(s)${omitted > 0 ? ` (${omitted} older omitted)` : ""} · cursor ${read.cursor}`;
+  return { text: `${header}\n${body}${note}`, cursor: read.cursor, total };
 }
 
 /** Fill in the container when the caller and the config both omit it. */
@@ -653,7 +780,7 @@ function parseCommandArgs(raw: string): ToolParams {
   const params: Record<string, unknown> = {};
   const free: string[] = [];
   const numberKeys = ["limit", "since", "timeoutSeconds"];
-  const boolKeys = ["force", "installPods", "dualChannel", "keepApp", "terminateExisting", "build"];
+  const boolKeys = ["force", "installPods", "dualChannel", "keepApp", "terminateExisting", "build", "regex", "times"];
 
   const assign = (key: string, value: string): void => {
     if (numberKeys.includes(key)) {
@@ -736,6 +863,10 @@ type ToolParams = {
   limit?: number;
   grep?: string;
   match?: string;
+  /** `match`/`grep` are regular expressions rather than substrings. */
+  regex?: boolean;
+  /** Prefix returned lines with the host time they arrived. */
+  times?: boolean;
   timeoutSeconds?: number;
   push?: "off" | "context" | "wake";
   force?: boolean;
@@ -757,6 +888,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     endedCaptures: new Set(),
     pushTimers: new Map(),
     pushCursors: new Map(),
+    builds: new Map(),
     companions: new Map(),
     lastLineAt: new Map(),
     silenceNotified: new Set(),
@@ -1054,6 +1186,81 @@ export default function xcodebug(pi: ExtensionAPI): void {
     }
   };
   /**
+   * Record the pid of the instance a console bridge has just launched.
+   *
+   * `replaced` is the instance that launch terminated. It stays in the process
+   * table for a moment afterwards, so the first answer can still be the one that
+   * is about to die - and a pid that names the wrong process makes `terminate`
+   * miss, and makes a later bridge drop look like someone else restarted the app.
+   */
+  const discoverAppPid = async (capture: Capture, device: DeviceInfo, replaced: number | undefined): Promise<void> => {
+    if (!capture.processName) return;
+    const launch = capture.relaunches;
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && capture.running && capture.relaunches === launch) {
+      const pid = await findProcessPid(device, capture.processName, { attempts: 1 });
+      if (pid !== undefined && pid !== replaced) {
+        if (capture.relaunches === launch) capture.appPid = pid;
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  };
+
+  /** Captures a crash report is being looked for, so two bridge drops close together search once. */
+  const crashSearches = new Set<string>();
+
+  /**
+   * Look for the crash report of an app whose console bridge went down.
+   *
+   * The device writes one a few seconds after the process died, so this tries a
+   * few times. An app that was only terminated, or that is still running, leaves
+   * none, and then nothing more is said. It runs apart from the capture: a
+   * `stop` a moment later must not call it off, since that is exactly how a run
+   * that ends in a crash is wrapped up.
+   */
+  const fetchCrashReport = async (capture: Capture, device: DeviceInfo): Promise<void> => {
+    const executable = capture.processName;
+    if (!executable || crashSearches.has(capture.id)) return;
+    crashSearches.add(capture.id);
+    // The instance whose bridge has just gone; a reattach will soon record another.
+    const pid = capture.appPid;
+    // A report is written after the process is gone, so one dated before the
+    // bridge went down belongs to an earlier run of the app.
+    const since = Date.now() - DEVICE_CLOCK_SKEW_MS;
+    try {
+      for (const delay of CRASH_REPORT_DELAYS_MS) {
+        // Unreferenced: a search still waiting must not hold a finished host open.
+        await new Promise((resolve) => {
+          setTimeout(resolve, delay).unref?.();
+        });
+        // The session ended, or has since let go of this capture.
+        if (state.captures.get(capture.id) !== capture) return;
+        const path = await pullCrashReport(device, executable, { since, pid, directory: dirname(capture.logFile) });
+        if (path) {
+          capture.crashReport = path;
+          capture.pushLine("err", `[xcodebug] crash report: ${path}`);
+          return;
+        }
+      }
+    } finally {
+      crashSearches.delete(capture.id);
+    }
+  };
+
+  /**
+   * End a console capture whose app is no longer the process it launched, and
+   * say why where a later read will find it: a capture that just stops looks
+   * the same as an app that went quiet.
+   */
+  const endCapture = (capture: Capture, reason: string): void => {
+    const last = lastWords(capture);
+    capture.endReason = last ? `${reason}; last line before the bridge ended: "${last}"` : reason;
+    capture.pushLine("err", `[xcodebug] ${capture.endReason}; stopping capture`);
+    releaseCapture(capture);
+  };
+
+  /**
    * Keep a capture alive for as long as the run lasts.
    *
    * `devicectl --console` is the only channel that carries the app's own
@@ -1091,18 +1298,32 @@ export default function xcodebug(pi: ExtensionAPI): void {
           // Only the console channel is bound to the app's lifetime, so only it
           // consults the process table. A syslog bridge outlives the app and its
           // drops say nothing about whether the app is still running.
+          // `listed` is the app's pid as the table has it now, when it could be read.
+          let listed: number | undefined;
           if (capture.mode === "console" && capture.processName) {
             const lookup = await lookupProcess(device, capture.processName, {
               attempts: 1,
               signal: capture.signal,
             });
-            if (!lookup.queryFailed && lookup.pid === undefined) {
-              capture.pushLine("err", "[xcodebug] app process is gone; stopping capture");
-              releaseCapture(capture);
-              return;
-            }
+            // A stop that lands during the probe aborts it, which reads as a
+            // failed query; carrying on would relaunch an app the user has let go.
+            if (capture.stoppedByUser) return;
             if (lookup.queryFailed) {
               capture.pushLine("err", "[xcodebug] could not read the process table; still retrying");
+            } else if (lookup.pid === undefined) {
+              endCapture(capture, "the app exited");
+              return;
+            } else if (capture.appPid !== undefined && lookup.pid !== capture.appPid) {
+              // The console attaches only by launching, so reattaching here would
+              // kill whatever started this instance - another session's capture,
+              // which would then do the same to this one, or a test runner's app.
+              endCapture(
+                capture,
+                `the app was restarted outside this capture (pid ${capture.appPid} -> ${lookup.pid}) and is left running`,
+              );
+              return;
+            } else {
+              listed = lookup.pid;
             }
           }
 
@@ -1117,7 +1338,21 @@ export default function xcodebug(pi: ExtensionAPI): void {
             if (capture.pushMode && state.pushTimers.get(capture.id) === undefined) {
               startPush(capture, capture.pushMode, capture.pushMatch, { resume: true });
             }
-            capture.pushLine("err", `[xcodebug] ${label} bridge reattached`);
+            // devicectl attaches a console only by launching, and this launch
+            // terminates the instance that was running.
+            if (capture.mode === "console" && capture.launchArgs.includes("--terminate-existing")) {
+              capture.relaunches += 1;
+              // Without a reading of the table the new pid cannot be told from
+              // the old one, and none is better than one that may be wrong.
+              capture.appPid = undefined;
+              if (listed !== undefined) void discoverAppPid(capture, device, listed);
+              capture.pushLine(
+                "err",
+                `[xcodebug] console bridge reattached - this relaunched the app (relaunch ${capture.relaunches}), so the state it had is gone`,
+              );
+            } else {
+              capture.pushLine("err", `[xcodebug] ${label} bridge reattached`);
+            }
             return;
           } catch (error) {
             capture.pushLine("err", `[xcodebug] reconnect failed: ${(error as Error).message}`);
@@ -1141,6 +1376,10 @@ export default function xcodebug(pi: ExtensionAPI): void {
         releaseCapture(capture);
         return;
       }
+      // An app that dies takes its console with it. Looking for its report
+      // starts here rather than once the reconnect below has settled what
+      // happened, because a `stop` can arrive before it does.
+      if (capture.mode === "console") void fetchCrashReport(capture, device);
       // Always hand off. If a reconnect loop is already running it returns at
       // once and keeps retrying on its own; if none is running, this starts it.
       // An earlier version skipped this while the watchdog was restarting, which
@@ -1275,8 +1514,10 @@ export default function xcodebug(pi: ExtensionAPI): void {
     onUpdate?: (text: string) => void;
     /** The .xcworkspace/.xcodeproj this run targets; anchors the Podfile lookup. */
     containerPath?: string;
+    /** Which of this session's builds would be reused; without one, a build is always needed. */
+    buildKey?: string;
   }): Promise<{ report: ChangeReport; needsBuild: boolean; podInstall?: string; podInstallFailed: boolean; notes: string[] }> => {
-    let report = await detectChanges(options.root);
+    let report = await detectChanges(options.root, options.containerPath);
     const notes: string[] = [];
     let podInstallNote: string | undefined;
     let podInstallFailed = false;
@@ -1330,7 +1571,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         // pod install rewrites Podfile.lock and the Pods project, so re-read the
         // tree: storing the pre-install fingerprint would make the next launch
         // think the pods are still stale and install them again.
-        report = await detectChanges(options.root);
+        report = await detectChanges(options.root, options.containerPath);
         // Record the key derived from the post-install tree, not the one that
         // triggered this install: pod install can change the new-file set, and a
         // stale key would make the next run skip an install it still needs.
@@ -1347,13 +1588,49 @@ export default function xcodebug(pi: ExtensionAPI): void {
       }
     }
 
+    // A build is reused only when it was made of this target, from this tree,
+    // and its product is still what the build left behind: Xcode, or a raw
+    // xcodebuild in another terminal, writes the same DerivedData path.
+    const built = options.buildKey === undefined ? undefined : state.builds.get(options.buildKey);
     const needsBuild =
       options.force === true ||
       report.unavailable ||
-      state.lastBuiltFingerprint === undefined ||
-      state.lastBuiltFingerprint !== report.fingerprint;
+      built?.fingerprint !== report.fingerprint ||
+      (await directorySignature(built.appPath)) !== built.product;
 
     return { report, needsBuild, podInstall: podInstallNote, podInstallFailed, notes };
+  };
+
+  /**
+   * Remember a successful build so the next run of the same target can reuse it.
+   *
+   * `before` is the tree the build started from. If the tree is different once
+   * the build is over, something changed while it ran, and whether that change
+   * made it into the product is unknowable - so the build is not remembered, the
+   * next run builds again, and the returned note says why.
+   */
+  const rememberBuild = async (
+    key: string,
+    before: string,
+    root: string,
+    containerPath: string | undefined,
+    outcome: BuildOutcome,
+  ): Promise<string | undefined> => {
+    if (!outcome.appPath) return undefined;
+    const after = (await detectChanges(root, containerPath)).fingerprint;
+    if (after !== before) {
+      return "the working tree changed while this was building, so the next run builds again instead of reusing it";
+    }
+    const product = await directorySignature(outcome.appPath);
+    if (product === undefined) return undefined;
+    state.builds.set(key, {
+      fingerprint: after,
+      appPath: outcome.appPath,
+      product,
+      bundleId: outcome.bundleId,
+      executable: outcome.executable,
+    });
+    return undefined;
   };
 
   /**
@@ -1397,6 +1674,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
 
     const since = target?.status().cursor ?? 0;
     const linesAtStart = target?.status().lineCount ?? 0;
+    const relaunchesAtStart = target?.relaunches ?? 0;
     const result = await runCommand(bin, argv, {
       cwd,
       timeoutMs,
@@ -1412,11 +1690,24 @@ export default function xcodebug(pi: ExtensionAPI): void {
     // the screen stays where the case left it.
     let captureNote = "no capture was running; nothing to stop";
     if (target) {
+      // A bridge that is already down went down by itself, and the reply has to
+      // say so: "the case ran" and "the app died under the case" must not read
+      // alike. Stopping still matters then - it calls off a pending reattach,
+      // which would relaunch the app now that the case is over.
+      const how = target.running
+        ? `stopped ${target.id}`
+        : target.stoppedByUser
+          ? `${target.id} was already stopped`
+          : `warning: ${target.id} was no longer capturing when the command finished${whyEnded(target)}`;
       stopCapture(target, false);
       await target.waitForExit(5_000);
       const status = target.status();
       const added = Math.max(0, status.lineCount - linesAtStart);
-      captureNote = `stopped ${status.id} · ${added} new line(s) · ${status.logFile}`;
+      captureNote = `${how} · ${added} new line(s) · ${status.logFile}`;
+      const relaunched = target.relaunches - relaunchesAtStart;
+      if (relaunched > 0) {
+        captureNote += `\nwarning: a console reattach relaunched the app ${relaunched} time(s) during this run; lines after a relaunch come from a fresh instance`;
+      }
     }
 
     const verdict = result.timedOut
@@ -1463,8 +1754,20 @@ export default function xcodebug(pi: ExtensionAPI): void {
     // lookup below (config, change detection, container discovery, the command's
     // working directory) must agree on one root or they disagree about the project.
     const projectRoot = resolveProjectRoot(pi, ctx);
-    const config = await readConfig(projectRoot);
+    const configRead = await readConfig(projectRoot).then(
+      (value) => ({ value, error: undefined }),
+      (error: Error) => ({ value: {} as ProjectConfig, error }),
+    );
+    const config = configRead.value;
     const action = params.action;
+    if (configRead.error && !CONFIG_FREE_ACTIONS.has(action)) throw configRead.error;
+
+    // The first run of a session clears out the logs nothing has written to in
+    // a while, before it adds its own.
+    if (!state.logsPruned && (action === "build" || action === "launch" || action === "syslog")) {
+      state.logsPruned = true;
+      await pruneLogs(logDir(ctx), LOG_RETENTION_MS);
+    }
 
     if (action === "doctor") {
       const checks = await Promise.all([
@@ -1472,28 +1775,38 @@ export default function xcodebug(pi: ExtensionAPI): void {
         runCommand("xcrun", ["devicectl", "--version"], { timeoutMs: 30_000 }),
         runCommand("idevicesyslog", ["--version"], { timeoutMs: 20_000 }),
       ]);
+      const configLine = configRead.error
+        ? configRead.error.message
+        : Object.keys(config).length > 0 ? join(projectRoot, ".xcodebug.json") : "(none)";
       const lines = [
         `xcodebuild: ${checks[0].code === 0 ? checks[0].stdout.split("\n")[0] : "missing"}`,
         `devicectl: ${checks[1].code === 0 ? (checks[1].stdout || checks[1].stderr).trim().split("\n")[0] : "missing"}`,
         `idevicesyslog: ${checks[2].code === 0 ? (checks[2].stdout || checks[2].stderr).trim().split("\n")[0] : "missing (optional, syslog action only)"}`,
-        `config: ${Object.keys(config).length > 0 ? join(projectRoot, ".xcodebug.json") : "(none)"}`,
+        `config: ${configLine}`,
         `log dir: ${logDir(ctx)}`,
       ];
       return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
     }
 
     if (action === "changes") {
-      const report = await detectChanges(projectRoot);
+      // The container a build would pick, so the fingerprint shown here is the
+      // one a build compares against.
+      const detected = await detectContainer(projectRoot);
+      const containerPath =
+        params.workspace ?? config.workspace ?? detected.workspace ??
+        params.project ?? config.project ?? detected.project;
+      const report = await detectChanges(projectRoot, containerPath);
+      const lastBuilt = [...state.builds.values()].at(-1)?.fingerprint;
       const lines = [
         describeChanges(report),
         `fingerprint: ${report.fingerprint}`,
-        `last build in this session: ${state.lastBuiltFingerprint ?? "(none)"}`,
-        `rebuild needed: ${report.needsBuild || state.lastBuiltFingerprint !== report.fingerprint ? "yes" : "no"}`,
+        `last build in this session: ${lastBuilt ?? "(none)"}`,
+        `rebuild needed: ${report.unavailable || lastBuilt !== report.fingerprint ? "yes" : "no"}`,
         `pod install needed: ${report.podsNeedingInstall.length > 0 ? report.podsNeedingInstall.join(", ") : "no"}`,
       ];
       return {
         content: [{ type: "text", text: lines.join("\n") }],
-        details: { report, lastBuiltFingerprint: state.lastBuiltFingerprint },
+        details: { report, lastBuiltFingerprint: lastBuilt },
       };
     }
 
@@ -1508,13 +1821,16 @@ export default function xcodebug(pi: ExtensionAPI): void {
       setRunPhase("resolving the project…");
       const device = await resolveDeviceParam(params.device, projectRoot);
       const target = await withContainer(projectRoot, config, params);
+      const buildKey = buildKeyOf(target, device);
+      const containerPath = target.workspace ?? target.project;
       const gate = await prepareRun(ctx, {
         root: projectRoot,
         force: params.force,
         installPods: params.installPods,
         timeoutSeconds: params.timeoutSeconds,
         signal,
-        containerPath: target.workspace ?? target.project,
+        containerPath,
+        buildKey,
         onUpdate: (text) => onUpdate?.({ content: [{ type: "text", text }], details: {} }),
       });
       if (gate.podInstallFailed) {
@@ -1527,14 +1843,17 @@ export default function xcodebug(pi: ExtensionAPI): void {
       if (!gate.needsBuild) {
         const summary =
           gate.report.changed.length === 0
-            ? "no build-relevant changes"
-            : `${gate.report.changed.length} changed file(s), but they are unchanged since the last successful build`;
+            ? "nothing changed"
+            : `${gate.report.changed.length} changed file(s), but they are unchanged`;
         return {
-          content: [{ type: "text", text: `build skipped: ${summary} (fingerprint ${gate.report.fingerprint}; pass force=true to rebuild)` }],
+          content: [{ type: "text", text: `build skipped: ${summary} since this session's last successful build (fingerprint ${gate.report.fingerprint}; pass force=true to rebuild)` }],
           details: { report: gate.report, skipped: true },
         };
       }
       setRunPhase(`building ${target.scheme} for ${device.name}`);
+      // Forgotten before the build, not after: one that fails can leave the
+      // product half rewritten, which is no longer the build that was remembered.
+      state.builds.delete(buildKey);
       const outcome = await buildForDevice(target, device, {
         logDir: logDir(ctx),
         cwd: projectRoot,
@@ -1544,13 +1863,14 @@ export default function xcodebug(pi: ExtensionAPI): void {
         signal,
       });
       clearRunPhase();
+      let notRemembered: string | undefined;
       if (outcome.ok) {
-        state.lastBuiltFingerprint = (await detectChanges(projectRoot)).fingerprint;
+        notRemembered = await rememberBuild(buildKey, gate.report.fingerprint, projectRoot, containerPath, outcome);
         await clearArchiveBeforeNewRun(ctx);
       }
       const prefix = gate.podInstall ? `${gate.podInstall}\n` : "";
       return {
-        content: [{ type: "text", text: `${prefix}${outcome.summary}\nlog: ${outcome.logFile}` }],
+        content: [{ type: "text", text: `${prefix}${outcome.summary}${notRemembered ? `\nnote: ${notRemembered}` : ""}\nlog: ${outcome.logFile}` }],
         details: { ...outcome, report: gate.report },
         isError: !outcome.ok,
       };
@@ -1641,13 +1961,16 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // Resolve the container up front: the Podfile that governs this run lives
       // beside it, so the pod gate must not search from an arbitrary cwd.
       const launchTarget = explicitApp && !wantsBuild ? undefined : await withContainer(projectRoot, config, params);
+      const buildKey = launchTarget ? buildKeyOf(launchTarget, device) : undefined;
+      const containerPath = launchTarget ? (launchTarget.workspace ?? launchTarget.project) : undefined;
       const gate = await prepareRun(ctx, {
         root: projectRoot,
         force: params.force,
         installPods: explicitApp && !wantsBuild ? false : params.installPods,
         timeoutSeconds: params.timeoutSeconds,
         signal,
-        containerPath: launchTarget ? (launchTarget.workspace ?? launchTarget.project) : undefined,
+        containerPath,
+        buildKey,
         onUpdate: (text) => onUpdate?.({ content: [{ type: "text", text }], details: {} }),
       });
       const notes = [...gate.notes];
@@ -1661,13 +1984,16 @@ export default function xcodebug(pi: ExtensionAPI): void {
         };
       }
 
-      // Rebuild when the tree changed, when no build happened yet in this
-      // session, when the caller asked for a build, or when force is set.
-      const mustBuild = explicitApp && !wantsBuild ? false : gate.needsBuild || wantsBuild || !appPath;
+      // Rebuild when the tree changed, when this session has not built this
+      // target yet, when the caller asked for a build, or when force is set.
+      // `needsBuild` false means the gate found this target's build still good.
+      const reused = buildKey === undefined || gate.needsBuild || wantsBuild ? undefined : state.builds.get(buildKey);
+      const mustBuild = launchTarget !== undefined && buildKey !== undefined && reused === undefined;
       if (mustBuild) {
-        const target = launchTarget ?? (await withContainer(projectRoot, config, params));
-        setRunPhase(`building ${target.scheme} for ${device.name}`);
-        const build = await buildForDevice(target, device, {
+        setRunPhase(`building ${launchTarget.scheme} for ${device.name}`);
+        // Forgotten before the build, for the reason `build` gives.
+        state.builds.delete(buildKey);
+        const build = await buildForDevice(launchTarget, device, {
           logDir: logDir(ctx),
           cwd: projectRoot,
           onProgress: (text) => setRunPhase(text),
@@ -1682,19 +2008,39 @@ export default function xcodebug(pi: ExtensionAPI): void {
             isError: true,
           };
         }
-        state.lastBuiltFingerprint = (await detectChanges(projectRoot)).fingerprint;
-        notes.push(await clearArchiveBeforeNewRun(ctx));
+        const notRemembered = await rememberBuild(buildKey, gate.report.fingerprint, projectRoot, containerPath, build);
+        const cleared = await clearArchiveBeforeNewRun(ctx);
+        if (cleared) notes.push(cleared);
         appPath = build.appPath;
         bundleId = build.bundleId ?? bundleId;
         executable = build.executable;
         notes.push(build.summary);
+        if (notRemembered) notes.push(`note: ${notRemembered}`);
         if (!appPath) throw new Error(`Build succeeded but the product path is unknown.\nlog: ${build.logFile}`);
-      } else {
-        notes.push(`reusing this session's build (no changes since fingerprint ${gate.report.fingerprint})`);
+      } else if (reused) {
+        appPath = reused.appPath;
+        bundleId = reused.bundleId ?? bundleId;
+        executable = reused.executable;
+        notes.push(`reusing this session's build (nothing changed since fingerprint ${gate.report.fingerprint}; force=true rebuilds)\napp: ${appPath}`);
       }
 
       if (!appPath) throw new Error("launch requires appPath, or a scheme to build.");
       executable ??= params.processName ?? (await readBundleExecutable(appPath));
+
+      // The instance this launch is about to replace, read before the install
+      // because installing over a running app can end it already. The pid
+      // recorded further down must not be this one, so when the table cannot be
+      // read none is recorded.
+      const before =
+        executable && params.terminateExisting !== false
+          ? await lookupProcess(device, executable, { attempts: 1 })
+          : { queryFailed: false, pid: undefined };
+      // Another session's capture, or the user's own running app: its state is
+      // gone once this launch goes through, which is worth a line.
+      if (before.pid !== undefined && ![...state.captures.values()].some((c) => c.appPid === before.pid)) {
+        notes.push(`note: ${executable} was already running (pid ${before.pid}), not started by this session; this launch terminated it`);
+      }
+
       setRunPhase(`installing on ${device.name}`);
       const install = await installApp(device, appPath, { timeoutMs: 180_000, signal });
       if (!install.ok) {
@@ -1794,13 +2140,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
 
       // The app pid is not part of --console's output; discover it from the
       // process table so terminate can target the app rather than the bridge.
-      if (executable) {
-        const deadline = Date.now() + 20_000;
-        while (Date.now() < deadline && capture.appPid === undefined && capture.running) {
-          capture.appPid = await findProcessPid(device, executable, { attempts: 1 });
-          if (capture.appPid === undefined) await new Promise((resolve) => setTimeout(resolve, 500));
-        }
-      }
+      if (!before.queryFailed) await discoverAppPid(capture, device, before.pid);
 
       return {
         content: [{
@@ -1859,11 +2199,19 @@ export default function xcodebug(pi: ExtensionAPI): void {
     if (action === "logs") {
       const capture = requireCapture(params.captureId);
       const since = params.since ?? 0;
-      const formatted = formatLogLines(capture, since, params.limit ?? 200, params.grep);
+      const formatted = await formatLogLines(capture, {
+        since,
+        limit: params.limit ?? 200,
+        grep: toFilter(params.grep, params.regex),
+        times: params.times,
+      });
       const companionId = state.companions.get(capture.id);
       if (!capture.running && companionId) {
         formatted.text += `\n\n[this channel has ended; system-level logs continue in ${companionId} - pass captureId=${companionId}]`;
       }
+      // The lines that say so are in the log, but a filtered read leaves them out.
+      if (capture.endReason) formatted.text += `\n\n[this capture ended on its own · ${capture.endReason}]`;
+      if (capture.crashReport) formatted.text += `\n[crash report: ${capture.crashReport}]`;
       return {
         content: [{ type: "text", text: formatted.text }],
         details: { captureId: capture.id, cursor: formatted.cursor, total: formatted.total, running: capture.running },
@@ -1872,15 +2220,20 @@ export default function xcodebug(pi: ExtensionAPI): void {
 
     if (action === "wait") {
       const capture = requireCapture(params.captureId);
-      const needle = params.match;
-      if (!needle) throw new Error("wait requires match (a substring to wait for).");
+      const needle = toFilter(params.match, params.regex);
+      if (!needle) throw new Error("wait requires match (a substring to wait for, or a pattern with regex=true).");
+      const shown = typeof needle === "string" ? `"${needle}"` : String(needle);
       const timeoutMs = Math.min(Math.max(1, params.timeoutSeconds ?? 30), 600) * 1000;
       const since = params.since ?? 0;
 
-      const matches: LogLine[] = [];
+      const matches: FoundLine[] = [];
       const seen = new Set<number>();
       let finished = false;
       let cancelled = false;
+      // The backlog is read from disk too, which takes a moment. A line that
+      // arrives meanwhile must not settle the wait ahead of the earlier ones.
+      let backlogRead = false;
+      let note = "";
       let timer: ReturnType<typeof setTimeout> | undefined;
       let unsubscribeLine: () => void = () => {};
       let unsubscribeExit: () => void = () => {};
@@ -1892,16 +2245,16 @@ export default function xcodebug(pi: ExtensionAPI): void {
         if (matches.length === 0) {
           // Abort also settles through `finish`, so say what happened instead of
           // reporting a timeout that never elapsed.
-          if (cancelled) return `cancelled while waiting for "${needle}" (cursor ${cursor})`;
-          return timedOut
-            ? `timed out after ${timeoutMs / 1000}s waiting for "${needle}" (cursor ${cursor})`
-            : `capture ended before "${needle}" appeared (cursor ${cursor})`;
+          if (cancelled) return `cancelled while waiting for ${shown} (cursor ${cursor})${note}`;
+          if (timedOut) return `timed out after ${timeoutMs / 1000}s waiting for ${shown} (cursor ${cursor})${note}`;
+          return `capture ended before ${shown} appeared (cursor ${cursor})${whyEnded(capture)}${note}`;
         }
         const body = matches
+          .sort((a, b) => a.index - b.index)
           .slice(0, 200)
-          .map((line) => `${String(line.index).padStart(6, " ")} ${line.text}`)
+          .map((line) => `${String(line.index).padStart(6, " ")} ${params.times ? clock(line.at) : ""}${line.text}`)
           .join("\n");
-        return `matched ${matches.length} line(s) · cursor ${cursor}\n${body}`;
+        return `matched ${matches.length} line(s) · cursor ${cursor}\n${body}${note}`;
       };
 
       const finish = (timedOut: boolean): void => {
@@ -1916,14 +2269,14 @@ export default function xcodebug(pi: ExtensionAPI): void {
         resolveWait(settle(timedOut));
       };
 
-      const collect = (line: LogLine): void => {
+      const collect = (line: FoundLine): void => {
         if (finished || line.index <= since || seen.has(line.index)) return;
-        if (!line.text.includes(needle)) return;
+        if (!matchesFilter(line.text, needle)) return;
         seen.add(line.index);
         matches.push(line);
       };
 
-      const text = await new Promise<string>((resolve) => {
+      const waiting = new Promise<string>((resolve) => {
         resolveWait = resolve;
         // Subscribe first, then scan the backlog: the scan covers
         // [since, cursor] and the listener covers everything after it, so no
@@ -1931,23 +2284,28 @@ export default function xcodebug(pi: ExtensionAPI): void {
         unsubscribeLine = capture.onLine((line) => {
           collect(line);
           // Let the rest of the same chunk land before settling.
-          if (matches.length > 0) setTimeout(() => finish(false), 50);
+          if (backlogRead && matches.length > 0) setTimeout(() => finish(false), 50);
         });
-        unsubscribeExit = capture.onExit(() => setTimeout(() => finish(false), 0));
-        timer = setTimeout(() => finish(true), timeoutMs);
+        unsubscribeExit = capture.onExit(() => setTimeout(() => backlogRead && finish(false), 0));
         onAbort = (): void => {
           cancelled = true;
           finish(true);
         };
         signal?.addEventListener("abort", onAbort, { once: true });
-
-        for (const line of capture.read({ since, limit: 500, grep: needle }).lines) collect(line);
-
-        // A pattern already present in the backlog must return immediately,
-        // not wait out the timeout.
-        if (matches.length > 0) finish(false);
-        else if (!capture.running) finish(false);
       });
+
+      const backlog = await capture.search({ since, limit: 500, grep: needle });
+      for (const line of backlog.lines) collect(line);
+      note = evictedNote(backlog, capture.logFile);
+      backlogRead = true;
+      // The deadline bounds the wait for a line still to come, so it starts
+      // here: expiring while the lines already logged are being read back would
+      // report a timeout for a line that is sitting on disk.
+      if (!finished) timer = setTimeout(() => finish(true), timeoutMs);
+      // A pattern already present in the backlog must return immediately,
+      // not wait out the timeout.
+      if (matches.length > 0 || !capture.running) finish(false);
+      const text = await waiting;
 
       return {
         content: [{ type: "text", text }],
@@ -1968,7 +2326,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
           : [...state.companions.values()].includes(status.id)
             ? " · companion"
             : "";
-        return `- ${status.id} [${status.mode}] ${stateText}${role} · ${status.lineCount} lines · ${status.bundleId} · ${status.logFile}`;
+        const relaunched = status.relaunches > 0 ? ` · app relaunched ${status.relaunches}×` : "";
+        return `- ${status.id} [${status.mode}] ${stateText}${role}${relaunched}${endedNote(capture)} · ${status.lineCount} lines · ${status.bundleId} · ${status.logFile}`;
       });
       return { content: [{ type: "text", text: lines.join("\n") }], details: { captures: [...state.captures.values()].map((capture) => capture.status()) } };
     }
@@ -2105,14 +2464,14 @@ export default function xcodebug(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use xcodebug instead of raw xcodebuild/devicectl when debugging on a physical iOS device; it keeps a cursor so xcodebug action=logs returns only new output.",
       "xcodebug action=launch restarts the app; use action=syslog when the app must keep running.",
-      "Use xcodebug action=wait to block on an expected log line when verifying a feature end to end.",
+      "Use xcodebug action=wait to block on an expected log line when verifying a feature end to end. With regex=true, match is a pattern, so one wait covers both outcomes: match=\"sync (done|failed)\".",
       "xcodebug action=changes reports whether a rebuild or pod install is pending without running either.",
       "After editing code mid-run, use xcodebug action=restart instead of a full launch: it replays the last launch's app, device, scheme, goal and command, and forces the rebuild.",
       "For an automated run, pass command=\"cd /repo && npm run test:xxx\" to launch: it builds, installs, launches, runs the command to completion, then stops the capture and returns the exit code plus the app-side cursor. Never poll the log for silence to decide a run is done.",
       "The command's runner must not restart the app itself (disable any auto-launch option in the test config), or the launch that xcodebug is capturing dies and the log stops at the restart.",
       "Verification is a loop: run, read the log, stop, edit the code, run again. Once the log has answered the question, call action=stop and report the conclusion - keeping the capture alive only floods the session.",
       "The one case where you must NOT stop: the user has not touched the app yet, so the log is silent because nothing happened. Wait, tell them what to do on the phone, and keep capturing.",
-      "A capture also ends on its own when the app process exits; do not reconnect a run whose app the user deliberately closed.",
+      "A capture also ends on its own when the app process exits, or when something else relaunched the app; status and logs then say why, and name the crash report if the device wrote one. Do not reconnect a run whose app the user deliberately closed.",
     ],
     executionMode: "sequential",
     parameters: Type.Object({
@@ -2146,6 +2505,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
       limit: Type.Optional(Type.Number({ description: "Max lines to return (default 200)" })),
       grep: Type.Optional(Type.String({ description: "Only return lines containing this text" })),
       match: Type.Optional(Type.String({ description: "wait: substring to wait for; also filters pushed lines" })),
+      regex: Type.Optional(Type.Boolean({ description: "logs/wait: treat grep and match as regular expressions instead of substrings, e.g. match=\"sync (done|failed)\"." })),
+      times: Type.Optional(Type.Boolean({ description: "logs/wait: prefix each line with the host time it arrived (HH:MM:SS.mmm), to line it up with a test runner's output." })),
       timeoutSeconds: Type.Optional(Type.Number({ description: "wait/build timeout in seconds; await: max run time (default 1800)" })),
       command: Type.Optional(Type.String({ description: "await/launch/restart: shell command line to run to completion after the app is up, e.g. \"cd /repo && npm run test:xxx\". Only /bin/sh -lc runs it, so the cd into the repo that owns the runner is part of the line. Quoted in the slash command (command=\"...\"); restart re-runs the last launch's command unless this overrides it." })),
       push: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("context"), Type.Literal("wake")], {
@@ -2276,7 +2637,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
     stopStatusTicker();
     state.uiCtx?.ui.setStatus("xcodebug", undefined);
     state.uiCtx?.ui.setWidget("xcodebug", undefined);
-    for (const capture of state.captures.values()) {
+    const captures = [...state.captures.values()];
+    for (const capture of captures) {
       stopPush(capture.id);
       stopWatchdog(capture.id);
       capture.stop(false);
@@ -2284,5 +2646,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
     state.captures.clear();
     state.endedCaptures.clear();
     state.activeCaptureId = undefined;
+    // The host exits once this returns, and a log line still in a pipe then is
+    // lost; each capture bounds its own drain.
+    await Promise.all(captures.map((capture) => capture.waitForExit(3_000)));
   });
 }

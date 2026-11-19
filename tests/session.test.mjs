@@ -114,12 +114,16 @@ test("stopping console stops its companion before the console writer drains", { 
     const processesJSON = JSON.stringify({ result: { runningProcesses: [
       { executable: "/ReviewApp.app/ReviewApp", processIdentifier: 1234 },
     ] } });
+    // The app is in the process table once it has been launched, not before:
+    // launch tells its own instance from one that was already running by pid.
     await writeFile(join(bin, "xcrun"), `#!/bin/sh
 case "$*" in
   *"list devices"*) printf '%s\\n' ${quote(devicesJSON)} ;;
-  *"info processes"*) printf '%s\\n' ${quote(processesJSON)} ;;
+  *"info processes"*)
+    if [ -f ${quote(join(root, "launched"))} ]; then printf '%s\\n' ${quote(processesJSON)}
+    else printf '%s\\n' '{"result":{"runningProcesses":[]}}'; fi ;;
   *"install app"*) exit 0 ;;
-  *"process launch"*) printf 'console ready\\n'; exec /bin/sleep 60 ;;
+  *"process launch"*) : > ${quote(join(root, "launched"))}; printf 'console ready\\n'; exec /bin/sleep 60 ;;
   *) exit 1 ;;
 esac
 `, { mode: 0o755 });

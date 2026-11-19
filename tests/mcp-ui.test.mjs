@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -199,5 +199,78 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     child.kill(signal);
     await exited;
     await assert.rejects(access(file), { code: "ENOENT" });
+  });
+}
+
+// A capture's bridge is a child of the server. One whose app is quiet writes
+// nothing, so it never learns that the pipe it would write to is closed, and it
+// outlives a server that does not stop it.
+const CALL = args => `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "xcodebug", arguments: args } })}\n`;
+const COMMAND = "/bin/sleep 987";
+const pids = pattern => {
+  try { return execFileSync("pgrep", ["-f", pattern]).toString().trim().split("\n").map(Number); } catch { return []; }
+};
+// Each ends the server its own way and returns the processes a call had started.
+for (const [how, end, code] of [
+  ["closing its stdin", async child => { child.stdin.end(); }, 0],
+  ["SIGINT", async child => { child.kill("SIGINT"); }, 130],
+  // The command of a call still running is a process group of its own.
+  ["SIGINT during a call", async child => {
+    child.stdin.write(CALL({ action: "await", command: COMMAND }));
+    let command = [];
+    while (command.length === 0) { await delay(25); command = pids(COMMAND); }
+    child.kill("SIGINT");
+    return command;
+  }, 130],
+  // The client died with a call in flight: the reply to it has nowhere to go.
+  ["a client that vanishes during a call", async child => {
+    child.stdin.write(CALL({ action: "wait", match: "NEVER_LOGGED", timeoutSeconds: 1 }));
+    child.stdout.destroy();
+    child.stdin.end();
+  }, 0],
+]) {
+  test(`${how} ends the server and what its calls started`, { timeout: 30_000 }, async t => {
+    const root = await mkdtemp(join(tmpdir(), "xcodebug-ui-end-"));
+    const bin = join(root, "bin");
+    await mkdir(bin);
+    const device = { identifier: "test-device", properties: {
+      hardware: { udid: "test-udid", reality: "physical" },
+      connection: { state: "connected", transportType: "wired" }, state: { name: "Test" },
+    } };
+    await writeFile(join(bin, "xcrun"), `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({ result: { devices: [device] } })}'\n`, { mode: 0o755 });
+    await writeFile(join(bin, "idevicesyslog"), "#!/bin/sh\nexec /bin/sleep 120\n", { mode: 0o755 });
+    const child = spawn("bun", [new URL("../mcp/server.ts", import.meta.url).pathname], {
+      cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, XCODEBUG_AGENT_DIR: root },
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+    let started = [];
+    t.after(async () => {
+      child.kill("SIGKILL");
+      for (const pid of [...started, ...pids(COMMAND)]) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* already gone, as it should be */ }
+      }
+      await rm(root, { recursive: true, force: true });
+    });
+    const lines = createInterface({ input: child.stdout });
+    const request = (id, method, params) => new Promise(resolve => {
+      lines.on("line", line => {
+        const message = JSON.parse(line);
+        if (message.id === id) resolve(message.result);
+      });
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    });
+    await request(1, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "end-test", version: "1" } });
+    const capture = await request(2, "tools/call", { name: "xcodebug", arguments: { action: "syslog", device: "test-device", processName: "Quiet" } });
+    assert.ok(!capture.isError, capture.content[0].text);
+    started = execFileSync("pgrep", ["-P", String(child.pid)]).toString().trim().split("\n").map(Number);
+    assert.equal(started.length, 1, "the capture's bridge");
+
+    const exited = new Promise(resolve => child.once("exit", resolve));
+    started.push(...(await end(child) ?? []));
+    assert.equal(await Promise.race([exited, delay(10_000, "still running")]), code);
+    const deadline = Date.now() + 3_000;
+    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    while (started.some(alive) && Date.now() < deadline) await delay(25);
+    assert.deepEqual(started.filter(alive), [], "nothing a call started may outlive the server");
   });
 }

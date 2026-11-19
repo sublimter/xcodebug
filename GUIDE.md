@@ -215,6 +215,7 @@ xcodebug action=restart                    # after editing: rebuild + relaunch +
 xcodebug action=logs limit=200
 xcodebug action=logs grep=MySDK
 xcodebug action=wait match="DataPacket" timeoutSeconds=30
+xcodebug action=wait match="sync (done|failed)" regex=true   # either outcome, one wait
 
 # wrap up
 xcodebug action=status
@@ -244,6 +245,10 @@ pending writes; a drain timeout can truncate logs. Neither memory nor disk is
 a lossless archive of the whole run. See [retention](README.md#reading-logs-from-a-cursor)
 and [disk files](README.md#files) for details and the `logFiles` path list.
 
+A filtered read (`logs grep=`, `wait`) looks in those files for the lines memory
+has dropped and says in its reply that it did. Logs are deleted 30 days after
+their last write.
+
 ## Three rules of use
 
 1. **Stop once the log has answered the question.** A capture left running keeps
@@ -251,5 +256,7 @@ and [disk files](README.md#files) for details and the `logFiles` path list.
 2. **Do not stop while the user has not acted yet.** Silence there means "not
    tried yet", not "finished" — say what to tap and keep listening.
 3. **A console capture ends when the app process is confirmed gone.** Its syslog
-   companion is stopped too. A standalone `syslog` capture is not bound to the
-   app's lifetime and keeps reconnecting; stop it explicitly when finished.
+   companion is stopped too, and `status` says why it ended and where the crash
+   report is, if the device wrote one. A standalone `syslog` capture is not
+   bound to the app's lifetime and keeps reconnecting; stop it explicitly when
+   finished.

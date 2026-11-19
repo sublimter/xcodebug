@@ -4,7 +4,7 @@
  * back through a cursor so the agent can fetch only what is new.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { createWriteStream, type WriteStream } from "node:fs";
+import { appendFileSync, createReadStream, createWriteStream, statSync, type WriteStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { finished } from "node:stream/promises";
@@ -25,6 +25,9 @@ export interface LogLine {
   stream: "out" | "err";
   text: string;
 }
+
+/** A line as a search returns it: one read back from disk has no stream. */
+export type FoundLine = Pick<LogLine, "index" | "at" | "text"> & Partial<Pick<LogLine, "stream">>;
 
 export interface CaptureInit {
   mode: CaptureMode;
@@ -65,10 +68,30 @@ export interface CaptureStatus {
   logFiles: string[];
   commandLine: string;
   error?: string;
+  relaunches: number;
+  endReason?: string;
+  crashReport?: string;
 }
 
 function clean(text: string): string {
   return text.replace(ANSI, "").replace(/\r/g, "");
+}
+
+function clampLimit(limit: number | undefined): number {
+  return Math.trunc(Math.min(Math.max(1, limit ?? 200), 5_000));
+}
+
+/** A filter is a substring, or a pattern when the caller asked for one. */
+export function matchesFilter(text: string, filter: string | RegExp): boolean {
+  return typeof filter === "string" ? text.includes(filter) : filter.test(text);
+}
+
+function sizeOnDisk(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
 }
 
 export class Capture {
@@ -104,6 +127,15 @@ export class Capture {
    */
   lastLineAt = Date.now();
   /**
+   * Times the console bridge was reattached. devicectl attaches a console only
+   * by launching, so each one restarted the app and dropped its state.
+   */
+  relaunches = 0;
+  /** Why the capture ended without being asked to. */
+  endReason?: string;
+  /** The crash report pulled from the device after the app died, if it left one. */
+  crashReport?: string;
+  /**
    * Aborted when this capture is stopped, so an in-flight device probe returns
    * at once instead of running out its own timeout first.
    */
@@ -124,6 +156,18 @@ export class Capture {
   private fileNumber = 0;
   private fileOrder = 0;
   private readonly logFiles = new Map<string, number>();
+  /**
+   * Where each run of consecutively indexed lines starts on disk. The files
+   * carry no index and have holes - a rotated segment is overwritten, and a
+   * write that fails takes its lines with it - so a line's index is only
+   * recoverable per run.
+   */
+  private runs: Array<{ path: string; offset: number; index: number }> = [];
+  /** The segment being written, and where its next run starts once a line arrives. */
+  private segment = "";
+  private opened: { path: string; offset: number } | undefined;
+  /** True while lines are appended with the bridge down, which is one run. */
+  private appending = false;
   private readonly files = new Set<WriteStream>();
   private readonly blockedFiles = new Set<WriteStream>();
   private readonly exitListeners = new Set<(code: number | undefined, signal: string | undefined) => void>();
@@ -253,6 +297,10 @@ export class Capture {
 
   private openFile(append: boolean): void {
     const path = this.fileNumber === 0 ? this.logFile : `${this.logFile}.${this.fileNumber}`;
+    if (!append) this.runs = this.runs.filter((run) => run.path !== path);
+    this.segment = path;
+    this.opened = { path, offset: append ? sizeOnDisk(path) : 0 };
+    this.appending = false;
     const file = createWriteStream(path, { flags: append ? "a" : "w" });
     this.file = file;
     this.files.add(file);
@@ -328,8 +376,8 @@ export class Capture {
         // A listener must never break capture.
       }
     }
+    const encoded = `${new Date(line.at).toISOString()} ${line.text}\n`;
     if (this.file) {
-      const encoded = `${new Date(line.at).toISOString()} ${line.text}\n`;
       const size = Buffer.byteLength(encoded);
       if (this.fileBytes > 0 && this.fileBytes + size > MAX_FILE_BYTES) {
         this.file.end();
@@ -337,12 +385,29 @@ export class Capture {
         this.fileBytes = 0;
         this.openFile(false);
       }
+      if (this.opened) {
+        this.runs.push({ ...this.opened, index: line.index });
+        this.opened = undefined;
+      }
       this.fileBytes += size;
       const file = this.file;
       if (!file.write(encoded)) {
         this.blockedFiles.add(file);
         this.child?.stdout?.pause();
         this.child?.stderr?.pause();
+      }
+    } else if (!this.child && this.segment) {
+      // The bridge is down and its file is closed. What is said meanwhile - why
+      // it ended, each reattach - is what explains the rest of the log, so it
+      // goes to disk too. Only a few lines arrive in this state.
+      try {
+        const offset = this.appending ? undefined : sizeOnDisk(this.segment);
+        appendFileSync(this.segment, encoded);
+        if (offset !== undefined) this.runs.push({ path: this.segment, offset, index: line.index });
+        this.appending = true;
+      } catch {
+        // The log could not be written before either; the line is still in memory.
+        this.appending = false;
       }
     }
   }
@@ -394,15 +459,19 @@ export class Capture {
     });
   }
 
-  read(options: { since?: number; limit?: number; grep?: string; streams?: Array<"out" | "err"> }): {
+  read(options: { since?: number; limit?: number; grep?: string | RegExp; streams?: Array<"out" | "err"> }): {
     lines: LogLine[];
     cursor: number;
     total: number;
+    /** Lines after `since` that the buffer has already dropped. */
+    evicted: number;
   } {
     const since = Math.max(0, options.since ?? 0);
-    const limit = Math.trunc(Math.min(Math.max(1, options.limit ?? 200), 5_000));
-    const grep = options.grep?.trim();
+    const limit = clampLimit(options.limit);
+    const grep = typeof options.grep === "string" ? options.grep.trim() : options.grep;
     const streams = options.streams;
+    const oldest = this.lineCount > 0 ? this.lines[this.head]!.index : this.cursor + 1;
+    const evicted = Math.max(0, oldest - 1 - since);
     // Locate the first eligible index without scanning or copying the buffer.
     let first = 0;
     let end = this.lineCount;
@@ -416,18 +485,91 @@ export class Capture {
       for (let i = Math.max(first, this.lineCount - limit); i < this.lineCount; i++) {
         lines.push(this.lines[(this.head + i) % MAX_BUFFER_LINES]!);
       }
-      return { lines, cursor: this.cursor, total: this.lineCount - first };
+      return { lines, cursor: this.cursor, total: this.lineCount - first, evicted };
     }
     let total = 0;
     for (let i = this.lineCount - 1; i >= first; i--) {
       const line = this.lines[(this.head + i) % MAX_BUFFER_LINES]!;
       if (streams && streams.length > 0 && !streams.includes(line.stream)) continue;
-      if (grep && !line.text.includes(grep)) continue;
+      if (grep && !matchesFilter(line.text, grep)) continue;
       total += 1;
       if (lines.length < limit) lines.push(line);
     }
     lines.reverse();
-    return { lines, cursor: this.cursor, total };
+    return { lines, cursor: this.cursor, total, evicted };
+  }
+
+  /**
+   * `read` with a filter, extended to the log files when the buffer starts
+   * after `since`: without that, a line that was only evicted reads as never
+   * logged. `missing` counts the evicted lines no file holds any more.
+   */
+  async search(options: { since?: number; limit?: number; grep: string | RegExp }, retry = true): Promise<{
+    lines: FoundLine[];
+    cursor: number;
+    total: number;
+    evicted: number;
+    missing: number;
+  }> {
+    const read = this.read(options);
+    if (read.evicted === 0) return { ...read, missing: 0 };
+    const since = Math.max(0, options.since ?? 0);
+    const last = since + read.evicted;
+    const grep = typeof options.grep === "string" ? options.grep.trim() : options.grep;
+    // Memory holds the newest matches; disk only fills what the limit has left.
+    const room = clampLimit(options.limit) - read.lines.length;
+    let older: FoundLine[] = [];
+    let total = 0;
+    let covered = 0;
+    const runs = this.runs;
+    for (const [position, run] of runs.entries()) {
+      if (run.index > last) break;
+      // A run ends where the next one begins, when that is in the same file. A
+      // file's runs sit together: it is only written again after a rotation
+      // away from it, and by then its earlier runs have been dropped.
+      const next = runs[position + 1];
+      let index = run.index;
+      let pending = "";
+      try {
+        const stream = createReadStream(run.path, {
+          encoding: "utf8",
+          start: run.offset,
+          ...(next?.path === run.path ? { end: next.offset - 1 } : {}),
+        });
+        for await (const chunk of stream) {
+          const parts = (pending + chunk).split("\n");
+          pending = parts.pop() ?? "";
+          for (const raw of parts) {
+            if (index > since && index <= last) {
+              covered += 1;
+              const space = raw.indexOf(" ");
+              const text = raw.slice(space + 1);
+              if (matchesFilter(text, grep)) {
+                total += 1;
+                older.push({ index, at: Date.parse(raw.slice(0, space)), text });
+                // A broad filter can match most of a long log; only `room` are kept.
+                if (older.length >= room * 2 + 64) older = older.slice(older.length - room);
+              }
+            }
+            index += 1;
+          }
+          if (index > last) break;
+        }
+      } catch {
+        // A run that cannot be read back stays counted in `missing`.
+      }
+    }
+    // A rotation overwrote a segment while this was reading, so what came out of
+    // it may be new lines under the indices of the old ones. Reading once more
+    // settles it; if a segment is overwritten again, disk counts as not searched.
+    if (this.runs !== runs) return retry ? this.search(options, false) : { ...read, missing: read.evicted };
+    return {
+      lines: [...older.slice(Math.max(0, older.length - room)), ...read.lines],
+      cursor: read.cursor,
+      total: read.total + total,
+      evicted: read.evicted,
+      missing: read.evicted - covered,
+    };
   }
 
   status(): CaptureStatus {
@@ -450,6 +592,9 @@ export class Capture {
       logFiles: [...this.logFiles].sort((a, b) => a[1] - b[1]).map(([path]) => path),
       commandLine: [this.command, ...this.launchArgs].join(" "),
       error: this.error,
+      relaunches: this.relaunches,
+      endReason: this.endReason,
+      crashReport: this.crashReport,
     };
   }
 }

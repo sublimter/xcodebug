@@ -88,6 +88,74 @@ test("file rotation keeps the newest three segments and continues past 150 MiB",
   assert.ok(first > 0, "the oldest segment should have been replaced");
   assert.equal(previous, rows - 1, "the newest log must still reach disk after the old 50 MiB cutoff");
   assert.equal(c.status().cursor, rows);
+  // Row i is line i + 1. The first rows went with the overwritten segment.
+  const oldest = await c.search({ grep: new RegExp(`^${first} `) });
+  assert.deepEqual(oldest.lines.map(line => line.index), [first + 1]);
+  const overwritten = await c.search({ grep: /^0 / });
+  assert.deepEqual(overwritten.lines, []);
+  assert.equal(overwritten.missing, first, "rows no file holds any more must be counted, not passed over");
+});
+
+test("a search reads back the lines the buffer dropped, under their own indices", { timeout: 30_000 }, async t => {
+  const dir = await directory(t);
+  const c = capture({ logDir: dir, args: ["-e", producer, "25000", "10"] });
+  t.after(() => c.stop(false));
+  c.pushLine("out", "said before any file existed");
+  await c.start();
+  assert.equal(await c.waitForExit(20_000), true);
+  assert.equal(c.read({ grep: /^0 / }).lines.length, 0, "the buffer no longer holds the first rows");
+  assert.equal(c.read({}).evicted, 5_001);
+  assert.equal(c.read({ since: 5_001 }).evicted, 0);
+
+  const early = await c.search({ grep: /^0 / });
+  assert.deepEqual(early.lines.map(line => [line.index, line.text]), [[2, "0 xxxxxxxxxx"]]);
+  assert.ok(Math.abs(early.lines[0].at - c.status().startedAt) < 20_000);
+  assert.deepEqual([early.total, early.evicted, early.missing], [1, 5_001, 1]);
+  assert.deepEqual((await c.search({ since: 2, grep: /^0 / })).lines, [], "a line at or before `since` is not asked for");
+  const neverWritten = await c.search({ grep: "before any file" });
+  assert.deepEqual([neverWritten.lines.length, neverWritten.missing], [0, 1]);
+  // One row from disk and two from the buffer, in order.
+  const both = await c.search({ grep: "4999 x" });
+  assert.deepEqual(both.lines.map(line => line.index), [5_001, 15_001, 25_001]);
+  assert.equal(both.total, 3);
+  assert.deepEqual((await c.search({ grep: "4999 x", limit: 2 })).lines.map(line => line.index), [15_001, 25_001]);
+  assert.equal((await c.search({ grep: "x", limit: 3 })).total, 25_000, "matches beyond the limit are still counted");
+
+  // What is said while the bridge is down is written too, and a reattach keeps the numbering.
+  c.pushLine("err", "[test] bridge down");
+  c.resetForReconnect();
+  await c.start();
+  assert.equal(await c.waitForExit(20_000), true);
+  c.pushLine("err", "[test] ended for good");
+  assert.deepEqual((await c.search({ grep: "[test] bridge down" })).lines.map(line => line.index), [25_002]);
+  assert.deepEqual((await c.search({ grep: /^0 / })).lines.map(line => line.index), [2, 25_003]);
+  const handle = await open(c.logFile);
+  const text = await handle.readFile("utf8");
+  await handle.close();
+  assert.equal(text.trim().split("\n").length, 50_002);
+  assert.match(text, / \[test\] ended for good\n$/);
+});
+
+test("a search that a rotation overtakes reads again", { timeout: 60_000 }, async t => {
+  const dir = await directory(t);
+  const c = capture({ logDir: dir, args: ["-e", "setInterval(() => {}, 1000)"] });
+  t.after(() => c.stop(false));
+  await c.start();
+  c.pushLine("out", "MARKER");
+  for (let i = 0; i < 20_000; i++) c.pushLine("out", `filler ${i}`);
+  // On disk before the search starts, so what follows is about the rotation alone.
+  for (;;) {
+    const settled = await c.search({ grep: "filler 19998" });
+    if (settled.lines.length === 1 && settled.missing === 0) break;
+    await delay(20);
+  }
+  const searching = c.search({ grep: "MARKER" });
+  // More than one segment's worth, pushed before the search has read anything.
+  const megabyte = "y".repeat(1024 * 1024);
+  for (let i = 0; i < 51; i++) c.pushLine("out", megabyte);
+  const found = await searching;
+  assert.deepEqual(found.lines.map(line => [line.index, line.text]), [[1, "MARKER"]]);
+  assert.equal(found.cursor, 20_052, "the answer is from a read that began after the rotation");
 });
 
 test("a blocked log sink pauses the producer and drains without losing the final lines", { timeout: 30_000 }, async t => {

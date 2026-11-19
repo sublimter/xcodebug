@@ -4,6 +4,8 @@
  * devicectl accepts a uuid, ecid, serial number, udid, name or DNS name, so
  * every identifier we keep is accepted verbatim by later commands.
  */
+import { readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 import { asRecord, asString, runCommand } from "./exec.ts";
 
 export interface DeviceInfo {
@@ -265,14 +267,75 @@ async function findProcessPidOnce(
   }
   const processes = asRecord(asRecord(parsed).result).runningProcesses;
   if (!Array.isArray(processes)) return { queryFailed: true };
+  // The app's own executable sits directly in its bundle. An extension runs from
+  // `<App>.app/PlugIns/…` as a process of its own, and taking it for the app
+  // would report a pid that is not the app's and an app that is not there.
   const needle = `/${executableName}.app/`;
   for (const raw of processes) {
     const entry = asRecord(raw);
     const executable = asString(entry.executable) ?? "";
-    if (executable.includes(needle) && typeof entry.processIdentifier === "number") {
-      return { pid: entry.processIdentifier, queryFailed: false };
-    }
+    const at = executable.lastIndexOf(needle);
+    if (at < 0 || executable.indexOf("/", at + needle.length) >= 0) continue;
+    if (typeof entry.processIdentifier === "number") return { pid: entry.processIdentifier, queryFailed: false };
   }
   // The table was read successfully and the app is not in it: a real exit.
   return { queryFailed: false };
+}
+
+/**
+ * Copy the crash report the device wrote for one instance of an app into
+ * `directory`, and return where it landed.
+ *
+ * Crash reports are named `<executable>-<date>.ips`. The resource diagnostics
+ * beside them (`<executable>.cpu_resource-…`) share the prefix up to the dot and
+ * are not crashes. A report names the process it is about, so with `pid` only
+ * that instance's report is returned: the next launch of the same app, crashing
+ * in turn, writes one that is not this instance's. Without `pid` the newest
+ * report since `since` is taken.
+ */
+export async function pullCrashReport(
+  device: DeviceInfo,
+  executableName: string,
+  options: { since: number; directory: string; pid?: number },
+): Promise<string | undefined> {
+  const listed = await runCommand(
+    "xcrun",
+    [
+      "devicectl", "device", "info", "files", "--device", device.id,
+      "--domain-type", "systemCrashLogs", "--search", executableName, "--json-output", "-",
+    ],
+    { timeoutMs: 45_000 },
+  );
+  if (listed.code !== 0) return undefined;
+  let files: unknown;
+  try {
+    files = asRecord(asRecord(JSON.parse(listed.stdout)).result).files;
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(files)) return undefined;
+  const candidates: Array<{ name: string; at: number }> = [];
+  for (const raw of files) {
+    const entry = asRecord(raw);
+    const name = asString(entry.name);
+    const at = Date.parse(asString(asRecord(entry.metadata).lastModDate) ?? "");
+    if (name?.startsWith(`${executableName}-`) && name.endsWith(".ips") && at >= options.since) candidates.push({ name, at });
+  }
+  for (const { name } of candidates.sort((a, b) => b.at - a.at)) {
+    const destination = join(options.directory, `crash-${name}`);
+    const copied = await runCommand(
+      "xcrun",
+      [
+        "devicectl", "device", "copy", "from", "--device", device.id,
+        "--domain-type", "systemCrashLogs", "--source", name, "--destination", destination,
+      ],
+      { timeoutMs: 60_000 },
+    );
+    if (copied.code !== 0) continue;
+    const reported = /"pid"\s*:\s*(\d+)/.exec(await readFile(destination, "utf8").catch(() => ""))?.[1];
+    if (options.pid === undefined || reported === undefined || Number(reported) === options.pid) return destination;
+    // Another instance's crash. Left beside this run's log it would be read as this run's.
+    await rm(destination, { force: true }).catch(() => {});
+  }
+  return undefined;
 }

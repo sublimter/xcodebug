@@ -35,6 +35,71 @@ function destination(device: DeviceInfo): string {
   return `platform=iOS,id=${id}`;
 }
 
+const MAX_DIAGNOSTICS = 12;
+const MAX_DIAGNOSTIC_CHARS = 320;
+/** Indented lines kept under a linker's symbol list: the symbols and what references them. */
+const MAX_SYMBOL_LINES = 6;
+/**
+ * `path:line:column: error: …` from a compiler, `xcodebuild: error: …`, or a
+ * bare `error: …`. Never indented: the indented ones are the compiler's own
+ * rendering of the source line under a diagnostic already taken.
+ */
+const ERROR_LINE = /^(?:\S.*: )?(?:fatal )?error: /;
+/** The linker's own failures, which carry no `error:`. Its warnings are left out. */
+const LINKER_LINE = /^ld: (?!warning: )/;
+/** The heading of the linker's list of symbols, which follows indented. */
+const SYMBOLS_LINE = /^(?:Undefined|duplicate) symbols? for architecture/;
+
+/**
+ * Collects the lines of a build's output that say what failed, as they pass.
+ *
+ * xcodebuild prints an error in the middle of its output, under the
+ * multi-kilobyte command that produced it and above everything the build still
+ * goes on to do, so the end of a failed build is build commands. Collecting
+ * while the output streams also keeps an error the size cap later drops.
+ */
+export class BuildDiagnostics {
+  private readonly seen = new Set<string>();
+  private readonly kept: string[] = [];
+  private total = 0;
+  private remainder = "";
+  /** Indented lines still to keep under the symbol list just opened. */
+  private symbolLines = 0;
+
+  update(chunk: string): void {
+    const parts = (this.remainder + chunk).split("\n");
+    this.remainder = parts.pop() ?? "";
+    for (const part of parts) this.take(part.trimEnd());
+  }
+
+  private take(line: string): void {
+    if (this.symbolLines > 0 && /^\s+\S/.test(line)) {
+      this.symbolLines -= 1;
+      this.kept.push(line.slice(0, MAX_DIAGNOSTIC_CHARS));
+      return;
+    }
+    this.symbolLines = 0;
+    const symbols = SYMBOLS_LINE.test(line);
+    if (!symbols && !LINKER_LINE.test(line) && !ERROR_LINE.test(line)) return;
+    // The compiler reports a diagnostic once per pass over the file. A symbol
+    // list opens with the same words every time and is told apart by what follows.
+    if (!symbols) {
+      if (this.seen.has(line)) return;
+      this.seen.add(line);
+    }
+    this.total += 1;
+    if (this.total > MAX_DIAGNOSTICS) return;
+    this.kept.push(line.slice(0, MAX_DIAGNOSTIC_CHARS));
+    if (symbols) this.symbolLines = MAX_SYMBOL_LINES;
+  }
+
+  /** The diagnostics kept, and how many more there were. */
+  result(): { lines: string[]; omitted: number } {
+    this.update("\n");
+    return { lines: this.kept, omitted: Math.max(0, this.total - MAX_DIAGNOSTICS) };
+  }
+}
+
 function targetFlags(target: BuildTarget): string[] {
   const flags: string[] = [];
   if (target.workspace) flags.push("-workspace", target.workspace);
@@ -74,6 +139,8 @@ export async function buildForDevice(
 
   const args = [...targetFlags(target), "-destination", destination(device), "build"];
   const tracker = new BuildProgressTracker();
+  // One per stream: each is split into lines on its own.
+  const diagnostics = { stdout: new BuildDiagnostics(), stderr: new BuildDiagnostics() };
   let lastEmit = 0;
   let lastStage = "";
   // xcodebuild can go quiet for minutes (signing, copying a large bundle). A
@@ -90,7 +157,8 @@ export async function buildForDevice(
     timeoutMs: options.timeoutMs,
     maxBytes: 12_000_000,
     signal: options.signal,
-    onChunk: (_stream, chunk) => {
+    onChunk: (stream, chunk) => {
+      diagnostics[stream].update(chunk);
       const progress = tracker.update(chunk);
       // Throttle: a build emits tens of thousands of lines.
       const now = Date.now();
@@ -117,11 +185,23 @@ export async function buildForDevice(
     const final = tracker.finish("failed");
     options.onProgress?.(formatProgress(final));
     const reason = result.timedOut ? "build timed out" : `build failed (exit ${result.code})`;
+    const found = [diagnostics.stdout.result(), diagnostics.stderr.result()];
+    const errors = found.flatMap((each) => each.lines);
+    const omitted = found.reduce((sum, each) => sum + each.omitted, 0);
+    // xcodebuild closes stderr with its own account: the verdict and the
+    // commands that failed.
+    const verdictAt = result.stderr.lastIndexOf("** BUILD ");
+    const verdict = verdictAt < 0 ? [] : result.stderr.slice(verdictAt).split("\n").filter((line) => line.trim()).slice(0, 12);
+    const detail =
+      errors.length > 0
+        ? [...errors, omitted > 0 ? `(+${omitted} more error(s) in the log)` : "", ...verdict].filter(Boolean).join("\n")
+        : // Nothing called itself an error, so the end of the output is all there is.
+          lastLines(`${result.stderr}\n${result.stdout}`, 25);
     return {
       ok: false,
       logFile,
       durationMs,
-      summary: `${reason}\n${lastLines(`${result.stderr}\n${result.stdout}`, 25)}`,
+      summary: `${reason}\n${detail}`,
     };
   }
   options.onProgress?.(formatProgress(tracker.finish("done")));

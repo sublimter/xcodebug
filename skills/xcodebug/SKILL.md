@@ -64,12 +64,23 @@ Both explicit invocation and a matching natural-language request can use this sk
   `logs` returns the newest matching lines up to `limit` and advances to the
   latest capture cursor, so omitted or evicted lines will not reappear merely
   by advancing `since`. Report omissions instead of claiming a lossless stream.
-- Use bounded `wait` for an expected line. An empty read or quiet log is not proof
+- A filtered read (`logs grep=...`, `wait`) also searches the log files for lines
+  memory has dropped, and a `note:` line in the reply says what it covered. If
+  the note says some lines were not searched, say so instead of "not logged".
+- Use bounded `wait` for an expected line. With `regex=true`, `match` and `grep`
+  are regular expressions, so one `wait` covers both outcomes of a step:
+  `match="sync (done|failed)"`. An empty read or quiet log is not proof
   that a test finished. While waiting for the user to operate the phone, tell them
   the required action and keep the capture running.
 - For an automated scenario, pass the user's `command` to `launch`, or use `await`
   with the current capture. The command must not relaunch the app itself, since
   that would break the console bridge. Use the returned exit code and logs as evidence.
+- A capture that ended on its own says why in `status`, under `logs`, and in the
+  reply of the `wait` or `command` it interrupted: the app exited, or was
+  restarted outside the capture. It gives a crash report path when the device
+  wrote one. A reply can also warn that a console reattach relaunched the app.
+  Report these with the result; the log then does not describe one
+  uninterrupted run.
 - When a verification goal is answered, stop the capture started for that goal.
   Include its `captureId` so other captures are not stopped. An explicit `stop`
   without an ID intentionally stops all running captures in this server.

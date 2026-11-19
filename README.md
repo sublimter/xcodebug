@@ -92,6 +92,22 @@ codex  mcp list     # xcodebug  bun …
 claude mcp list     # xcodebug: … ✔ Connected
 ```
 
+Codex ends an MCP tool call after 60 seconds unless the server is given its own
+limit, and a device build usually takes longer. Set one in
+`~/.codex/config.toml`, above the tool's own limits added up (15 minutes each
+for `pod install` and the build, 30 for `command=`), so that a call is ended by
+the tool, which then reports why:
+
+```toml
+[mcp_servers.xcodebug]
+tool_timeout_sec = 4200
+```
+
+Claude Code needs no setting for this. Its default limit on a tool call is about
+28 hours. It also ends a call to a stdio server that has sent neither a reply
+nor a progress notification for 30 minutes; this server sends progress once a
+second to a client that asks for it.
+
 ### Install the manual entry point
 
 Connecting MCP makes the tool available to the model; it does not register a
@@ -350,8 +366,10 @@ remain available without the display.
   `action=wait`; these pull reads are separate from the Claude Mod's user-visible
   display. Cursor reads exclude earlier indices, but a limited read can omit
   lines; see [Reading logs from a cursor](#reading-logs-from-a-cursor).
-- **Captures end with the client.** The server is a child of Codex/Claude, so
-  quitting the client stops the bridges. Relaunch next session.
+- **Captures end with the client.** The server is a child of Codex/Claude. When
+  the client closes the connection, the server finishes the call in progress,
+  stops its captures and exits. On SIGINT or SIGTERM it stops at once, a build
+  still running included. Relaunch next session.
 
 Logs land in `~/.xcodebug/logs/xcodebug/`, or under `XCODEBUG_AGENT_DIR` when set.
 Every response also reports the exact path, so the model can read the file once a
@@ -452,13 +470,23 @@ rather than writing logs to a guessed path.
 `device` may be a name, UDID, ECID or CoreDevice uuid. With one physical device
 connected it can be omitted.
 
+A file that is not valid JSON is an error, not an absent config: `doctor` reports
+it, and every action that would read it refuses to run rather than use the
+defaults the file was written to override. The actions that never read it -
+`devices`, `logs`, `wait`, `status`, `stop` and `await` - still work.
+
 ## Change detection and pod install
 
 Every `build` and `launch` first inspects the working tree with
 `git status --porcelain -uall`:
 
-1. **Any build-relevant change** (sources, resources, Podfile, podspec, project
-   files) forces a rebuild + relaunch.
+1. **Any change git reports** forces a rebuild + relaunch, tracked or not and
+   whatever its type (`Podfile.rb`, an `.xcconfig`, a new image): a build that
+   is reused must not be older than what it was built from. The exceptions are
+   the types no build reads - notes, logs, crash reports and patches (`.md`,
+   `.log`, `.ips`, `.patch`, `.diff`) - so what a run leaves in the tree does
+   not trigger a build. A run that writes files of other types into the
+   repository, such as JSON results, does.
 2. **A new file inside a pod** forces `pod install --no-repo-update` first,
    because the generated Pods project enumerates pod sources and will not
    compile a file it has never seen. Pod membership comes from the repo's own
@@ -472,8 +500,19 @@ Every `build` and `launch` first inspects the working tree with
 `Podfile` (the workspace's parent). If there is none, the step is skipped and
 the reason is reported - it never searches elsewhere, because that could
 reinstall a different project's pods.
-4. **No change** since the last successful build in this session reuses that
-   build instead of rebuilding for minutes. Pass `force=true` to override.
+4. **No change** since this session last built the same scheme, configuration
+   and device reuses that build, for `launch` as well as `build`, instead of
+   rebuilding for minutes. The app is still installed and launched. Pass
+   `force=true` to rebuild. "No change" means all of:
+   - the same committed code and the same uncommitted changes. A commit, pull or
+     checkout rebuilds even though `git status` is clean again; `git add` alone
+     does not;
+   - the same files in every pod the workspace installs from a path outside the
+     repository (`:path` in `Podfile.lock`), which `git status` cannot see;
+   - the built `.app` is as that build left it. Xcode, or an `xcodebuild` in
+     another terminal, writes the same product path.
+
+   A build during which the tree changed is not reused, and its reply says so.
 
 Inspect the decision without building:
 
@@ -632,7 +671,10 @@ nothing about any test framework. Two consequences worth knowing:
 What it reports: exit code, elapsed time, how many new lines the capture gained,
 the log path, and the `action=logs` call (with the right `since`) that returns
 the app side of that run. A non-zero exit is surfaced as an error, not as a
-successful "run finished".
+successful "run finished". Two things about the capture are reported when they
+happened, because either one changes what the log means: that it was no longer
+capturing when the command finished (with the reason, or the last line logged),
+and that a console reattach relaunched the app during the run.
 
 ### What the model does with it
 
@@ -685,8 +727,10 @@ Boundaries that keep it out of every other workflow:
 **Prerequisite when the command drives the UI:** the runner must not relaunch the
 app. Many UI-test fixtures terminate and relaunch the app before every test
 unless `autoAppLaunch: false` is set, which kills the very launch xcodebug is
-capturing. Set it in the config the run uses. A command that does not touch the
-app (a curl, a fixture import, a codegen step) has no such constraint.
+capturing. Set it in the config the run uses. When it happens anyway, the capture
+ends there and says the app was restarted outside it; it does not relaunch over
+the runner's instance. A command that does not touch the app (a curl, a fixture
+import, a codegen step) has no such constraint.
 
 ### Run semantics
 
@@ -702,10 +746,24 @@ session.
   has been tried, not that the run is over: say what to do on the phone and keep
   listening.
 - A console capture ends when the app process is confirmed gone, and its syslog
-  companion is stopped too. A standalone `syslog` capture is not bound to the
-  app's lifetime and keeps reconnecting; stop it explicitly when finished.
-- A dropped console bridge otherwise reconnects indefinitely. An inconclusive
-  probe (USB unplugged, `devicectl` timeout) is **not** treated as "the app exited".
+  companion is stopped too. It records why - `the app exited`, with the last
+  line logged, which is devicectl's own `App terminated due to signal 9.` when
+  the app was killed - in the log file, in `status`, and under later `logs`
+  reads. If the device wrote a crash report for the app, it is copied next to
+  the log and its path is reported the same way. A standalone `syslog` capture
+  is not bound to the app's lifetime and keeps reconnecting; stop it explicitly
+  when finished.
+- A dropped console bridge whose app is still running is reattached, retrying
+  for as long as it takes. devicectl attaches a console only by launching, so
+  with the default `terminateExisting` **a reattach restarts the app** and its
+  state is gone: the log says so and `status` counts the relaunches. An
+  inconclusive probe (USB unplugged, `devicectl` timeout) is **not** treated as
+  "the app exited".
+- If the instance running is not the one this capture launched - another
+  session, a test runner or the user relaunched the app - the capture ends and
+  leaves that instance alone. Reattaching would terminate it. The session that
+  did the relaunching is told as well: its `launch` reply notes that the app was
+  already running and not started by it.
 - `idevicesyslog` can go silent with its process still alive; a 30s watchdog kills
   it and the exit hook reattaches. Reattachment has exactly one owner, so the
   watchdog and the exit hook can never both assume the other is handling it.
@@ -746,7 +804,9 @@ xcodebug action=syslog processName=MyApp
 # incremental reads (cursor-based)
 xcodebug action=logs limit=200
 xcodebug action=logs grep=MySDK
+xcodebug action=logs grep=MySDK times=true
 xcodebug action=wait match="DataPacket" timeoutSeconds=30
+xcodebug action=wait match="sync (done|failed)" regex=true timeoutSeconds=30
 
 xcodebug action=status
 xcodebug action=stop keepApp=true
@@ -789,6 +849,19 @@ is written to disk and delivered to live subscribers but not retained for
 `logs`. The session keeps the most recent 10 ended captures; active captures
 and captures reconnecting after a bridge failure are not evicted. Older capture
 IDs leave `logs`/`status`, while their retained disk segments remain available.
+
+A busy app fills that buffer in seconds, so a filtered read does not stop at it.
+`logs grep=...` and `wait` also read the capture's log files for the lines
+memory no longer holds, and return a match from there under its own index. The
+reply then carries a note: how many lines were searched on disk, and how many
+are gone from disk too (a rotated segment was overwritten), so "no match" says
+what it covered. An unfiltered `logs` returns the newest lines as before and
+names the log file for the rest.
+
+`regex=true` makes `grep` and `match` regular expressions, so one `wait` can
+cover both outcomes of a step: `match="sync (done|failed)"`. `times=true`
+prefixes each returned line with the host time it arrived, for lining the log
+up with a test runner's own output.
 
 ### `syslog`: attach without relaunching
 
@@ -837,8 +910,15 @@ drain-timeout error in capture status, and completes shutdown; pending logs may
 be truncated.
 
 The bundle id separates apps, and the timestamp includes milliseconds to
-separate runs. Segment limits apply per capture: old runs are not automatically
-deleted from disk when their capture IDs leave the in-memory history.
+separate runs. Segment limits apply per capture. What xcodebug itself says while
+a bridge is down - why the capture ended, each reattach - is appended to the same
+file, so a log that stops also says why. A crash report copied from the device
+lands beside the logs as `crash-<name>.ips`.
+
+Logs are kept for 30 days after their last write. The first `build`, `launch` or
+`syslog` of a session deletes older `build-`, `console-`, `syslog-` and
+`pod-install-` logs and `crash-*.ips` reports from this directory, and nothing
+else in it.
 
 A successful build clears `<agentDir>/logs/xcodebug/archive/` first, so snapshots
 from a previous binary cannot be mistaken for the run that is starting.

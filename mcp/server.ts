@@ -54,7 +54,7 @@ interface RegisteredTool {
 /** Only the members index.ts calls on the host API. */
 interface StubPi {
   cwd: string;
-  on(): void;
+  on(event: string, handler: () => Promise<void>): void;
   registerCommand(): void;
   sendMessage(): void;
   registerTool(tool: RegisteredTool): void;
@@ -70,9 +70,13 @@ const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url),
 };
 
 let registered: RegisteredTool | undefined;
+/** The extension's own teardown: it stops every capture the session started. */
+let endSession: (() => Promise<void>) | undefined;
 const stubPi: StubPi = {
   cwd: process.cwd(),
-  on() {},
+  on(event, handler) {
+    if (event === "session_shutdown") endSession = handler;
+  },
   registerCommand() {},
   // Nothing consumes pushed lines here: MCP has no channel that injects messages
   // into the conversation, so push is refused below instead of silently dropped.
@@ -131,8 +135,8 @@ process.on("exit", () => {
 });
 // Claude Code ends a stdio server with SIGINT. Left to the default, a signal
 // ends the process without the handler above; the exit codes are the shell's.
-process.on("SIGINT", () => process.exit(130));
-process.on("SIGTERM", () => process.exit(143));
+process.on("SIGINT", () => void shutdown(130));
+process.on("SIGTERM", () => void shutdown(143));
 // A server that was killed outright never ran it either. Its file is named after
 // a process that no longer exists, which is how the next server to start finds it.
 try {
@@ -283,7 +287,38 @@ async function handle(message: Record<string, unknown>): Promise<void> {
 let queue: Promise<void> = Promise.resolve();
 /** Calls running right now, so a cancellation can reach the one it names. */
 const inflight = new Map<unknown, AbortController>();
-createInterface({ input: process.stdin }).on("line", (line) => {
+
+/**
+ * Stop what the client's calls started, then exit.
+ *
+ * A capture's bridge and a running build are child processes that nothing else
+ * stops. A bridge that is still alive keeps this process alive after stdin has
+ * closed, and one that outlives it stays for good if the app is quiet.
+ */
+let exiting = false;
+async function shutdown(code: number): Promise<void> {
+  if (exiting) return;
+  exiting = true;
+  for (const controller of inflight.values()) controller.abort();
+  try {
+    await endSession?.();
+  } finally {
+    process.exit(code);
+  }
+}
+
+// A client that has gone has closed its end of this pipe as well, and the reply
+// to a call it left running fails to write. Unhandled, that error ends the
+// process there and then, before the captures are stopped.
+process.stdout.on("error", () => {});
+
+const input = createInterface({ input: process.stdin });
+// The client is gone. What it had already asked for is still carried out first:
+// a script that pipes its requests in and closes stdin reads the replies.
+input.on("close", () => {
+  queue = queue.then(() => shutdown(0));
+});
+input.on("line", (line) => {
   const text = line.trim();
   if (text.length === 0) return;
   let message: Record<string, unknown>;

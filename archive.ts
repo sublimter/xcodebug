@@ -61,6 +61,35 @@ export async function clearArchives(workDir: string): Promise<{ removed: number;
   return { removed, freedBytes };
 }
 
+/** The files this extension writes: build, capture and pod install logs, and pulled crash reports. */
+const OWN_LOG = /^(?:build|console|syslog|pod-install|crash)-.+\.(?:log(?:\.\d+)?|ips)$/;
+
+/**
+ * Delete this extension's logs that nothing has written to for `maxAgeMs`.
+ *
+ * Nothing else ever removes them, and they add up to hundreds of megabytes in
+ * a few weeks. Age since the last write is the whole test: a capture still
+ * running keeps its log fresh, and a file xcodebug did not name is left alone.
+ */
+export async function pruneLogs(logDir: string, maxAgeMs: number): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await readdir(logDir);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - maxAgeMs;
+  for (const name of entries) {
+    if (!OWN_LOG.test(name)) continue;
+    const path = join(logDir, name);
+    try {
+      if ((await stat(path)).mtimeMs < cutoff) await rm(path, { force: true });
+    } catch {
+      // A log that cannot be removed is not worth failing a run over.
+    }
+  }
+}
+
 /** Recursive size of a file or directory, in bytes. */
 async function sizeOf(path: string): Promise<number> {
   const info = await stat(path);
