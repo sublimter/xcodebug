@@ -92,11 +92,10 @@ codex  mcp list     # xcodebug  bun …
 claude mcp list     # xcodebug: … ✔ Connected
 ```
 
-Codex ends an MCP tool call after 60 seconds unless the server is given its own
-limit, and a device build usually takes longer. Set one in
-`~/.codex/config.toml`, above the tool's own limits added up (15 minutes each
-for `pod install` and the build, 30 for `command=`), so that a call is ended by
-the tool, which then reports why:
+Set Codex's MCP timeout high enough for the stages your calls use. For example,
+4200 seconds leaves room for the default 15-minute pod install, 15-minute build
+and 30-minute command budgets, plus device operations. Increase it if you pass
+larger timeouts; the client can still cancel before xcodebug's own deadline.
 
 ```toml
 [mcp_servers.xcodebug]
@@ -107,6 +106,15 @@ Claude Code needs no setting for this. Its default limit on a tool call is about
 28 hours. It also ends a call to a stdio server that has sent neither a reply
 nor a progress notification for 30 minutes; this server sends progress once a
 second to a client that asks for it.
+
+Cancelling an MCP request aborts that request. On SIGINT, SIGTERM or detected
+stdout loss, the server stops accepting work, cancels admitted requests and
+then cleans up captures. Closing only stdin lets admitted requests finish and
+sends their replies; a silent lost reader cannot be distinguished from this
+until stdout closes or a write fails.
+
+To run `npm test` from a checkout, use Node.js 22.18 or later and put Bun on PATH
+for the stdio integration tests.
 
 ### Install the manual entry point
 
@@ -515,6 +523,9 @@ reinstall a different project's pods.
    A build during which the tree changed is not reused, and its reply says so.
 
 Inspect the decision without building:
+Use the same target and device options as the intended build. If the target
+cannot be resolved, the report cannot identify a reusable build. If pod install
+is needed, the preview assumes a rebuild until the updated tree is available.
 
 ```text
 xcodebug action=changes
@@ -524,6 +535,7 @@ xcodebug action=changes
 2 build-relevant change(s)
    M Packages/FeatureX/Classes/Weather/AddCityController.swift
 fingerprint: 963e92a4
+last build for this target: (none)
 rebuild needed: yes
 pod install needed: no
 ```
@@ -757,8 +769,9 @@ session.
   for as long as it takes. devicectl attaches a console only by launching, so
   with the default `terminateExisting` **a reattach restarts the app** and its
   state is gone: the log says so and `status` counts the relaunches. An
-  inconclusive probe (USB unplugged, `devicectl` timeout) is **not** treated as
-  "the app exited".
+  inconclusive probe (USB unplugged, `devicectl` timeout) is retried without
+  relaunching. If the current PID is known but capture ownership cannot be
+  verified, a reattach that would terminate the running app is skipped.
 - If the instance running is not the one this capture launched - another
   session, a test runner or the user relaunched the app - the capture ends and
   leaves that instance alone. Reattaching would terminate it. The session that
@@ -851,11 +864,11 @@ and captures reconnecting after a bridge failure are not evicted. Older capture
 IDs leave `logs`/`status`, while their retained disk segments remain available.
 
 A busy app fills that buffer in seconds, so a filtered read does not stop at it.
-`logs grep=...` and `wait` also read the capture's log files for the lines
-memory no longer holds, and return a match from there under its own index. The
-reply then carries a note: how many lines were searched on disk, and how many
-are gone from disk too (a rotated segment was overwritten), so "no match" says
-what it covered. An unfiltered `logs` returns the newest lines as before and
+`logs grep=...` and `wait` also search for lines missing from memory, including
+oversized lines between retained entries. They wait for writes through the
+scan's cursor before reading disk; cancellation interrupts that work. The reply
+reports how many lines were searched on disk and how many are unavailable.
+An unfiltered `logs` returns the newest lines as before and
 names the log file for the rest.
 
 `regex=true` makes `grep` and `match` regular expressions, so one `wait` can
@@ -913,7 +926,8 @@ The bundle id separates apps, and the timestamp includes milliseconds to
 separate runs. Segment limits apply per capture. What xcodebug itself says while
 a bridge is down - why the capture ended, each reattach - is appended to the same
 file, so a log that stops also says why. A crash report copied from the device
-lands beside the logs as `crash-<name>.ips`.
+lands beside the logs as `crash-<unique-id>-<name>.ips`. When the app PID is
+known, a report without that PID is not retained.
 
 Logs are kept for 30 days after their last write. The first `build`, `launch` or
 `syslog` of a session deletes older `build-`, `console-`, `syslog-` and

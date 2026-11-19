@@ -4,8 +4,8 @@
  * devicectl accepts a uuid, ecid, serial number, udid, name or DNS name, so
  * every identifier we keep is accepted verbatim by later commands.
  */
-import { readFile, rm } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdtemp, readFile, rename, rm } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { asRecord, asString, runCommand } from "./exec.ts";
 
 export interface DeviceInfo {
@@ -319,23 +319,31 @@ export async function pullCrashReport(
     const entry = asRecord(raw);
     const name = asString(entry.name);
     const at = Date.parse(asString(asRecord(entry.metadata).lastModDate) ?? "");
-    if (name?.startsWith(`${executableName}-`) && name.endsWith(".ips") && at >= options.since) candidates.push({ name, at });
+    if (name?.startsWith(`${executableName}-`) && name.endsWith(".ips") && basename(name) === name && at >= options.since) candidates.push({ name, at });
   }
   for (const { name } of candidates.sort((a, b) => b.at - a.at)) {
-    const destination = join(options.directory, `crash-${name}`);
-    const copied = await runCommand(
-      "xcrun",
-      [
-        "devicectl", "device", "copy", "from", "--device", device.id,
-        "--domain-type", "systemCrashLogs", "--source", name, "--destination", destination,
-      ],
-      { timeoutMs: 60_000 },
-    );
-    if (copied.code !== 0) continue;
-    const reported = /"pid"\s*:\s*(\d+)/.exec(await readFile(destination, "utf8").catch(() => ""))?.[1];
-    if (options.pid === undefined || reported === undefined || Number(reported) === options.pid) return destination;
-    // Another instance's crash. Left beside this run's log it would be read as this run's.
-    await rm(destination, { force: true }).catch(() => {});
+    const directory = await mkdtemp(join(options.directory, "crash-")).catch(() => undefined);
+    if (!directory) return undefined;
+    const destination = join(directory, `crash-${name}`);
+    try {
+      const copied = await runCommand(
+        "xcrun",
+        [
+          "devicectl", "device", "copy", "from", "--device", device.id,
+          "--domain-type", "systemCrashLogs", "--source", name, "--destination", destination,
+        ],
+        { timeoutMs: 60_000 },
+      );
+      if (copied.code !== 0) continue;
+      const report = await readFile(destination, "utf8").catch(() => undefined);
+      if (report === undefined) continue;
+      const reported = /"pid"\s*:\s*(\d+)/.exec(report)?.[1];
+      if (options.pid !== undefined && Number(reported) !== options.pid) continue;
+      const retained = join(options.directory, `${basename(directory)}-${name}`);
+      if (await rename(destination, retained).then(() => true, () => false)) return retained;
+    } finally {
+      await rm(directory, { recursive: true, force: true }).catch(() => {});
+    }
   }
   return undefined;
 }

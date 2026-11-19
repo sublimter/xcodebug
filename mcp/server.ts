@@ -233,7 +233,7 @@ async function callTool(
   }
 }
 
-async function handle(message: Record<string, unknown>): Promise<void> {
+async function handle(message: Record<string, unknown>, controller?: AbortController): Promise<void> {
   const id = message.id;
   const method = message.method;
   // Notifications carry no id and must never be answered.
@@ -266,16 +266,14 @@ async function handle(message: Record<string, unknown>): Promise<void> {
       replyError(id, -32602, `Unknown tool "${params.name ?? ""}"`);
       return;
     }
-    // Registered before the call starts so a cancellation that arrives while it
-    // runs finds the controller; `finally` keeps the map from growing.
-    const controller = new AbortController();
-    inflight.set(id, controller);
     try {
-      reply(id, await callTool(params.arguments ?? {}, controller.signal, params._meta?.progressToken));
+      if (controller!.signal.aborted) {
+        reply(id, { content: [{ type: "text", text: "Request cancelled" }], isError: true });
+        return;
+      }
+      reply(id, await callTool(params.arguments ?? {}, controller!.signal, params._meta?.progressToken));
     } catch (error) {
       reply(id, { content: [{ type: "text", text: (error as Error).message }], isError: true });
-    } finally {
-      inflight.delete(id);
     }
     return;
   }
@@ -285,7 +283,7 @@ async function handle(message: Record<string, unknown>): Promise<void> {
 // Requests are serialized: a capture's state is a plain map, and two overlapping
 // calls (launch + stop) would interleave mutations on it.
 let queue: Promise<void> = Promise.resolve();
-/** Calls running right now, so a cancellation can reach the one it names. */
+/** Admitted calls, including queued calls, so cancellation cannot miss one. */
 const inflight = new Map<unknown, AbortController>();
 
 /**
@@ -301,24 +299,33 @@ async function shutdown(code: number): Promise<void> {
   exiting = true;
   for (const controller of inflight.values()) controller.abort();
   try {
+    // Aborting is not settlement: an operation may still be rolling back a
+    // partially started capture. Teardown must run after that rollback, never
+    // concurrently with it, and queued work must not start after this barrier.
+    await queue;
     await endSession?.();
+    if (!process.stdout.destroyed) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      process.stdout.write("", () => resolve());
+      await promise;
+    }
   } finally {
     process.exit(code);
   }
 }
 
-// A client that has gone has closed its end of this pipe as well, and the reply
-// to a call it left running fails to write. Unhandled, that error ends the
-// process there and then, before the captures are stopped.
-process.stdout.on("error", () => {});
+// EOF on stdin is only a half-close: scripts commonly finish sending requests
+// and keep stdout open to collect replies. A full disconnect is observable only
+// when stdout closes or a write fails; stdio cannot detect a silent reader gone.
+process.stdout.on("error", () => { void shutdown(0); });
+process.stdout.on("close", () => { void shutdown(0); });
 
 const input = createInterface({ input: process.stdin });
-// The client is gone. What it had already asked for is still carried out first:
-// a script that pipes its requests in and closes stdin reads the replies.
 input.on("close", () => {
-  queue = queue.then(() => shutdown(0));
+  void queue.then(() => shutdown(0));
 });
 input.on("line", (line) => {
+  if (exiting) return;
   const text = line.trim();
   if (text.length === 0) return;
   let message: Record<string, unknown>;
@@ -347,7 +354,16 @@ input.on("line", (line) => {
     inflight.get(requestId)?.abort();
     return;
   }
-  queue = queue.then(() => handle(message)).catch((error: unknown) => {
+  const controller = message.method === "tools/call" && message.id !== undefined
+    ? new AbortController() : undefined;
+  if (controller) inflight.set(message.id, controller);
+  queue = queue.then(async () => {
+    try {
+      if (!exiting) await handle(message, controller);
+    } finally {
+      if (controller && inflight.get(message.id) === controller) inflight.delete(message.id);
+    }
+  }).catch((error: unknown) => {
     console.error("xcodebug-mcp:", error);
   });
 });

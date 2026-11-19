@@ -104,6 +104,29 @@ test("a pod installed from outside the repository is part of the target's finger
   assert.notEqual(await fingerprint(container), edited);
 });
 
+test("relative containers locate external pods from the project cwd, not the process cwd", async t => {
+  const { root, git, write } = await repository(t);
+  const outside = await mkdtemp(join(tmpdir(), "xcodebug-relative-pod-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  await writeFile(join(outside, "Kit.swift"), "// original\n");
+  await mkdir(join(root, "App"));
+  await write("App/Podfile.lock", `EXTERNAL SOURCES:\n  Kit:\n    :path: "${outside}"\n`);
+  git("add", "-A");
+  git("commit", "-q", "-m", "base");
+  const cwd = join(root, "App");
+  const fingerprint = async container => (await detectChanges(cwd, container)).fingerprint;
+  const before = await fingerprint("App.xcworkspace");
+  assert.equal(before, await fingerprint(join(cwd, "App.xcworkspace")));
+
+  await mkdir(join(outside, "build"));
+  await writeFile(join(outside, "build", "generated.swift"), "// ignored build output\n");
+  assert.equal(await fingerprint("App.xcworkspace"), before, "external source scans still ignore build directories");
+
+  await writeFile(join(outside, "Kit.swift"), "// edited outside git\n");
+  assert.notEqual(await fingerprint("App.xcworkspace"), before);
+  assert.equal(await fingerprint("App.xcodeproj"), await fingerprint(join(cwd, "App.xcodeproj")));
+});
+
 test("a directory's signature follows its files, and there is none for one that cannot be read", async t => {
   const root = await mkdtemp(join(tmpdir(), "xcodebug-signature-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -113,17 +136,31 @@ test("a directory's signature follows its files, and there is none for one that 
   await writeFile(join(root, ".git", "HEAD"), "ref");
   // A link to nothing is an entry like any other, not a reason to give up.
   await symlink(join(root, "missing"), join(root, "dangling"));
-  const first = await directorySignature(root);
+  const first = await directorySignature(root, "source");
   assert.equal(typeof first, "string");
-  assert.equal(await directorySignature(root), first);
+  assert.equal(await directorySignature(root, "source"), first);
 
   await writeFile(join(root, ".git", "HEAD"), "ref: moved");
-  assert.equal(await directorySignature(root), first, "a repository's own bookkeeping is not its sources");
+  assert.equal(await directorySignature(root, "source"), first, "a repository's own bookkeeping is not its sources");
   await writeFile(join(root, "Frameworks", "Kit"), "binary, rebuilt");
-  const rebuilt = await directorySignature(root);
+  const rebuilt = await directorySignature(root, "source");
   assert.notEqual(rebuilt, first);
   await writeFile(join(root, "Frameworks", "Extra"), "new");
-  assert.notEqual(await directorySignature(root), rebuilt);
+  assert.notEqual(await directorySignature(root, "source"), rebuilt);
 
   assert.equal(await directorySignature(join(root, "gone")), undefined);
+});
+
+test("product signatures include directories that source scans ignore", async t => {
+  const root = await mkdtemp(join(tmpdir(), "xcodebug-product-signature-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const dir of ["Pods", "build", ".build", "DerivedData", "Carthage", ".git"]) {
+    await mkdir(join(root, dir));
+    const before = await directorySignature(root);
+    await writeFile(join(root, dir, "resource"), "bundled app resource");
+    assert.notEqual(await directorySignature(root), before, `${dir} is part of the installed product`);
+    const withResource = await directorySignature(root);
+    await writeFile(join(root, dir, "resource"), "bundled app resource, changed");
+    assert.notEqual(await directorySignature(root), withResource, `${dir} edits invalidate the product`);
+  }
 });

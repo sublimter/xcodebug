@@ -165,19 +165,22 @@ test("launch reuses this session's build until the code or the product is no lon
   assert.doesNotMatch(second, /already running/, "replacing its own previous instance is not news");
   assert.equal(await s.count("builds"), 1);
   assert.equal(await s.count("launches"), 2, "a reused build is still installed and launched");
-  assert.match(await s.text({ action: "changes" }), /\nrebuild needed: no\n/);
+  assert.match(await s.text({ action: "changes", ...s.built }), /\nrebuild needed: no\n/);
+  assert.match(await s.text({ action: "changes", ...s.built, scheme: "Other" }), /\nrebuild needed: yes\n/);
+  assert.match(await s.text({ action: "changes", ...s.built, force: true }), /\nrebuild needed: yes\n/);
   assert.match(await s.text({ action: "build", ...s.built }), /^build skipped: nothing changed since /);
 
   // A commit leaves the tree as clean as it was, with other code in it.
   await writeFile(join(s.repo, "A.swift"), "// two, and committed\n");
   s.git("commit", "-q", "-am", "two");
-  assert.match(await s.text({ action: "changes" }), /\nrebuild needed: yes\n/);
+  assert.match(await s.text({ action: "changes", ...s.built }), /\nrebuild needed: yes\n/);
   assert.match(await s.text({ action: "launch", ...s.built }), /build succeeded/);
   assert.equal(await s.count("builds"), 2);
   assert.match(await s.text({ action: "launch", ...s.built }), /^reusing this session's build /);
 
   // Xcode, or an xcodebuild in another terminal, writes the same product path.
   await writeFile(join(s.app, "Probe"), "rebuilt by someone else");
+  assert.match(await s.text({ action: "changes", ...s.built }), /\nrebuild needed: yes\n/);
   assert.match(await s.text({ action: "launch", ...s.built }), /build succeeded/);
   assert.equal(await s.count("builds"), 3);
 
@@ -197,7 +200,7 @@ test("launch reuses this session's build until the code or the product is no lon
   assert.equal(await s.count("builds"), 6);
   assert.match(await s.text({ action: "launch", ...s.built }), /^reusing this session's build /);
   // The tree still differs from the last commit, and is what was built.
-  assert.match(await s.text({ action: "changes" }), /^1 build-relevant change\(s\)\n.*\nrebuild needed: no\n/s);
+  assert.match(await s.text({ action: "changes", ...s.built }), /^1 build-relevant change\(s\)\n.*\nrebuild needed: no\n/s);
 });
 
 test("a line the buffer has dropped is still found, and the reply says where it looked", { timeout: 60_000 }, async t => {
@@ -248,15 +251,15 @@ test("an app that dies under a capture ends it with the reason and its crash rep
   assert.equal(ended.endReason, 'the app exited; last line before the bridge ended: "App terminated due to signal 9."');
   // This instance's report: not the resource diagnostic dated beside it, and not
   // the crash from 2020, which was of a process that had the same pid.
-  assert.equal(ended.crashReport, join(s.logs, "crash-Probe-2026-11-19-101010.ips"));
+  assert.match(ended.crashReport, /\/crash-[^/]+-Probe-2026-11-19-101010\.ips$/);
   assert.match(await readFile(ended.crashReport, "utf8"), /"pid" : 4001,/);
-  assert.deepEqual((await readdir(s.logs)).filter(name => name.startsWith("crash-")), ["crash-Probe-2026-11-19-101010.ips"]);
+  assert.equal((await readdir(s.logs)).filter(name => name.startsWith("crash-")).length, 1);
   assert.equal(await s.count("launches"), 1, "an app that is gone is not relaunched");
 
-  assert.match(await s.text({ action: "status" }), / exited code=1 · the app exited; .+ · crash report: \S+crash-Probe-2026-11-19-101010\.ips · \d+ lines · /);
+  assert.match(await s.text({ action: "status" }), / exited code=1 · the app exited; .+ · crash report: \S+crash-[^/]+-Probe-2026-11-19-101010\.ips · \d+ lines · /);
   const filtered = await s.text({ action: "logs", captureId, grep: "matches no line" });
   assert.match(filtered, /\n\[this capture ended on its own · the app exited; /);
-  assert.match(filtered, /\n\[crash report: \S+crash-Probe-2026-11-19-101010\.ips\]$/);
+  assert.match(filtered, /\n\[crash report: \S+crash-[^/]+-Probe-2026-11-19-101010\.ips\]$/);
   const onDisk = await readFile(ended.logFile, "utf8");
   assert.match(onDisk, / \[xcodebug\] the app exited; .+; stopping capture\n/, "why a log stops is part of the log");
   assert.match(onDisk, / \[xcodebug\] crash report: /);
@@ -310,12 +313,12 @@ test("a capture whose app someone else relaunched ends, and leaves that instance
 
 test("a stop that lands while a dropped bridge is being looked into is not answered with a relaunch", { timeout: 60_000 }, async t => {
   const s = await session(t);
-  const captureId = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+  await s.ok({ action: "launch", ...s.prebuilt, dualChannel: false });
   await s.flag("slow-table");
   await s.flag("drop");
   // One second of backoff, then the process table is asked; the stop arrives mid-answer.
   await delay(1_600);
-  await s.ok({ action: "stop", captureId });
+  assert.match(await s.text({ action: "stop" }), /^stopped 1 capture/);
   await delay(2_500);
   assert.equal(await s.count("launches"), 1);
   assert.equal((await s.capture()).running, false);

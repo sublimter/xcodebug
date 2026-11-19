@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -165,6 +165,20 @@ done
     assert.match((await snapshot()).rows[0], /capturing/);
   });
 
+  await t.test("cancellation reaches an install still queued behind another call", async () => {
+    await rm(join(root, "install-started"));
+    // A release file keeps a regression from stranding the fixture indefinitely.
+    await writeFile(join(root, "install-release"), "");
+    const waiting = action({ action: "wait", match: "NEVER_MATCH_THIS", timeoutSeconds: 1 });
+    const requestId = id + 1;
+    const installing = action({ action: "install", device: "test-device", appPath: "/test/Probe.app" });
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId } })}\n`);
+    await waiting;
+    assert.equal((await installing).isError, true);
+    await assert.rejects(access(join(root, "install-started")), { code: "ENOENT" });
+    assert.match((await snapshot()).rows[0], /capturing/);
+  });
+
   let waitSettled = false;
   const waiting = action({ action: "wait", match: "NEVER_MATCH_THIS", timeoutSeconds: 3 });
   waiting.finally(() => { waitSettled = true; });
@@ -205,28 +219,52 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 // A capture's bridge is a child of the server. One whose app is quiet writes
 // nothing, so it never learns that the pipe it would write to is closed, and it
 // outlives a server that does not stop it.
-const CALL = args => `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "xcodebug", arguments: args } })}\n`;
-const COMMAND = "/bin/sleep 987";
-const pids = pattern => {
-  try { return execFileSync("pgrep", ["-f", pattern]).toString().trim().split("\n").map(Number); } catch { return []; }
+const CALL = (args, id = 3) => `${JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "xcodebug", arguments: args } })}\n`;
+// PID files are written by fixtures owned by this test. Never search all system
+// processes by a shared command string: another test or user may run it too.
+const fixturePid = async (root, name) => {
+  const file = join(root, `${name}.pid`);
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try {
+      const pid = Number((await readFile(file, "utf8")).trim());
+      if (Number.isSafeInteger(pid) && pid > 1) return pid;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    assert.ok(Date.now() < deadline, `fixture did not start: ${name}`);
+    await delay(25);
+  }
 };
-// Each ends the server its own way and returns the processes a call had started.
+// Each fixture ends the server its own way. Commands record their own PIDs.
 for (const [how, end, code] of [
   ["closing its stdin", async child => { child.stdin.end(); }, 0],
+  ["closing its stdin with calls still queued", async child => {
+    child.stdin.end(CALL({ action: "wait", match: "NEVER_LOGGED", timeoutSeconds: 1 }) +
+      `${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "ping" })}\n`);
+  }, 0],
   ["SIGINT", async child => { child.kill("SIGINT"); }, 130],
   // The command of a call still running is a process group of its own.
-  ["SIGINT during a call", async child => {
-    child.stdin.write(CALL({ action: "await", command: COMMAND }));
-    let command = [];
-    while (command.length === 0) { await delay(25); command = pids(COMMAND); }
+  ["SIGINT during a call with another call queued", async (child, root, started, request) => {
+    child.stdin.write(CALL({ action: "await", command: `'${join(root, "bin", "long-command")}'` }));
+    started.push(await fixturePid(root, "command"));
+    // The active request must settle before teardown, and this admitted request
+    // must never start during that teardown or recreate session state afterward.
+    child.stdin.write(CALL({ action: "await", command: `'${join(root, "bin", "queued-command")}'` }, 4));
+    // A reply on the bypass route proves the preceding line was admitted while
+    // the long command still holds the mutation queue.
+    await request(5, "tools/call", { name: "xcodebug_ui", arguments: {} });
     child.kill("SIGINT");
-    return command;
   }, 130],
   // The client died with a call in flight: the reply to it has nowhere to go.
-  ["a client that vanishes during a call", async child => {
-    child.stdin.write(CALL({ action: "wait", match: "NEVER_LOGGED", timeoutSeconds: 1 }));
+  ["a client that vanishes during a call", async (child, root, started) => {
+    child.stdin.write(CALL({ action: "await", command: `'${join(root, "bin", "long-command")}'` }));
+    started.push(await fixturePid(root, "command"));
     child.stdout.destroy();
-    child.stdin.end();
+    // EOF alone cannot identify a full disconnect. Force an immediate reply
+    // through the out-of-band UI route so EPIPE exposes the vanished reader,
+    // even though its stdin remains open and the command has not finished.
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "xcodebug_ui", arguments: {} } })}\n`);
   }, 0],
 ]) {
   test(`${how} ends the server and what its calls started`, { timeout: 30_000 }, async t => {
@@ -238,7 +276,10 @@ for (const [how, end, code] of [
       connection: { state: "connected", transportType: "wired" }, state: { name: "Test" },
     } };
     await writeFile(join(bin, "xcrun"), `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({ result: { devices: [device] } })}'\n`, { mode: 0o755 });
-    await writeFile(join(bin, "idevicesyslog"), "#!/bin/sh\nexec /bin/sleep 120\n", { mode: 0o755 });
+    await writeFile(join(bin, "idevicesyslog"), `#!/bin/sh\nprintf '%s' "$$" > '${root}/capture.pid'\nexec /bin/sleep 120\n`, { mode: 0o755 });
+    for (const [name, marker] of [["long-command", "command"], ["queued-command", "queued"]]) {
+      await writeFile(join(bin, name), `#!/bin/sh\nprintf '%s' "$$" > '${root}/${marker}.pid'\nexec /bin/sleep 120\n`, { mode: 0o755 });
+    }
     const child = spawn("bun", [new URL("../mcp/server.ts", import.meta.url).pathname], {
       cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, XCODEBUG_AGENT_DIR: root },
       stdio: ["pipe", "pipe", "inherit"],
@@ -246,31 +287,51 @@ for (const [how, end, code] of [
     let started = [];
     t.after(async () => {
       child.kill("SIGKILL");
-      for (const pid of [...started, ...pids(COMMAND)]) {
+      // Collect only fixture-owned PIDs, including one that started just before
+      // an assertion failed. No process-name search is safe for test cleanup.
+      for (const name of ["capture", "command", "queued"]) {
+        try {
+          const pid = Number((await readFile(join(root, `${name}.pid`), "utf8")).trim());
+          if (Number.isSafeInteger(pid) && pid > 1) started.push(pid);
+        } catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
+      for (const pid of new Set(started)) {
         try { process.kill(pid, "SIGKILL"); } catch { /* already gone, as it should be */ }
       }
       await rm(root, { recursive: true, force: true });
     });
     const lines = createInterface({ input: child.stdout });
-    const request = (id, method, params) => new Promise(resolve => {
-      lines.on("line", line => {
+    const replies = [];
+    lines.on("line", line => { replies.push(JSON.parse(line)); });
+    const request = (id, method, params) => {
+      const { promise, resolve } = Promise.withResolvers();
+      const onLine = line => {
         const message = JSON.parse(line);
-        if (message.id === id) resolve(message.result);
-      });
+        if (message.id !== id) return;
+        lines.off("line", onLine);
+        resolve(message.result);
+      };
+      lines.on("line", onLine);
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-    });
+      return promise;
+    };
     await request(1, "initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "end-test", version: "1" } });
     const capture = await request(2, "tools/call", { name: "xcodebug", arguments: { action: "syslog", device: "test-device", processName: "Quiet" } });
     assert.ok(!capture.isError, capture.content[0].text);
-    started = execFileSync("pgrep", ["-P", String(child.pid)]).toString().trim().split("\n").map(Number);
-    assert.equal(started.length, 1, "the capture's bridge");
+    started.push(await fixturePid(root, "capture"));
 
-    const exited = new Promise(resolve => child.once("exit", resolve));
-    started.push(...(await end(child) ?? []));
+    const { promise: exited, resolve: onClose } = Promise.withResolvers();
+    child.once("close", onClose);
+    await end(child, root, started, request);
     assert.equal(await Promise.race([exited, delay(10_000, "still running")]), code);
+    if (how === "closing its stdin with calls still queued") {
+      assert.deepEqual(replies.filter(reply => reply.id >= 3).map(reply => reply.id), [3, 4], "EOF must drain queued requests and flush their replies");
+      assert.match(replies.find(reply => reply.id === 3).result.content[0].text, /timed out after 1s/, "half-close must let an admitted call finish naturally, not cancel it");
+    }
     const deadline = Date.now() + 3_000;
     const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
     while (started.some(alive) && Date.now() < deadline) await delay(25);
     assert.deepEqual(started.filter(alive), [], "nothing a call started may outlive the server");
+    await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
   });
 }

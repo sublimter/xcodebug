@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createReadStream } from "node:fs";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { Writable } from "node:stream";
+import { addAbortSignal, PassThrough, Writable } from "node:stream";
 import { mkdtemp, open, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +23,44 @@ async function directory(t) {
   const dir = await mkdtemp(join(tmpdir(), "xcodebug-capture-test-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
   return dir;
+}
+
+async function idleCapture(t, dir) {
+  const c = capture({ logDir: dir, args: ["-e", "setInterval(() => {}, 1000)"] });
+  t.after(async () => {
+    c.stop(false);
+    await c.waitForExit(5_000);
+  });
+  await c.start();
+  return c;
+}
+
+function holdLogWrites(t, path) {
+  fs.writeFileSync(path, "");
+  let held = true;
+  let release;
+  const sink = new Writable({
+    write(chunk, _encoding, callback) {
+      const append = () => {
+        try {
+          fs.appendFileSync(path, chunk);
+          callback();
+        } catch (error) {
+          callback(error);
+        }
+      };
+      if (held) release = () => { held = false; append(); };
+      else append();
+    },
+  });
+  t.mock.method(fs, "createWriteStream", () => sink);
+  syncBuiltinESMExports();
+  t.after(() => {
+    sink.destroy();
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  });
+  return () => release();
 }
 
 const producer = String.raw`
@@ -61,6 +99,142 @@ test("long lines cannot make the retained text exceed 4 MiB", () => {
   c.pushLine("out", "after oversized line");
   assert.equal(c.read({ limit: 1 }).lines[0].text, "after oversized line");
   assert.equal(c.status().cursor, 1_002);
+});
+
+test("a search cannot advance past a pending write, including when started by a line listener", { timeout: 10_000 }, async t => {
+  const dir = await directory(t);
+  const path = join(dir, "pending.log");
+  const release = holdLogWrites(t, path);
+  const c = capture({ logFile: path, args: ["-e", "setInterval(() => {}, 1000)"] });
+  t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+  await c.start();
+  let searching;
+  t.after(c.onLine(line => {
+    if (line.index === 1) searching = c.search({ grep: "MATCH" });
+  }));
+  c.pushLine("out", `MATCH ${"x".repeat(3 * 1024 * 1024)}`);
+  let settled = false;
+  void searching.then(() => { settled = true; });
+  await delay(20);
+  assert.equal(settled, false, "EOF before the queued write must not produce a final cursor");
+  c.pushLine("out", "MATCH later");
+  release();
+  const found = await searching;
+  assert.deepEqual(found.lines.map(line => [line.index, line.text.slice(0, 6)]), [[1, "MATCH "]]);
+  assert.deepEqual([found.cursor, found.total, found.evicted, found.missing], [1, 1, 1, 0]);
+  const later = await c.search({ since: found.cursor, grep: "MATCH" });
+  assert.deepEqual(later.lines.map(line => [line.index, line.text]), [[2, "MATCH later"]]);
+});
+
+test("disk search fills interior oversized-line holes and merges chronological tails", { timeout: 10_000 }, async t => {
+  const dir = await directory(t);
+  const c = await idleCapture(t, dir);
+  c.pushLine("out", "MATCH before");
+  c.pushLine("out", `MATCH ${"x".repeat(3 * 1024 * 1024)}`);
+  c.pushLine("out", "MATCH after");
+  const memory = c.read({});
+  assert.deepEqual(memory.lines.map(line => line.index), [1, 3]);
+  assert.equal(memory.evicted, 1);
+  const found = await c.search({ grep: "MATCH", limit: 2 });
+  assert.deepEqual(found.lines.map(line => line.index), [2, 3]);
+  assert.deepEqual([found.cursor, found.total, found.evicted, found.missing], [3, 3, 1, 0]);
+  const since = await c.search({ since: 1, grep: "MATCH" });
+  assert.deepEqual(since.lines.map(line => line.index), [2, 3]);
+  assert.deepEqual([since.total, since.evicted, since.missing], [2, 1, 0]);
+  assert.deepEqual((await c.search({ grep: "MATCH", limit: 1 })).lines.map(line => line.index), [3]);
+  assert.equal((await c.search({ since: 2, grep: "MATCH" })).evicted, 0);
+});
+
+test("an interior hole without a disk copy is reported as missing", async () => {
+  const c = capture();
+  c.pushLine("out", "MATCH before");
+  c.pushLine("out", `MATCH ${"x".repeat(3 * 1024 * 1024)}`);
+  c.pushLine("out", "MATCH after");
+  const found = await c.search({ grep: "MATCH" });
+  assert.deepEqual(found.lines.map(line => line.index), [1, 3]);
+  assert.deepEqual([found.total, found.evicted, found.missing], [2, 1, 1]);
+});
+
+test("search cancellation interrupts a pending writer barrier", { timeout: 10_000 }, async t => {
+  const dir = await directory(t);
+  const path = join(dir, "pending.log");
+  const release = holdLogWrites(t, path);
+  const c = capture({ logFile: path, args: ["-e", "setInterval(() => {}, 1000)"] });
+  t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+  await c.start();
+  c.pushLine("out", `MATCH ${"x".repeat(3 * 1024 * 1024)}`);
+  const abort = new AbortController();
+  const reason = new Error("search cancelled");
+  const searching = c.search({ grep: "MATCH", signal: abort.signal });
+  abort.abort(reason);
+  await assert.rejects(searching, error => error === reason);
+  release();
+  const found = await c.search({ grep: "MATCH" });
+  assert.deepEqual([found.total, found.missing], [1, 0], "cancelling a search does not cancel capture writes");
+});
+
+test("search cancellation destroys an active disk reader and preserves the abort reason", { timeout: 10_000 }, async t => {
+  const dir = await directory(t);
+  const c = await idleCapture(t, dir);
+  c.pushLine("out", `MATCH ${"x".repeat(3 * 1024 * 1024)}`);
+  c.stop(false);
+  assert.equal(await c.waitForExit(5_000), true);
+  const abort = new AbortController();
+  const reason = new Error("scan cancelled");
+  let started;
+  const ready = new Promise(resolve => { started = resolve; });
+  let reader;
+  t.mock.method(fs, "createReadStream", (_path, options) => {
+    assert.equal(options.signal, abort.signal);
+    reader = addAbortSignal(options.signal, new PassThrough());
+    started();
+    return reader;
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const searching = c.search({ grep: "MATCH", signal: abort.signal });
+  await ready;
+  abort.abort(reason);
+  await assert.rejects(searching, error => error === reason);
+  assert.equal(reader.destroyed, true);
+});
+
+test("an already-aborted search rejects even when all lines are in memory", async () => {
+  const c = capture();
+  c.pushLine("out", "MATCH");
+  const reason = new Error("already cancelled");
+  await assert.rejects(c.search({ grep: "MATCH", signal: AbortSignal.abort(reason) }), error => error === reason);
+});
+
+test("a stop during start's mkdir prevents opening a writer or spawning a bridge", { timeout: 10_000 }, async t => {
+  const dir = await directory(t);
+  const c = capture({ logDir: dir, args: ["-e", "setInterval(() => {}, 1000)"] });
+  t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+  const starting = c.start();
+  c.stop(false);
+  await starting;
+  assert.equal(c.running, false);
+  assert.equal(c.pid, undefined);
+  assert.deepEqual(await readdir(dir), []);
+  c.resetForReconnect();
+  await c.start();
+  assert.equal(c.running, false, "reconnect must not clear explicit stop intent");
+});
+
+test("a cancelled start never opens a writer or spawns a bridge", { timeout: 10_000 }, async t => {
+  const dir = await directory(t);
+  const c = capture({ logDir: dir, args: ["-e", "setInterval(() => {}, 1000)"] });
+  t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+  const abort = new AbortController();
+  const reason = new Error("start cancelled");
+  const starting = c.start(abort.signal);
+  abort.abort(reason);
+  await assert.rejects(starting, error => error === reason);
+  assert.equal(c.running, false);
+  assert.equal(c.pid, undefined);
+  assert.deepEqual(await readdir(dir), []);
+  await assert.rejects(c.start(abort.signal), error => error === reason);
+  assert.equal(c.running, false);
 });
 
 test("file rotation keeps the newest three segments and continues past 150 MiB", { timeout: 60_000 }, async t => {
@@ -136,7 +310,7 @@ test("a search reads back the lines the buffer dropped, under their own indices"
   assert.match(text, / \[test\] ended for good\n$/);
 });
 
-test("a search that a rotation overtakes reads again", { timeout: 60_000 }, async t => {
+test("a rotation to a new segment does not invalidate a disk search snapshot", { timeout: 60_000 }, async t => {
   const dir = await directory(t);
   const c = capture({ logDir: dir, args: ["-e", "setInterval(() => {}, 1000)"] });
   t.after(() => c.stop(false));
@@ -155,7 +329,34 @@ test("a search that a rotation overtakes reads again", { timeout: 60_000 }, asyn
   for (let i = 0; i < 51; i++) c.pushLine("out", megabyte);
   const found = await searching;
   assert.deepEqual(found.lines.map(line => [line.index, line.text]), [[1, "MARKER"]]);
-  assert.equal(found.cursor, 20_052, "the answer is from a read that began after the rotation");
+  assert.equal(found.cursor, 20_001, "creating a new segment must preserve the original search snapshot");
+});
+
+test("overwriting a snapshot segment retries the disk search with current indices", { timeout: 30_000 }, async t => {
+  const dir = await directory(t);
+  const c = await idleCapture(t, dir);
+  c.pushLine("out", "MARKER");
+  for (let i = 0; i < 20_000; i++) c.pushLine("out", `filler ${i}`);
+  assert.equal((await c.search({ grep: "MARKER" })).missing, 0);
+  const original = fs.createReadStream;
+  let rotate = true;
+  t.mock.method(fs, "createReadStream", (...args) => {
+    if (rotate) {
+      rotate = false;
+      // Boundary accounting is covered by the large-file test. Force each next
+      // line over that boundary here so a three-segment overwrite stays small.
+      for (let i = 0; i < 3; i++) {
+        c.fileBytes = 50 * 1024 * 1024;
+        c.pushLine("out", `rotated ${i}`);
+      }
+    }
+    return original(...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const found = await c.search({ grep: "MARKER" });
+  assert.deepEqual(found.lines, []);
+  assert.deepEqual([found.cursor, found.total, found.evicted, found.missing], [20_004, 0, 4, 4]);
 });
 
 test("a blocked log sink pauses the producer and drains without losing the final lines", { timeout: 30_000 }, async t => {
@@ -252,7 +453,7 @@ test("an existing directory is not reported as a successfully opened log file", 
 });
 
 for (const scenario of ["explicit stop with paused pipes", "natural exit with paused pipes", "natural close with pending writer"]) {
-  test(`drain deadline bounds ${scenario} and permits reconnect`, { timeout: 40_000 }, async t => {
+  test(`drain deadline bounds ${scenario} and preserves stop intent`, { timeout: 40_000 }, async t => {
     const dir = await directory(t);
     let releaseWrite;
     let sinkReady;
@@ -312,6 +513,13 @@ for (const scenario of ["explicit stop with paused pipes", "natural exit with pa
     assert.equal(c.running, false);
     assert.equal(exits, 1);
     assert.match(c.status().error, /drain.*(timed? out|timeout|truncat)/i);
+    if (scenario.startsWith("explicit")) {
+      c.resetForReconnect();
+      await c.start();
+      assert.equal(c.running, false, "explicit stop must prevent even a queued reconnect");
+      assert.equal(exits, 1);
+      return;
+    }
 
     c.resetForReconnect();
     let reconnected;

@@ -186,7 +186,7 @@ async function fileSignature(repoRoot: string, file: ChangedFile): Promise<strin
     const info = await stat(path);
     // A directory here is a submodule: one entry however much changed inside
     // it, and nothing on the entry itself tells two of its states apart.
-    if (info.isDirectory()) return `${file.path}:${(await directorySignature(path)) ?? "unreadable"}`;
+    if (info.isDirectory()) return `${file.path}:${(await directorySignature(path, "source")) ?? "unreadable"}`;
     return `${file.path}:${info.mtimeMs}:${info.size}`;
   } catch {
     return `${file.path}:missing`;
@@ -194,14 +194,15 @@ async function fileSignature(repoRoot: string, file: ChangedFile): Promise<strin
 }
 
 /**
- * Fingerprint a directory git says nothing about: every file's path, time and size.
+ * Fingerprint every file's path, time and size in a built product or source tree.
  *
- * It serves both ends of a build that lie outside the repository's view - a pod
- * installed from a local path elsewhere, and the built app - where the question
- * is the same: is this still what it was? Undefined when the directory is
- * missing or changes under the walk, which is never "the same as before".
+ * Products include all directories: even a resource called `build` is installed
+ * app content. Source trees omit generated/build directories and git metadata
+ * so a local pod's build output does not invalidate its own inputs.
+ * Undefined when the directory is missing or changes under the walk, which is
+ * never "the same as before".
  */
-export async function directorySignature(root: string): Promise<string | undefined> {
+export async function directorySignature(root: string, kind: "product" | "source" = "product"): Promise<string | undefined> {
   const files: string[] = [];
   const pending = [root];
   for (let dir = pending.pop(); dir !== undefined; dir = pending.pop()) {
@@ -209,7 +210,7 @@ export async function directorySignature(root: string): Promise<string | undefin
       for (const entry of await readdir(dir, { withFileTypes: true })) {
         const path = join(dir, entry.name);
         if (entry.isDirectory()) {
-          if (!IGNORED_SEGMENTS.includes(`/${entry.name}/`)) pending.push(path);
+          if (kind === "product" || !IGNORED_SEGMENTS.includes(`/${entry.name}/`)) pending.push(path);
           continue;
         }
         // Not followed: a link is recorded as itself, so one that points at a
@@ -229,8 +230,8 @@ export async function directorySignature(root: string): Promise<string | undefin
  * installs pods from (`:path` entries). An edit there changes what gets built
  * and leaves `git status` exactly as it was.
  */
-async function outsidePodDirs(containerPath: string, repoRoot: string): Promise<string[]> {
-  const dir = dirname(resolve(containerPath));
+async function outsidePodDirs(containerPath: string, repoRoot: string, cwd: string): Promise<string[]> {
+  const dir = dirname(resolve(cwd, containerPath));
   let lock: string;
   try {
     lock = await readFile(join(dir, "Podfile.lock"), "utf8");
@@ -323,9 +324,9 @@ export async function checkPodLockSync(
 }
 
 /**
- * `containerPath` is the .xcworkspace/.xcodeproj the run targets. With it, the
- * fingerprint also covers pods that container installs from outside the
- * repository; without it, only what git can see.
+ * `containerPath` is the .xcworkspace/.xcodeproj the run targets, resolved from
+ * `cwd` when relative. With it, the fingerprint also covers pods that container
+ * installs from outside the repository; without it, only what git can see.
  */
 export async function detectChanges(cwd: string, containerPath?: string): Promise<ChangeReport> {
   const root = await runCommand("git", ["rev-parse", "--show-toplevel"], { cwd, timeoutMs: 30_000 });
@@ -393,9 +394,9 @@ export async function detectChanges(cwd: string, containerPath?: string): Promis
   // or switching to a branch with the same content costs no rebuild.
   const head = await runCommand("git", ["rev-parse", "HEAD^{tree}"], { cwd: repoRoot, timeoutMs: 30_000 });
   const signatures = await Promise.all(changed.map((file) => fileSignature(repoRoot, file)));
-  const outside = containerPath ? await outsidePodDirs(containerPath, repoRoot) : [];
+  const outside = containerPath ? await outsidePodDirs(containerPath, repoRoot, cwd) : [];
   const outsideSignatures = await Promise.all(
-    outside.map(async (dir) => `${dir}:${(await directorySignature(dir)) ?? "unreadable"}`),
+    outside.map(async (dir) => `${dir}:${(await directorySignature(dir, "source")) ?? "unreadable"}`),
   );
   const fingerprint = hashString(
     [head.code === 0 ? head.stdout.trim() : "no commit", ...signatures.sort(), ...outsideSignatures].join("\n"),

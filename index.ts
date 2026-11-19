@@ -7,7 +7,7 @@
  * the same surface Xcode's debug console shows. No jailbreak, no debugger.
  */
 import { readdir, readFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 // `import type` is erased at compile time, so this specifier never reaches the
 // runtime: it only has to name a module the loader can resolve for typechecking.
 // `@earendil-works/pi-coding-agent` is the official one the engine documents for
@@ -626,12 +626,12 @@ function clock(at: number): string {
 
 async function formatLogLines(
   capture: Capture,
-  options: { since: number; limit: number; grep?: string | RegExp; times?: boolean },
+  options: { since: number; limit: number; grep?: string | RegExp; times?: boolean; signal?: AbortSignal },
 ): Promise<{ text: string; cursor: number; total: number }> {
   const { since, limit, grep } = options;
   // A filtered read looks on disk for what the buffer dropped. An unfiltered one
   // returns the newest lines anyway, so the dropped ones only add to "omitted".
-  const read = grep ? await capture.search({ since, limit, grep }) : capture.read({ since, limit });
+  const read = grep ? await capture.search({ since, limit, grep, signal: options.signal }) : capture.read({ since, limit });
   const total = grep ? read.total : read.total + read.evicted;
   const note = evictedNote(read, capture.logFile);
   if (read.lines.length === 0) {
@@ -1080,6 +1080,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     if (![...state.captures.values()].some((c) => c !== capture && c.running)) stopStatusTicker();
     refreshStatus();
     capture.stop(terminateApp);
+    if (!capture.running) releaseCapture(capture);
     if (state.activeCaptureId === capture.id) state.activeCaptureId = undefined;
   };
 
@@ -1193,12 +1194,12 @@ export default function xcodebug(pi: ExtensionAPI): void {
    * is about to die - and a pid that names the wrong process makes `terminate`
    * miss, and makes a later bridge drop look like someone else restarted the app.
    */
-  const discoverAppPid = async (capture: Capture, device: DeviceInfo, replaced: number | undefined): Promise<void> => {
+  const discoverAppPid = async (capture: Capture, device: DeviceInfo, replaced: number | undefined, signal = capture.signal): Promise<void> => {
     if (!capture.processName) return;
     const launch = capture.relaunches;
     const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline && capture.running && capture.relaunches === launch) {
-      const pid = await findProcessPid(device, capture.processName, { attempts: 1 });
+    while (!signal.aborted && Date.now() < deadline && capture.running && capture.relaunches === launch) {
+      const { pid } = await lookupProcess(device, capture.processName, { attempts: 1, signal });
       if (pid !== undefined && pid !== replaced) {
         if (capture.relaunches === launch) capture.appPid = pid;
         return;
@@ -1310,6 +1311,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
             if (capture.stoppedByUser) return;
             if (lookup.queryFailed) {
               capture.pushLine("err", "[xcodebug] could not read the process table; still retrying");
+              continue;
             } else if (lookup.pid === undefined) {
               endCapture(capture, "the app exited");
               return;
@@ -1322,6 +1324,9 @@ export default function xcodebug(pi: ExtensionAPI): void {
                 `the app was restarted outside this capture (pid ${capture.appPid} -> ${lookup.pid}) and is left running`,
               );
               return;
+            } else if (capture.appPid === undefined && capture.launchArgs.includes("--terminate-existing")) {
+              endCapture(capture, "cannot verify ownership of the running app; it is left running");
+              return;
             } else {
               listed = lookup.pid;
             }
@@ -1331,6 +1336,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
           capture.resetForReconnect();
           try {
             await capture.start();
+            if (capture.stoppedByUser) return;
             attempts = 0;
             onReconnect?.(1);
             // Resume pushing for whichever channel this is. The active-id check
@@ -1516,7 +1522,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
     containerPath?: string;
     /** Which of this session's builds would be reused; without one, a build is always needed. */
     buildKey?: string;
-  }): Promise<{ report: ChangeReport; needsBuild: boolean; podInstall?: string; podInstallFailed: boolean; notes: string[] }> => {
+    preview?: boolean;
+  }): Promise<{ report: ChangeReport; needsBuild: boolean; podInstall?: string; podInstallNeeded?: boolean; podInstallFailed: boolean; notes: string[] }> => {
     let report = await detectChanges(options.root, options.containerPath);
     const notes: string[] = [];
     let podInstallNote: string | undefined;
@@ -1542,13 +1549,16 @@ export default function xcodebug(pi: ExtensionAPI): void {
     const lockCheck =
       options.installPods === false || !options.containerPath
         ? undefined
-        : await checkPodLockSync(options.containerPath);
+        : await checkPodLockSync(resolve(options.root, options.containerPath));
     const lockNeedsInstall = lockCheck !== undefined && !lockCheck.synced;
 
     if (newFilesNeedInstall || lockNeedsInstall) {
       // pod install only runs in the directory that owns this container's
       // Podfile. Searching elsewhere risks reinstalling another project's pods.
       const podfileDir = lockCheck?.podfileDir;
+      if (options.preview && podfileDir) {
+        return { report, needsBuild: true, podInstallNeeded: true, podInstallFailed: false, notes };
+      }
       if (!podfileDir) {
         notes.push(
           `pod install skipped: no Podfile beside ${options.containerPath ?? "the container"} ` +
@@ -1580,7 +1590,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         // The install is only meaningful if the lock actually converged. Re-check
         // rather than trusting the pre-install verdict.
         if (options.containerPath) {
-          const after = await checkPodLockSync(options.containerPath);
+          const after = await checkPodLockSync(resolve(options.root, options.containerPath));
           if (after && !after.synced) {
             podInstallNote += `\nwarning: Podfile.lock is still out of sync after pod install (${after.reason})`;
           }
@@ -1789,21 +1799,33 @@ export default function xcodebug(pi: ExtensionAPI): void {
     }
 
     if (action === "changes") {
-      // The container a build would pick, so the fingerprint shown here is the
-      // one a build compares against.
-      const detected = await detectContainer(projectRoot);
-      const containerPath =
-        params.workspace ?? config.workspace ?? detected.workspace ??
-        params.project ?? config.project ?? detected.project;
-      const report = await detectChanges(projectRoot, containerPath);
-      const lastBuilt = [...state.builds.values()].at(-1)?.fingerprint;
+      let buildKey: string | undefined;
+      let containerPath: string | undefined;
+      let unresolved: string | undefined;
+      try {
+        const target = await withContainer(projectRoot, config, params);
+        containerPath = target.workspace ?? target.project;
+        buildKey = buildKeyOf(target, await resolveDeviceParam(params.device, projectRoot));
+      } catch (error) {
+        unresolved = (error as Error).message;
+        const detected = await detectContainer(projectRoot);
+        containerPath ??= params.workspace ?? params.project ?? config.workspace ?? config.project ?? detected.workspace ?? detected.project;
+      }
+      const gate = await prepareRun(ctx, {
+        root: projectRoot, containerPath: containerPath && resolve(projectRoot, containerPath),
+        buildKey, force: params.force, installPods: params.installPods, preview: true,
+      });
+      const { report } = gate;
+      const lastBuilt = buildKey === undefined ? undefined : state.builds.get(buildKey)?.fingerprint;
       const lines = [
         describeChanges(report),
         `fingerprint: ${report.fingerprint}`,
-        `last build in this session: ${lastBuilt ?? "(none)"}`,
-        `rebuild needed: ${report.unavailable || lastBuilt !== report.fingerprint ? "yes" : "no"}`,
-        `pod install needed: ${report.podsNeedingInstall.length > 0 ? report.podsNeedingInstall.join(", ") : "no"}`,
+        `last build for this target: ${lastBuilt ?? "(none)"}`,
+        `rebuild needed: ${gate.needsBuild ? "yes" : "no"}`,
+        `pod install needed: ${gate.podInstallNeeded ? "yes" : "no"}`,
+        ...gate.notes,
       ];
+      if (unresolved) lines.push(`no reusable target resolved: ${unresolved}`);
       return {
         content: [{ type: "text", text: lines.join("\n") }],
         details: { report, lastBuiltFingerprint: lastBuilt },
@@ -2033,7 +2055,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // read none is recorded.
       const before =
         executable && params.terminateExisting !== false
-          ? await lookupProcess(device, executable, { attempts: 1 })
+          ? await lookupProcess(device, executable, { attempts: 1, signal })
           : { queryFailed: false, pid: undefined };
       // Another session's capture, or the user's own running app: its state is
       // gone once this launch goes through, which is worth a line.
@@ -2080,7 +2102,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
           environment: { ...(config.environment ?? {}), ...(params.environment ?? {}) },
         }),
       });
-      await capture.start();
+      await capture.start(signal);
       state.captures.set(capture.id, capture);
       state.activeCaptureId = capture.id;
       watchExit(capture, device);
@@ -2128,7 +2150,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
           args: ["-u", device.udid ?? device.id, "-p", executable, "--no-colors"],
         });
         try {
-          await syslogCapture.start();
+          await syslogCapture.start(signal);
           state.captures.set(syslogCapture.id, syslogCapture);
           state.companions.set(capture.id, syslogCapture.id);
           watchExit(syslogCapture, device);
@@ -2140,7 +2162,12 @@ export default function xcodebug(pi: ExtensionAPI): void {
 
       // The app pid is not part of --console's output; discover it from the
       // process table so terminate can target the app rather than the bridge.
-      if (!before.queryFailed) await discoverAppPid(capture, device, before.pid);
+      if (!before.queryFailed) await discoverAppPid(capture, device, before.pid, signal);
+      if (signal?.aborted) {
+        stopCapture(capture, false);
+        await capture.waitForExit(3_000);
+        signal.throwIfAborted();
+      }
 
       return {
         content: [{
@@ -2176,7 +2203,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         command: "idevicesyslog",
         args,
       });
-      await capture.start();
+      await capture.start(signal);
       state.captures.set(capture.id, capture);
       state.activeCaptureId = capture.id;
       watchExit(capture, device);
@@ -2204,6 +2231,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         limit: params.limit ?? 200,
         grep: toFilter(params.grep, params.regex),
         times: params.times,
+        signal,
       });
       const companionId = state.companions.get(capture.id);
       if (!capture.running && companionId) {
@@ -2294,10 +2322,18 @@ export default function xcodebug(pi: ExtensionAPI): void {
         signal?.addEventListener("abort", onAbort, { once: true });
       });
 
-      const backlog = await capture.search({ since, limit: 500, grep: needle });
-      for (const line of backlog.lines) collect(line);
-      note = evictedNote(backlog, capture.logFile);
-      backlogRead = true;
+      try {
+        const backlog = await capture.search({ since, limit: 500, grep: needle, signal });
+        for (const line of backlog.lines) collect(line);
+        note = evictedNote(backlog, capture.logFile);
+        backlogRead = true;
+      } catch (error) {
+        if (signal?.aborted) onAbort?.();
+        else {
+          finish(false);
+          throw error;
+        }
+      }
       // The deadline bounds the wait for a line still to come, so it starts
       // here: expiring while the lines already logged are being read back would
       // report a timeout for a line that is sitting on disk.
@@ -2346,7 +2382,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // an error (requireCapture throws for that).
       const targets = params.captureId
         ? [requireCapture(params.captureId)]
-        : [...state.captures.values()].filter((c) => c.running);
+        : [...state.captures.values()].filter((c) => !state.endedCaptures.has(c.id));
       if (targets.length === 0) {
         const known = [...state.captures.values()].map((c) => `${c.id} (${c.mode}, ended)`);
         return {
@@ -2379,14 +2415,17 @@ export default function xcodebug(pi: ExtensionAPI): void {
       const capture = state.activeCaptureId ? state.captures.get(state.activeCaptureId) : undefined;
       const bundleId = params.bundleId ?? capture?.bundleId ?? config.bundleId;
       if (!bundleId) throw new Error("terminate requires bundleId or an active capture.");
-      const executable = params.processName ?? capture?.processName ?? config.scheme;
-      // Prefer the app pid recorded at launch; the process table can lag a fresh launch.
-      const knownPid = capture?.appPid;
-      const pid = knownPid ?? (executable ? await findProcessPid(device, executable) : undefined);
+      const sameTarget = capture?.deviceId === device.id && capture.bundleId === bundleId &&
+        (params.processName === undefined || params.processName === capture.processName);
+      const executable = params.processName ?? (sameTarget ? capture.processName : undefined) ??
+        (bundleId === config.bundleId ? config.scheme : undefined);
+      const pid = (sameTarget ? capture.appPid : undefined) ??
+        (executable ? (await lookupProcess(device, executable, { signal })).pid : undefined);
+      signal?.throwIfAborted();
       if (!pid) {
         return { content: [{ type: "text", text: `no running process for ${bundleId} on ${device.name}` }], details: {} };
       }
-      const outcome = await terminateApp(device, pid, { timeoutMs: 30_000 });
+      const outcome = await terminateApp(device, pid, { timeoutMs: 30_000, signal });
       return {
         content: [{ type: "text", text: outcome.message }],
         details: { ...outcome, pid },

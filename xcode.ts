@@ -47,8 +47,8 @@ const MAX_SYMBOL_LINES = 6;
 const ERROR_LINE = /^(?:\S.*: )?(?:fatal )?error: /;
 /** The linker's own failures, which carry no `error:`. Its warnings are left out. */
 const LINKER_LINE = /^ld: (?!warning: )/;
-/** The heading of the linker's list of symbols, which follows indented. */
-const SYMBOLS_LINE = /^(?:Undefined|duplicate) symbols? for architecture/;
+/** Linker symbol-list headings, followed by indented references or conflicting objects. */
+const SYMBOLS_LINE = /^(?:(?:Undefined|duplicate) symbols? for architecture|duplicate symbol .+ in:)/;
 
 /**
  * Collects the lines of a build's output that say what failed, as they pass.
@@ -290,12 +290,12 @@ export function consoleLaunchArgs(
 export async function terminateApp(
   device: DeviceInfo,
   pid: number,
-  options: { timeoutMs: number },
+  options: { timeoutMs: number; signal?: AbortSignal },
 ): Promise<{ ok: boolean; message: string }> {
   const result = await runCommand(
     "xcrun",
     ["devicectl", "device", "process", "terminate", "--device", device.id, "--pid", String(pid)],
-    { timeoutMs: options.timeoutMs, maxBytes: 200_000 },
+    { timeoutMs: options.timeoutMs, maxBytes: 200_000, signal: options.signal },
   );
   if (result.code === 0) return { ok: true, message: `terminated pid ${pid}` };
   return {

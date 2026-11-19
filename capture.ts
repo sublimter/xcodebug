@@ -156,6 +156,8 @@ export class Capture {
   private fileNumber = 0;
   private fileOrder = 0;
   private readonly logFiles = new Map<string, number>();
+  /** Only overwriting an existing segment invalidates an in-flight disk scan. */
+  private readonly fileVersions = new Map<string, number>();
   /**
    * Where each run of consecutively indexed lines starts on disk. The files
    * carry no index and have holes - a rotated segment is overwritten, and a
@@ -219,8 +221,10 @@ export class Capture {
     return () => this.lineListeners.delete(listener);
   }
 
-  async start(): Promise<void> {
+  async start(signal?: AbortSignal): Promise<void> {
     await mkdir(dirname(this.logFile), { recursive: true });
+    signal?.throwIfAborted();
+    if (this.stoppedByUser) return;
     this.openFile(true);
 
     const child = spawn(this.command, this.launchArgs, { stdio: ["ignore", "pipe", "pipe"] });
@@ -297,7 +301,10 @@ export class Capture {
 
   private openFile(append: boolean): void {
     const path = this.fileNumber === 0 ? this.logFile : `${this.logFile}.${this.fileNumber}`;
-    if (!append) this.runs = this.runs.filter((run) => run.path !== path);
+    if (!append && this.runs.some((run) => run.path === path)) {
+      this.runs = this.runs.filter((run) => run.path !== path);
+      this.fileVersions.set(path, (this.fileVersions.get(path) ?? 0) + 1);
+    }
     this.segment = path;
     this.opened = { path, offset: append ? sizeOnDisk(path) : 0 };
     this.appending = false;
@@ -369,13 +376,6 @@ export class Capture {
       // Still deliver and write an oversized line, without retaining it in memory.
       this.droppedLines += 1;
     }
-    for (const listener of this.lineListeners) {
-      try {
-        listener(line);
-      } catch {
-        // A listener must never break capture.
-      }
-    }
     const encoded = `${new Date(line.at).toISOString()} ${line.text}\n`;
     if (this.file) {
       const size = Buffer.byteLength(encoded);
@@ -408,6 +408,13 @@ export class Capture {
       } catch {
         // The log could not be written before either; the line is still in memory.
         this.appending = false;
+      }
+    }
+    for (const listener of this.lineListeners) {
+      try {
+        listener(line);
+      } catch {
+        // A listener must never break capture.
       }
     }
   }
@@ -470,8 +477,6 @@ export class Capture {
     const limit = clampLimit(options.limit);
     const grep = typeof options.grep === "string" ? options.grep.trim() : options.grep;
     const streams = options.streams;
-    const oldest = this.lineCount > 0 ? this.lines[this.head]!.index : this.cursor + 1;
-    const evicted = Math.max(0, oldest - 1 - since);
     // Locate the first eligible index without scanning or copying the buffer.
     let first = 0;
     let end = this.lineCount;
@@ -480,6 +485,8 @@ export class Capture {
       if (this.lines[(this.head + middle) % MAX_BUFFER_LINES]!.index <= since) first = middle + 1;
       else end = middle;
     }
+    // Oversized lines can leave holes inside the ring, not just before it.
+    const evicted = Math.max(0, this.cursor - since - (this.lineCount - first));
     const lines: LogLine[] = [];
     if (!grep && (!streams || streams.length === 0)) {
       for (let i = Math.max(first, this.lineCount - limit); i < this.lineCount; i++) {
@@ -500,33 +507,71 @@ export class Capture {
   }
 
   /**
-   * `read` with a filter, extended to the log files when the buffer starts
-   * after `since`: without that, a line that was only evicted reads as never
-   * logged. `missing` counts the evicted lines no file holds any more.
+   * `read` with a filter, extended to disk for every hole in the ring, including
+   * oversized lines between retained entries. `missing` counts lines neither
+   * memory nor any retained file holds any more.
    */
-  async search(options: { since?: number; limit?: number; grep: string | RegExp }, retry = true): Promise<{
+  async search(options: { since?: number; limit?: number; grep: string | RegExp; signal?: AbortSignal }, retry = true): Promise<{
     lines: FoundLine[];
     cursor: number;
     total: number;
     evicted: number;
     missing: number;
   }> {
+    const signal = options.signal;
+    signal?.throwIfAborted();
     const read = this.read(options);
     if (read.evicted === 0) return { ...read, missing: 0 };
     const since = Math.max(0, options.since ?? 0);
-    const last = since + read.evicted;
+    const holes: Array<{ first: number; last: number }> = [];
+    let first = since + 1;
+    for (let i = 0; i < this.lineCount; i++) {
+      const index = this.lines[(this.head + i) % MAX_BUFFER_LINES]!.index;
+      if (index <= since) continue;
+      if (index > first) holes.push({ first, last: index - 1 });
+      first = index + 1;
+    }
+    if (first <= read.cursor) holes.push({ first, last: read.cursor });
     const grep = typeof options.grep === "string" ? options.grep.trim() : options.grep;
-    // Memory holds the newest matches; disk only fills what the limit has left.
-    const room = clampLimit(options.limit) - read.lines.length;
+    const limit = clampLimit(options.limit);
     let older: FoundLine[] = [];
-    let total = 0;
+    let total = read.total;
     let covered = 0;
-    const runs = this.runs;
+    const runs = [...this.runs];
+    const versions = new Map(runs.map((run) => [run.path, this.fileVersions.get(run.path) ?? 0]));
+    // A reader reaching EOF before queued writes finish must not advance the
+    // cursor past those matches. Flush a barrier after this snapshot's writes;
+    // later producer output does not extend the snapshot or delay the barrier.
+    const clearBarriers: Array<() => void> = [];
+    const writes = [...this.files].map((file) => {
+      if (file.destroyed || file.writableFinished) return Promise.resolve();
+      if (file.writableEnded) return finished(file, { cleanup: true, signal }).catch(() => {});
+      return new Promise<void>((resolve) => {
+        const done = (): void => { file.off("close", done); resolve(); };
+        file.once("close", done);
+        clearBarriers.push(() => { file.off("close", done); });
+        file.write("", done);
+      });
+    });
+    let onAbort: (() => void) | undefined;
+    try {
+      await Promise.race([
+        Promise.all(writes),
+        new Promise<never>((_, reject) => {
+          if (!signal) return;
+          onAbort = () => reject(signal.reason);
+          signal.addEventListener("abort", onAbort, { once: true });
+          if (signal.aborted) onAbort();
+        }),
+      ]);
+    } finally {
+      if (onAbort) signal!.removeEventListener("abort", onAbort);
+      for (const clear of clearBarriers) clear();
+    }
+    let hole = 0;
     for (const [position, run] of runs.entries()) {
-      if (run.index > last) break;
-      // A run ends where the next one begins, when that is in the same file. A
-      // file's runs sit together: it is only written again after a rotation
-      // away from it, and by then its earlier runs have been dropped.
+      signal?.throwIfAborted();
+      if (run.index > read.cursor) break;
       const next = runs[position + 1];
       let index = run.index;
       let pending = "";
@@ -535,38 +580,44 @@ export class Capture {
           encoding: "utf8",
           start: run.offset,
           ...(next?.path === run.path ? { end: next.offset - 1 } : {}),
+          signal,
         });
         for await (const chunk of stream) {
+          signal?.throwIfAborted();
           const parts = (pending + chunk).split("\n");
           pending = parts.pop() ?? "";
           for (const raw of parts) {
-            if (index > since && index <= last) {
+            if (index > read.cursor) break;
+            while (hole < holes.length && holes[hole].last < index) hole++;
+            if (hole < holes.length && index >= holes[hole].first) {
               covered += 1;
               const space = raw.indexOf(" ");
               const text = raw.slice(space + 1);
               if (matchesFilter(text, grep)) {
                 total += 1;
                 older.push({ index, at: Date.parse(raw.slice(0, space)), text });
-                // A broad filter can match most of a long log; only `room` are kept.
-                if (older.length >= room * 2 + 64) older = older.slice(older.length - room);
+                if (older.length >= limit * 2 + 64) older = older.slice(-limit);
               }
             }
             index += 1;
           }
-          if (index > last) break;
+          if (index > read.cursor || hole === holes.length) break;
         }
       } catch {
+        signal?.throwIfAborted();
         // A run that cannot be read back stays counted in `missing`.
       }
     }
-    // A rotation overwrote a segment while this was reading, so what came out of
-    // it may be new lines under the indices of the old ones. Reading once more
-    // settles it; if a segment is overwritten again, disk counts as not searched.
-    if (this.runs !== runs) return retry ? this.search(options, false) : { ...read, missing: read.evicted };
+    signal?.throwIfAborted();
+    // Opening a new segment is harmless; only replacement of a file actually
+    // included in this snapshot can relabel bytes with the wrong indices.
+    if ([...versions].some(([path, version]) => (this.fileVersions.get(path) ?? 0) !== version)) {
+      return retry ? this.search(options, false) : { ...read, missing: read.evicted };
+    }
     return {
-      lines: [...older.slice(Math.max(0, older.length - room)), ...read.lines],
+      lines: [...older, ...read.lines].sort((a, b) => a.index - b.index).slice(-limit),
       cursor: read.cursor,
-      total: read.total + total,
+      total,
       evicted: read.evicted,
       missing: read.evicted - covered,
     };

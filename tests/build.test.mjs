@@ -84,6 +84,34 @@ test("a linker failure keeps the symbols it names, and nothing of the command ab
   ]);
 });
 
+test("duplicate-symbol diagnostics keep each symbol and the conflicting object paths", () => {
+  const lines = [
+    "duplicate symbol '_probe_shared' in:",
+    "    /tmp/build/First.o",
+    "    /tmp/build/libKit.a(Second.o)",
+    "duplicate symbol '_probe_other' in:",
+    "    /tmp/build/Third.o",
+    "    /tmp/build/libKit.a(Fourth.o)",
+    "ld: 2 duplicate symbols for architecture arm64",
+    "clang: error: linker command failed with exit code 1 (use -v to see invocation)",
+  ];
+  const output = [...lines, "", "    /usr/bin/clang unrelated build command", ""].join("\n");
+  for (const chunk of [1, 7, output.length]) {
+    assert.deepEqual(diagnose(output, chunk), { lines, omitted: 0 });
+  }
+});
+
+test("duplicate-symbol context respects the symbol and diagnostic limits", () => {
+  const output = Array.from({ length: 15 }, (_, i) => [
+    `duplicate symbol '_probe_${i}' in:`,
+    ...Array.from({ length: 8 }, (_, j) => `    /tmp/build/Object${i}_${j}.o`),
+  ].join("\n")).join("\n");
+  const result = diagnose(output);
+  assert.equal(result.lines.length, 12 * 7, "each kept diagnostic has at most six context lines");
+  assert.equal(result.omitted, 3);
+  assert.equal(result.lines.at(-1), "    /tmp/build/Object11_5.o");
+});
+
 test("warnings, and commands that merely mention an error, are not failures", () => {
   const output = [
     "ld: warning: object file (Pods/libA.a) was built for newer 'iOS' version (18.0) than being linked (15.0)",
