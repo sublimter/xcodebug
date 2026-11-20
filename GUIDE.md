@@ -12,6 +12,11 @@ Enter these commands in the client's chat input. A bare `/xcodebug` (`$xcodebug`
 in Codex) builds as needed, installs, launches and starts capturing with defaults.
 Use `/xcodebug status` (`$xcodebug status` in Codex) to inspect current captures.
 
+After installing the MCP server, run `xcodebug-setup-codex` once to register
+the server when missing and set Codex's 4200-second tool timeout. From a
+checkout, use `node bin/xcodebug-setup-codex.mjs`. This explicit command keeps
+package installation from changing Codex configuration silently.
+
 Native pi/omp `/xcodebug` dispatches directly to the loaded extension handler,
 without skill/model selection for that dispatch. The package excludes its
 bundled skill from native package discovery; Claude/Codex share `mcp/skills/xcodebug/SKILL.md`.
@@ -95,6 +100,12 @@ not send those lines to the model; use `logs`/`wait`
 for analysis.
 See [Claude Code live display](README.md#claude-code-live-display) for version
 requirements, upgrade/disable steps and missing-display troubleshooting.
+
+For an optional footer in Codex CLI 0.171.0 or later, follow the
+[Codex live display setup](README.md#codex-live-display-experimental). The
+footer shows the current operation or one running capture and its
+latest log line. It refreshes between tool calls and clears once no operation
+or capture remains. Use `logs` or `wait` to bring log evidence into the conversation.
 
 ## Running a command alongside a capture
 

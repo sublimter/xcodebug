@@ -92,15 +92,28 @@ codex  mcp list     # xcodebug  bun …
 claude mcp list     # xcodebug: … ✔ Connected
 ```
 
-Set Codex's MCP timeout high enough for the stages your calls use. For example,
-4200 seconds leaves room for the default 15-minute pod install, 15-minute build
-and 30-minute command budgets, plus device operations. Increase it if you pass
-larger timeouts; the client can still cancel before xcodebug's own deadline.
+After installing the package, run the setup command once to register the MCP
+server when missing and add the timeout without replacing an existing xcodebug
+
+```bash
+xcodebug-setup-codex
+```
+
+From a checkout, use `node bin/xcodebug-setup-codex.mjs`. The command uses the
+Codex app-server config API. It registers xcodebug with Bun if it is missing,
+then writes `tool_timeout_sec = 4200`. It does not run automatically during npm
+install because package installation should not silently modify a user's Codex
+configuration. The equivalent manual setting is:
 
 ```toml
 [mcp_servers.xcodebug]
 tool_timeout_sec = 4200
 ```
+
+The timeout leaves room for the default 15-minute pod install, 15-minute build
+and 30-minute command budgets, plus device operations. Increase it if you pass
+larger timeouts. This does not change xcodebug's stage deadlines or Codex's
+separate status-line resource read deadline.
 
 Claude Code needs no setting for this. Its default limit on a tool call is about
 28 hours. It also ends a call to a stdio server that has sent neither a reply
@@ -115,6 +128,24 @@ until stdout closes or a write fails.
 
 To run `npm test` from a checkout, use Node.js 22.18 or later and put Bun on PATH
 for the stdio integration tests.
+
+### Codex live display (experimental)
+
+With Codex CLI 0.171.0 or later, start Codex with
+`codex --enable tui_extensions_statusline` and choose `xcodebug / xcodebug_ui`
+under `/statusline`. Use a fresh Codex session after updating the xcodebug MCP
+server. For persistent opt-in, set `features.tui_extensions_statusline = true`
+in Codex's config (or set `tui_extensions_statusline = true` under `[features]`).
+Codex 0.171.0 looks up status-line providers in the user configuration. If a
+project config overrides the same MCP server name, remove the override or use
+a distinct server name for the user registration.
+
+The footer shows the current operation or capture and its latest log line. It
+refreshes even between tool calls and clears when no operation or capture is
+active. This is a display preview, not a log stream into the conversation; use
+`action=logs` or `action=wait` for log evidence.
+Long status text is shortened in the footer without changing the command or
+its output.
 
 ### Install the manual entry point
 
@@ -385,15 +416,15 @@ remain available without the display.
 |---|---|---|
 | how the tool is exposed | registered in-process | MCP server process |
 | manual entry point | native `/xcodebug` | shared skill: `/xcodebug` in Claude, `$xcodebug` in Codex |
-| status line, widget | yes | Claude: optional live Mod above; otherwise request progress when rendered |
+| status line, widget | yes | [Claude live Mod](#claude-code-live-display) or [Codex status line](#codex-live-display-experimental), both opt-in |
 | `push` | mirrors new lines into the session | `off` only; `context` and `wake` refused |
 | capture state | in the session | in the server process |
 | lifetime | the session | the client process |
 
 - **The adapter refuses `push=context` and `push=wake`.** It does not implement
   background log delivery into model context. Read with `action=logs` or
-  `action=wait`; these pull reads are separate from the Claude Mod's user-visible
-  display. Cursor reads exclude earlier indices, but a limited read can omit
+  `action=wait`; these pull reads are separate from both clients' live displays.
+  Cursor reads exclude earlier indices, but a limited read can omit
   lines; see [Reading logs from a cursor](#reading-logs-from-a-cursor).
 - **Captures end with the client.** The server is a child of Codex/Claude. When
   the client closes the connection, the server finishes the call in progress,
@@ -573,8 +604,8 @@ run. Set `installPods=false` to skip it deliberately.
 Detects the workspace from the current directory (walking up, so a nested cwd
 works), rebuilds when the tree changed, installs, launches, and starts capturing.
 Native pi/omp can push logs into the conversation; Claude Code and Codex use
-`logs`/`wait` pull reads through MCP. The optional Claude Mod displays a console
-tail to the user, not to the model. The phrase is a goal, not a log filter.
+`logs`/`wait` pull reads through MCP. Both clients offer an optional live preview
+for the user. The phrase is a goal, not a log filter.
 
 - **CocoaPods vs plain project** is decided by `Podfile`/`Podfile.lock`: a
   CocoaPods project uses its `.xcworkspace`, a plain project its `.xcodeproj`.
@@ -832,9 +863,10 @@ session.
   e.g. `📖 xcodebug · capturing · 7895 lines · 42s · /xcodebug stop to end`, plus
   recent log lines and the number of streaming channels. Claude Code can instead
   load the [live display Mod](#claude-code-live-display).
+  Codex can enable the [experimental status line](#codex-live-display-experimental).
 - Native pushed log batches are **hidden from the transcript** (`display: false`)
   but delivered to the model, subject to the per-batch limit. MCP does not push
-  batches; the Claude Mod's display does not add logs to model context.
+  batches; neither MCP live display adds logs to model context.
 - `/xcodebug stop` (or `action=stop`) without `captureId` closes **every running
   capture**. An ID scopes the stop to that target; a console primary's syslog
   companion is stopped too. Other apps' captures are unaffected by a targeted

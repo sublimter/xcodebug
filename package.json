@@ -25,8 +25,12 @@
   "bugs": {
     "url": "https://github.com/sublimter/xcodebug/issues"
   },
+  "bin": {
+    "xcodebug-setup-codex": "./bin/xcodebug-setup-codex.mjs"
+  },
   "files": [
     "*.ts",
+    "bin/",
     "mcp/",
     "claude/",
     "README.md",

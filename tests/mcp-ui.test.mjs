@@ -97,7 +97,7 @@ done
     assert.fail(`fixture did not start: ${name}`);
   };
   t.after(async () => {
-    await Promise.all(["install-release", "build-release"].map(name => writeFile(join(root, name), "")));
+    await Promise.all(["install-release", "build-release", "command-release", "unicode-release"].map(name => writeFile(join(root, name), "")));
     try { await action({ action: "stop" }); } finally {
       child.stdin.end();
       child.kill();
@@ -106,6 +106,15 @@ done
     }
   });
   await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ui-test", version: "1" } });
+  const { tools } = await request("tools/list");
+  const [entry] = tools.find(tool => tool.name === "xcodebug_ui")._meta["openai/ui"].entrypoints;
+  assert.equal(entry.type, "statusline");
+  const statusline = async () => {
+    const { contents: [resource] } = await request("resources/read", { uri: entry.resourceUri });
+    assert.equal(resource.mimeType, "application/json");
+    return JSON.parse(resource.text);
+  };
+  assert.equal(await statusline(), null);
   // The mod reads this file between tool calls; it must say what xcodebug_ui says.
   const { file } = await snapshot();
   const published = async () => JSON.parse(await readFile(file, "utf8"));
@@ -134,6 +143,38 @@ done
     assert.deepEqual((await snapshot()).rows, []);
     assert.deepEqual((await published()).rows, []);
   });
+  await t.test("a long command stays within the Codex text budget and executes unchanged", async () => {
+    const command = `: > command-started; while [ ! -f command-release ]; do sleep 0.05; done; printf 'command-complete\\n' # ${"🚀".repeat(4500)}`;
+    const running = action({ action: "status", command });
+    try {
+      await waitForStart("command-started");
+      const footer = await statusline();
+      assert.match(footer, /command:/);
+      assert.ok(Buffer.byteLength(footer, "utf8") <= 16 * 1024, "Codex rejects trees over its UTF-8 text budget");
+      assert.equal(footer, footer.toWellFormed());
+      assert.ok(footer.includes("🚀"), "valid emoji pairs must survive preview normalization");
+      assert.ok((await snapshot()).status.includes(command), "only the Codex preview is shortened");
+    } finally {
+      await writeFile(join(root, "command-release"), "");
+      const result = await running;
+      assert.ok(!result.isError);
+      assert.match(result.content[0].text, /command-complete/);
+    }
+    assert.equal(await statusline(), null);
+  });
+  await t.test("normalizes malformed short status text", async () => {
+    const malformed = String.fromCharCode(0xd800);
+    const running = action({ action: "status", command: `: > unicode-started; while [ ! -f unicode-release ]; do sleep 0.05; done; printf 'unicode-complete\\n' # ${malformed}` });
+    try {
+      await waitForStart("unicode-started");
+      const footer = await statusline();
+      assert.equal(footer, footer.toWellFormed());
+    } finally {
+      await writeFile(join(root, "unicode-release"), "");
+      assert.ok(!(await running).isError);
+    }
+    assert.equal(await statusline(), null);
+  });
   await action({ action: "syslog", device: "test-device", processName: "Heartbeat", push: "off" }, "launch-token");
   const afterResponse = notifications.length;
   const first = await waitForSnapshot(value => value.rows.some(row => row.includes("UI heartbeat")));
@@ -148,6 +189,8 @@ done
       const duringBuild = await snapshot();
       assert.match(duringBuild.rows[0], /running/);
       assert.ok(duringBuild.rows.some(row => /building|compil/i.test(row)), JSON.stringify(duringBuild));
+      const footer = await Promise.race([statusline(), delay(700).then(() => { throw new Error("statusline was blocked by build"); })]);
+      assert.match(footer, /building|compil/i);
     } finally {
       await writeFile(join(root, "build-release"), "");
       assert.equal((await building).isError, true);
@@ -193,10 +236,16 @@ done
   const duringWait = await Promise.race([snapshot(), delay(700).then(() => { throw new Error("UI read was blocked by wait"); })]);
   assert.equal(waitSettled, false);
   assert.ok(duringWait.rows.some(row => row.includes("UI heartbeat")));
+  const footer = await Promise.race([statusline(), delay(700).then(() => { throw new Error("statusline was blocked by wait"); })]);
+  assert.match(footer.children[0], /capturing/);
+  assert.match(footer.children[1], /UI heartbeat/);
+  assert.doesNotMatch(footer.children[0], /\/xcodebug stop/);
+  assert.match(duringWait.status, /\/xcodebug stop/);
   await waiting;
   await action({ action: "stop" });
   assert.deepEqual((await snapshot()).rows, [], "stopped captures must clear the band");
   assert.deepEqual((await published()).rows, [], "the file must clear with the band");
+  assert.equal(await statusline(), null);
 });
 
 // Claude Code ends a stdio server with SIGINT, not by closing its stdin.

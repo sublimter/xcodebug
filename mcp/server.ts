@@ -14,9 +14,9 @@
  *
  *   codex mcp add xcodebug -- bun /path/to/xcodebug/mcp/server.ts
  *
- * The protocol is hand-written JSON-RPC over stdio because only three methods are
- * needed (initialize, tools/list, tools/call); the official SDK would add ~97
- * transitive packages to every install, including the pi users who never run MCP.
+ * The protocol is hand-written JSON-RPC over stdio because the adapter only needs
+ * the MCP handshake, tool calls, and the status-line resource methods; the official
+ * SDK would add ~97 transitive packages to every install, including pi users.
  */
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -150,11 +150,15 @@ try {
 } catch {
   // No directory to sweep: publishUi() could not create it and said so.
 }
+const statusResource = { uri: "ui://xcodebug/statusline", name: "xcodebug live status", mimeType: "application/json" };
+const normalizeStatusText = (value: string | undefined): string | undefined =>
+  value?.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
 const uiTool = {
   name: "xcodebug_ui",
   description: "Read the current display snapshot for the xcodebug Claude Code mod. For capture details or log analysis use xcodebug with action=status or action=logs.",
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  _meta: { "openai/ui": { entrypoints: [{ type: "statusline", resourceUri: statusResource.uri }] } },
 };
 
 function sendNotification(method: string, params: unknown): void {
@@ -243,7 +247,7 @@ async function handle(message: Record<string, unknown>, controller?: AbortContro
     const requested = (message.params as { protocolVersion?: string } | undefined)?.protocolVersion;
     reply(id, {
       protocolVersion: requested ?? PROTOCOL_VERSION,
-      capabilities: { tools: {} },
+      capabilities: { tools: {}, resources: {} },
       serverInfo: { name: "xcodebug", version: pkg.version },
     });
     return;
@@ -254,6 +258,14 @@ async function handle(message: Record<string, unknown>, controller?: AbortContro
   }
   if (method === "tools/list") {
     reply(id, { tools: [{ name: "xcodebug", description: tool.description, inputSchema }, uiTool] });
+    return;
+  }
+  if (method === "resources/list") {
+    reply(id, { resources: [statusResource] });
+    return;
+  }
+  if (method === "resources/templates/list") {
+    reply(id, { resourceTemplates: [] });
     return;
   }
   if (method === "tools/call") {
@@ -337,6 +349,28 @@ input.on("line", (line) => {
   }
   // UI reads must remain responsive during a build/install/wait and must never
   // replace state.uiCtx with the context of a polling call.
+  if (message.method === "resources/read") {
+    if (message.id === undefined) return;
+    const uri = (message.params as { uri?: string } | undefined)?.uri;
+    if (uri !== statusResource.uri) {
+      replyError(message.id, -32002, "Resource not found");
+      return;
+    }
+    const { status, rows } = uiSnapshot;
+    const capturing = rows[0]?.startsWith("Xcodebug · capturing ");
+    const label = capturing ? status?.replace(/ · \/xcodebug stop to end$/, "") : status;
+    // Keep every text leaf valid UTF-8; Codex rejects UI trees containing lone surrogates.
+    const normalized = normalizeStatusText(label);
+    const preview = normalized && normalized.length > 1024
+      ? normalizeStatusText(`${normalized.slice(0, 1024)}…`)
+      : normalized;
+    const latest = capturing ? normalizeStatusText(rows.at(-1)?.trim()) : undefined;
+    const tree = preview && latest && latest !== "(waiting for the first line…)"
+      ? { type: "row", props: { gap: 2, wrap: "wrap" }, children: [preview, latest] }
+      : preview ?? null;
+    reply(message.id, { contents: [{ uri, mimeType: statusResource.mimeType, text: JSON.stringify(tree) }] });
+    return;
+  }
   if (message.method === "tools/call" &&
       (message.params as { name?: string } | undefined)?.name === uiTool.name) {
     if (message.id !== undefined) {
