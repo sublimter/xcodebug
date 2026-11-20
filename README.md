@@ -103,23 +103,32 @@ xcodebug-setup-codex
 From a checkout, use `node bin/xcodebug-setup-codex.mjs`. The command uses the
 Codex app-server config API available in current Codex releases. It registers
 xcodebug with Bun if it is missing, writes `tool_timeout_sec = 4200` only when
-that field is absent, and preserves an existing custom timeout. On Codex
-`0.171.0` or later it also enables `features.tui_extensions_statusline = true`.
-Older or unrecognized Codex versions receive a warning and keep the manual
-setup path below. The command warns when a `.codex/config.toml` in the current
-directory or a parent defines the same project-level xcodebug server; that
-project configuration can override the user-level setting. It also warns when
-an existing registration points to another server path. It does not migrate or
-edit project configuration, and it does not run automatically during npm
-install because package installation should not silently modify a user's Codex
-configuration. After setup, restart Codex and choose `xcodebug / xcodebug_ui`
-once under `/statusline`; provider selection is a Codex UI choice, not a
-server setting. If the installed Codex does not support the config API, use the
-manual TOML setting below.
+that field is absent, and preserves an existing custom timeout. On Codex CLI
+`0.171.0` or later it also enables `features.tui_extensions_statusline = true`
+and selects the xcodebug statusline provider when the user selection is missing
+or `default`. Existing custom providers are preserved with a warning. Older or
+unrecognized CLI versions receive a warning instead. It checks the
+running service with `codex app-server daemon version` and warns if its
+`appServerVersion` is too old or cannot be verified. Saving configuration does
+not upgrade the service; setup never updates or restarts a daemon automatically.
+The command warns about project-level xcodebug overrides and existing server
+paths pointing elsewhere, but preserves the registration and project files.
+Setup saves these fields together with one version-checked `config/batchWrite`
+request.
+If another process edits the user configuration during setup, Codex rejects
+stale writes; rerun setup after that edit rather than overwrite a new selection.
+It does not run automatically during npm install because package installation
+should not silently modify a user's Codex configuration. See the live display
+section below for provider selection. For manual setup on supported CLI and
+app-server versions, merge these fields into existing tables rather than add
+duplicate table headers:
 
 ```toml
 [features]
 tui_extensions_statusline = true
+
+[tui]
+status_line_provider = { server = "xcodebug", tool = "xcodebug_ui" }
 
 [mcp_servers.xcodebug]
 tool_timeout_sec = 4200
@@ -146,14 +155,35 @@ for the stdio integration tests.
 
 ### Codex live display (experimental)
 
-With Codex CLI 0.171.0 or later, start Codex with
-`codex --enable tui_extensions_statusline` and choose `xcodebug / xcodebug_ui`
-under `/statusline`. Use a fresh Codex session after updating the xcodebug MCP
-server. For persistent opt-in, set `features.tui_extensions_statusline = true`
-in Codex's config (or set `tui_extensions_statusline = true` under `[features]`).
-Codex 0.171.0 looks up status-line providers in the user configuration. If a
-project config overrides the same MCP server name, remove the override or use
-a distinct server name for the user registration.
+Both Codex CLI and the connected app server must be `0.171.0` or later. Setup
+enables the feature persistently and selects xcodebug for a missing or default
+provider. Alternatively start Codex with `codex --enable tui_extensions_statusline`.
+If setup reports an older running
+service, finish active Codex tasks and captures before running
+`codex app-server daemon update --from-cli --yes`, then
+`codex app-server daemon restart`. Opening a new TUI alone does not upgrade it.
+
+Start a new Codex session after setup or after updating the service or MCP
+server. If setup preserved another custom provider, open `/statusline`, enter
+**Choose a status line provider**, then select `xcodebug_ui`
+(`xcodebug / xcodebug_ui`). Codex 0.171.0 discovers providers from
+the user configuration. A project-level override of the same MCP server name
+can make the provider unavailable; remove the override or use a distinct name.
+
+Codex 0.171.0 has a five-second provider discovery deadline. If the global MCP
+inventory stalls, the picker can show only the default provider even though
+xcodebug itself is available. Specify the provider directly for one session:
+
+```bash
+codex -c 'tui.status_line_provider={server="xcodebug",tool="xcodebug_ui"}'
+```
+
+Setup persists the provider selection for missing/default user settings. To
+replace another custom provider explicitly, use the manual settings above.
+Provider selection is supported configuration, not an MCP server setting.
+See Codex's
+[provider configuration](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/app/status_line_settings.rs)
+and [discovery deadline](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/statusline_provider.rs).
 
 The footer shows the current operation or capture and its latest log line. It
 refreshes even between tool calls and clears when no operation or capture is
