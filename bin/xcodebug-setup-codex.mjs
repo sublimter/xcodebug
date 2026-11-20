@@ -7,6 +7,8 @@ import { dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
 const TOOL_TIMEOUT_SECONDS = 4_200;
+const STATUSLINE_MIN_CODEX_VERSION = [0, 171, 0];
+const STATUSLINE_FEATURE = "features.tui_extensions_statusline";
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const serverPath = join(packageRoot, "mcp", "server.ts");
 const codex = process.env.CODEX_BIN ?? "codex";
@@ -72,20 +74,49 @@ function hasTimeout(registration) {
   return /^\s*tool_timeout_sec\s*:/m.test(registration.stdout);
 }
 
-async function writeTimeout() {
+function codexVersion() {
+  const result = run(codex, ["--version"]);
+  const match = `${result.stdout}\n${result.stderr}`.match(/\b(\d+)\.(\d+)\.(\d+)\b/);
+  return match ? match.slice(1).map(Number) : undefined;
+}
+
+function supportsStatusline() {
+  const version = codexVersion();
+  if (!version) {
+    console.error("Warning: could not determine Codex version; statusline feature was not enabled");
+    return false;
+  }
+  const supported = version[0] > STATUSLINE_MIN_CODEX_VERSION[0] ||
+    (version[0] === STATUSLINE_MIN_CODEX_VERSION[0] && (version[1] > STATUSLINE_MIN_CODEX_VERSION[1] ||
+      (version[1] === STATUSLINE_MIN_CODEX_VERSION[1] && version[2] >= STATUSLINE_MIN_CODEX_VERSION[2])));
+  if (!supported) {
+    console.error(`Warning: Codex ${version.join(".")} is older than 0.171.0; statusline feature was not enabled`);
+  }
+  return supported;
+}
+
+async function writeConfig(values) {
   const app = startAppServer();
   try {
     await app.request("initialize", { clientInfo: { name: "xcodebug-setup-codex", version: "1" } });
     app.child.stdin.write('{"jsonrpc":"2.0","method":"initialized"}\n');
-    const result = await app.request("config/value/write", {
-      keyPath: "mcp_servers.xcodebug.tool_timeout_sec",
-      value: TOOL_TIMEOUT_SECONDS,
-      mergeStrategy: "upsert",
-    });
-    if (result?.status !== "ok") throw new Error(`Codex rejected the config write: ${JSON.stringify(result)}`);
+    for (const [keyPath, value] of Object.entries(values)) {
+      const result = await app.request("config/value/write", { keyPath, value, mergeStrategy: "upsert" });
+      if (result?.status !== "ok") throw new Error(`Codex rejected the config write: ${JSON.stringify(result)}`);
+    }
   } finally {
     await app.close();
   }
+}
+
+async function configureCodex(registration) {
+  const values = {};
+  if (!hasTimeout(registration)) values["mcp_servers.xcodebug.tool_timeout_sec"] = TOOL_TIMEOUT_SECONDS;
+  if (supportsStatusline()) values[STATUSLINE_FEATURE] = true;
+  if (Object.keys(values).length > 0) await writeConfig(values);
+  if (hasTimeout(registration)) console.log("Existing Codex xcodebug tool timeout preserved");
+  else console.log(`Configured xcodebug MCP timeout: ${TOOL_TIMEOUT_SECONDS}s`);
+  if (values[STATUSLINE_FEATURE] === true) console.log("Enabled Codex xcodebug statusline feature");
 }
 
 function startAppServer() {
@@ -125,17 +156,12 @@ function startAppServer() {
     });
   };
   return { child, request, close, get stderr() { return stderr; } };
-}
 
+}
 try {
   const registration = ensureServerRegistration();
   reportWarnings(registration);
-  if (hasTimeout(registration)) {
-    console.log("Existing Codex xcodebug tool timeout preserved");
-  } else {
-    await writeTimeout();
-    console.log(`Configured xcodebug MCP timeout: ${TOOL_TIMEOUT_SECONDS}s`);
-  }
+  await configureCodex(registration);
 } catch (error) {
   console.error(`xcodebug setup-codex failed: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;

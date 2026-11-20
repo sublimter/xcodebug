@@ -102,17 +102,25 @@ xcodebug-setup-codex
 
 From a checkout, use `node bin/xcodebug-setup-codex.mjs`. The command uses the
 Codex app-server config API available in current Codex releases. It registers
-xcodebug with Bun if it is missing, then writes `tool_timeout_sec = 4200` only
-when that field is absent. An existing custom timeout is preserved. The command
-warns when a `.codex/config.toml` in the current directory or a parent defines
-the same project-level xcodebug server; that project configuration can override
-the user-level setting. It also warns when an existing registration points to
-another server path. It does not migrate or edit project configuration, and it
-does not run automatically during npm install because package installation
-should not silently modify a user's Codex configuration. If the installed
-Codex does not support the config API, use the manual TOML setting below.
+xcodebug with Bun if it is missing, writes `tool_timeout_sec = 4200` only when
+that field is absent, and preserves an existing custom timeout. On Codex
+`0.171.0` or later it also enables `features.tui_extensions_statusline = true`.
+Older or unrecognized Codex versions receive a warning and keep the manual
+setup path below. The command warns when a `.codex/config.toml` in the current
+directory or a parent defines the same project-level xcodebug server; that
+project configuration can override the user-level setting. It also warns when
+an existing registration points to another server path. It does not migrate or
+edit project configuration, and it does not run automatically during npm
+install because package installation should not silently modify a user's Codex
+configuration. After setup, restart Codex and choose `xcodebug / xcodebug_ui`
+once under `/statusline`; provider selection is a Codex UI choice, not a
+server setting. If the installed Codex does not support the config API, use the
+manual TOML setting below.
 
 ```toml
+[features]
+tui_extensions_statusline = true
+
 [mcp_servers.xcodebug]
 tool_timeout_sec = 4200
 ```

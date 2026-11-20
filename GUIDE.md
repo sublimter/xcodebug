@@ -13,10 +13,12 @@ in Codex) builds as needed, installs, launches and starts capturing with default
 Use `/xcodebug status` (`$xcodebug status` in Codex) to inspect current captures.
 
 After installing the MCP server, run `xcodebug-setup-codex` once. It registers
-the server when missing and adds Codex's 4200-second tool timeout only when no
-custom timeout exists. From a checkout, use `node bin/xcodebug-setup-codex.mjs`.
-The command warns about project-level `.codex/config.toml` overrides and old
-server paths, but does not modify project configuration.
+the server when missing, adds the 4200-second timeout only when no custom
+timeout exists, and enables Codex's statusline feature on Codex 0.171.0+.
+From a checkout, use `node bin/xcodebug-setup-codex.mjs`. Older or unrecognized
+Codex versions get a warning. Restart Codex after setup, then choose
+`xcodebug / xcodebug_ui` once under `/statusline`; the provider choice remains
+interactive because Codex does not expose it as an MCP config setting.
 
 Native pi/omp `/xcodebug` dispatches directly to the loaded extension handler,
 without skill/model selection for that dispatch. The package excludes its

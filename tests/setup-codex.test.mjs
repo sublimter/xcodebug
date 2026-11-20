@@ -30,6 +30,7 @@ test("setup registers a missing server and writes the default timeout", async t 
   assert.match(result.stdout, /Configured xcodebug MCP timeout: 4200s/);
   const config = await readFile(join(root, "home", "config.toml"), "utf8");
   assert.match(config, /tool_timeout_sec = 4200/);
+  assert.match(config, /tui_extensions_statusline = true/);
   assert.match(config, /mcp_servers\.xcodebug/);
 });
 
