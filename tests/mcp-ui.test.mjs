@@ -36,7 +36,7 @@ exit 65
 n=0
 while :; do
   n=$((n + 1))
-  printf 'UI heartbeat %s\\n' "$n"
+  /usr/bin/printf 'UI heartbeat %s\\n' "$n"
   /bin/sleep 0.1
 done
 `, { mode: 0o755 });
@@ -76,6 +76,16 @@ done
     name: "xcodebug", arguments: args, ...(token ? { _meta: { progressToken: token } } : {}),
   });
   const snapshot = async () => JSON.parse((await request("tools/call", { name: "xcodebug_ui", arguments: {} })).content[0].text);
+  const waitForSnapshot = async predicate => {
+    const deadline = Date.now() + 12_000;
+    let latest;
+    while (Date.now() < deadline) {
+      latest = await snapshot();
+      if (predicate(latest)) return latest;
+      await delay(25);
+    }
+    assert.fail(`snapshot did not reach expected state: ${JSON.stringify(latest)}`);
+  };
   const waitForStart = async name => {
     const deadline = Date.now() + 12_000;
     while (Date.now() < deadline) {
@@ -126,12 +136,9 @@ done
   });
   await action({ action: "syslog", device: "test-device", processName: "Heartbeat", push: "off" }, "launch-token");
   const afterResponse = notifications.length;
-  await delay(1200);
-  const first = await snapshot();
-  assert.ok(first.rows.some(row => row.includes("UI heartbeat")), JSON.stringify(first));
-  await delay(1200);
-  const second = await snapshot();
-  assert.notDeepEqual(second.rows, first.rows, "idle capture must continue to repaint after syslog returns");
+  const first = await waitForSnapshot(value => value.rows.some(row => row.includes("UI heartbeat")));
+  const second = await waitForSnapshot(value => JSON.stringify(value.rows) !== JSON.stringify(first.rows));
+  assert.ok(second.rows.some(row => row.includes("UI heartbeat")), "idle repaints must retain captured logs");
   assert.equal(notifications.length, afterResponse, "closed progress tokens must not be reused for idle paints");
 
   await t.test("a build takes priority over capture and restores it after failure", async () => {

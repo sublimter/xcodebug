@@ -120,8 +120,21 @@ for the stdio integration tests.
 
 Connecting MCP makes the tool available to the model; it does not register a
 `/xcodebug` command in either client. The shared
-[xcodebug skill](skills/xcodebug/SKILL.md) adds an explicit entry point:
+[xcodebug skill](mcp/skills/xcodebug/SKILL.md) adds an explicit entry point:
 `/xcodebug` in Claude Code, `$xcodebug` in Codex, or Codex's `/skills` picker.
+
+Native pi/omp needs only the extension, not this skill or an MCP connection.
+Both hosts register `extensions: ["./index.ts"]`; `pi.skills: []` disables pi's
+package skill loading. The shared skill lives under `mcp/skills/`, outside the
+root `skills/` directory that omp scans independently of manifest fields.
+Native `/xcodebug` runs
+the registered extension handler directly; it does not ask the model to select
+a skill. A normal model tool call uses the registered native `xcodebug` tool.
+If pi/omp also discovers the shared user-level skill through `.agents/skills`
+or `.claude/skills`, its instructions select that native tool before MCP.
+This shared-skill selection is model-driven, not a substitute for the native
+command's deterministic dispatch. The extension must be installed, enabled and
+loaded in the session; explicitly disabling it is not overridden.
 
 Both clients can read the same skill directory through user-level symlinks:
 
@@ -131,11 +144,12 @@ XCODEBUG_DIR="/absolute/path/to/xcodebug"  # a checkout containing the skill
 # XCODEBUG_DIR="$(npm root -g)/xcodebug"
 
 (
-  source="$XCODEBUG_DIR/skills/xcodebug"
+  source="$XCODEBUG_DIR/mcp/skills/xcodebug"
+  legacy="$XCODEBUG_DIR/skills/xcodebug"
   test -f "$source/SKILL.md" || { printf 'Skill not found: %s\n' "$source/SKILL.md" >&2; exit 1; }
   for dest in "$HOME/.agents/skills/xcodebug" "$HOME/.claude/skills/xcodebug"; do
     if test -e "$dest" || test -L "$dest"; then
-      if ! test -L "$dest" || ! test "$dest" -ef "$source"; then
+      if ! test -L "$dest" || { ! test "$dest" -ef "$source" && ! test "$(readlink "$dest")" = "$legacy"; }; then
         printf 'Existing skill path: %s; inspect it before installing.\n' "$dest" >&2
         exit 1
       fi
@@ -143,22 +157,29 @@ XCODEBUG_DIR="/absolute/path/to/xcodebug"  # a checkout containing the skill
   done
   mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills" || exit 1
   for dest in "$HOME/.agents/skills/xcodebug" "$HOME/.claude/skills/xcodebug"; do
+    if test -L "$dest" && test "$(readlink "$dest")" = "$legacy"; then
+      rm "$dest" || exit 1
+    fi
     test -L "$dest" || ln -s "$source" "$dest" || exit 1
   done
 )
 ```
 
-If the installed package does not contain `skills/xcodebug/SKILL.md`, use a
+If the installed package does not contain `mcp/skills/xcodebug/SKILL.md`, use a
 checkout that contains it. The commands check both target paths before installing,
-skip symlinks already pointing to this skill, and stop on other existing files,
-directories or symlinks, including broken links.
-Keep the checkout or npm package at the linked path. Updating that source updates
-the shared skill for both clients.
+skip symlinks already pointing to this skill, and migrate links to this checkout's
+old `skills/xcodebug` source. They stop on other existing files, directories or
+symlinks, including unrelated broken links. After updating an older checkout or
+upgrading an npm package that used the old root `skills/` path, rerun these
+commands to relink both clients; npm upgrade alone does not migrate those links.
+Keep the checkout or npm package at the linked path. Once relinked, updates to
+the maintained source update the shared skill for both clients.
 
 Start a new Claude Code or Codex session after installing. The skill uses the
-MCP connection already configured above; it does not start a separate server or
-replace the native pi command. Both manual and model-selected invocation remain
-available. See the clients' [Claude Code skill documentation](https://code.claude.com/docs/en/skills)
+MCP connection already configured above in those clients; it does not start a
+separate server. Native pi/omp uses its extension command and native tool instead.
+Both manual and model-selected invocation remain available. See the clients'
+[Claude Code skill documentation](https://code.claude.com/docs/en/skills)
 and [Codex skill documentation](https://learn.chatgpt.com/docs/build-skills).
 
 ### Use
@@ -757,6 +778,9 @@ session.
 - **Do not stop while the user has not acted yet.** Silence there means nothing
   has been tried, not that the run is over: say what to do on the phone and keep
   listening.
+- When the initial process-table query succeeds, a dual-channel launch runs
+  console app-PID discovery before connecting the syslog companion. An explicit
+  stop during that step does not leave a new companion running.
 - A console capture ends when the app process is confirmed gone, and its syslog
   companion is stopped too. It records why - `the app exited`, with the last
   line logged, which is devicectl's own `App terminated due to signal 9.` when
@@ -765,6 +789,28 @@ session.
   the log and its path is reported the same way. A standalone `syslog` capture
   is not bound to the app's lifetime and keeps reconnecting; stop it explicitly
   when finished.
+- An interrupted `wait`, `await`, or `launch` with `command` joins the existing
+  exit-diagnostic job (launch identity and report collection) before replying.
+  A matching report supplies its
+  system termination namespace, code and explanation, plus its local path, in
+  the reply and follow-up details (`terminationReason`, `crashReport`). The
+  report search can add time after the line-wait or command deadline; caller
+  cancellation still interrupts it. A missing report or missing termination
+  data is reported as unavailable, not replaced with a guessed cause. A verified
+  App PID is required before a report can supply termination evidence; unknown
+  identity is reported explicitly without promoting another instance's candidate
+  report. Reattach-generation checks prevent an older search from overwriting
+  the newly launched instance's report.
+  Natural process exit registers that job before pipe/writer drain. Identity is
+  taken from this console launch's own `--json-output` result
+  (`result.process.processIdentifier`), not a late same-name process-table
+  snapshot. Each bridge start owns a fresh result file, removed after reading;
+  result identity and reattach-generation checks keep old jobs out of new runs.
+  A missing, malformed or unsuccessful launch result remains unverified; an
+  automatic reattach will not terminate an unverified running instance.
+  `wait` joins both identity and report collection. When a command exits, its
+  capture and queued reconnect are stopped before awaiting that independent job;
+  confirmed termination likewise cancels reconnect without cancelling collection.
 - A dropped console bridge whose app is still running is reattached, retrying
   for as long as it takes. devicectl attaches a console only by launching, so
   with the default `terminateExisting` **a reattach restarts the app** and its
@@ -922,6 +968,20 @@ writes to drain. If they remain blocked, it destroys the streams, reports a
 drain-timeout error in capture status, and completes shutdown; pending logs may
 be truncated.
 
+Console launches also own a private `.xcodebug-launch-*` directory containing
+`launch.json` and an `owner.json` marker with this extension's format, host PID
+and creation time. The directory is mode `0700`; the marker is mode `0600`.
+Result cleanup follows reading; raw metadata never enters the console log stream.
+Ordinary `stop` leaves a pending result read available to exit diagnostics.
+Session shutdown separately cancels those reads, blocks new bridge starts, and
+allows up to three seconds per capture for pending startup, result cleanup and
+log drainage, including older reattach results and captures evicted from visible
+history. Blocked filesystem work or failed deletion is reported as incomplete
+cleanup, including failures from captures already evicted from history.
+Once cleanup settles, the session retains only the warning text for shutdown,
+not the finished capture or its log buffer.
+Residual result files may remain; task settlement alone is not proof of deletion.
+
 The bundle id separates apps, and the timestamp includes milliseconds to
 separate runs. Segment limits apply per capture. What xcodebug itself says while
 a bridge is down - why the capture ended, each reattach - is appended to the same
@@ -931,8 +991,13 @@ known, a report without that PID is not retained.
 
 Logs are kept for 30 days after their last write. The first `build`, `launch` or
 `syslog` of a session deletes older `build-`, `console-`, `syslog-` and
-`pod-install-` logs and `crash-*.ips` reports from this directory, and nothing
-else in it.
+`pod-install-` logs and `crash-*.ips` reports from this directory. The same
+retention window applies to residual launch-result directories, but only when
+the ownership marker is valid, the host PID is definitely absent, and the
+directory and all known files are old. Active or uncertain owners, unmarked
+legacy directories, malformed markers, symlinks and extra entries are retained.
+Pruning removes only validated `owner.json` / `launch.json` files and an empty
+directory, never recursively deleting a directory based on its prefix.
 
 A successful build clears `<agentDir>/logs/xcodebug/archive/` first, so snapshots
 from a previous binary cannot be mistaken for the run that is starting.

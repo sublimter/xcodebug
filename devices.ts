@@ -296,15 +296,15 @@ async function findProcessPidOnce(
 export async function pullCrashReport(
   device: DeviceInfo,
   executableName: string,
-  options: { since: number; directory: string; pid?: number },
-): Promise<string | undefined> {
+  options: { since: number; directory: string; pid?: number; signal?: AbortSignal },
+): Promise<{ path: string; terminationReason?: string } | undefined> {
   const listed = await runCommand(
     "xcrun",
     [
       "devicectl", "device", "info", "files", "--device", device.id,
       "--domain-type", "systemCrashLogs", "--search", executableName, "--json-output", "-",
     ],
-    { timeoutMs: 45_000 },
+    { timeoutMs: 45_000, signal: options.signal },
   );
   if (listed.code !== 0) return undefined;
   let files: unknown;
@@ -322,6 +322,7 @@ export async function pullCrashReport(
     if (name?.startsWith(`${executableName}-`) && name.endsWith(".ips") && basename(name) === name && at >= options.since) candidates.push({ name, at });
   }
   for (const { name } of candidates.sort((a, b) => b.at - a.at)) {
+    options.signal?.throwIfAborted();
     const directory = await mkdtemp(join(options.directory, "crash-")).catch(() => undefined);
     if (!directory) return undefined;
     const destination = join(directory, `crash-${name}`);
@@ -332,15 +333,35 @@ export async function pullCrashReport(
           "devicectl", "device", "copy", "from", "--device", device.id,
           "--domain-type", "systemCrashLogs", "--source", name, "--destination", destination,
         ],
-        { timeoutMs: 60_000 },
+        { timeoutMs: 60_000, signal: options.signal },
       );
       if (copied.code !== 0) continue;
       const report = await readFile(destination, "utf8").catch(() => undefined);
       if (report === undefined) continue;
-      const reported = /"pid"\s*:\s*(\d+)/.exec(report)?.[1];
-      if (options.pid !== undefined && Number(reported) !== options.pid) continue;
+      let parsed: Record<string, unknown>;
+      try {
+        // An Apple .ips has a one-line metadata object before the report JSON.
+        const header = /^[^\n]*\}\s*\n(?=\s*\{)/.exec(report);
+        parsed = asRecord(JSON.parse(header ? report.slice(header[0].length) : report));
+      } catch {
+        continue;
+      }
+      if (options.pid !== undefined && parsed.pid !== options.pid) continue;
       const retained = join(options.directory, `${basename(directory)}-${name}`);
-      if (await rename(destination, retained).then(() => true, () => false)) return retained;
+      if (await rename(destination, retained).then(() => true, () => false)) {
+        const termination = asRecord(parsed.termination);
+        let reason = asString(termination.namespace);
+        let code = asString(termination.code);
+        if (typeof termination.code === "number" && Number.isSafeInteger(termination.code) && termination.code >= 0) {
+          code = `0x${termination.code.toString(16).toUpperCase()}`;
+        }
+        if (code) reason = reason ? `${reason} ${code}` : code;
+        const explanation = (Array.isArray(termination.reasons)
+          ? termination.reasons.filter((value): value is string => typeof value === "string").join(" ")
+          : undefined) || asString(termination.indicator);
+        if (explanation) reason = reason ? `${reason}: ${explanation}` : explanation;
+        return { path: retained, terminationReason: reason };
+      }
     } finally {
       await rm(directory, { recursive: true, force: true }).catch(() => {});
     }

@@ -12,6 +12,13 @@ Enter these commands in the client's chat input. A bare `/xcodebug` (`$xcodebug`
 in Codex) builds as needed, installs, launches and starts capturing with defaults.
 Use `/xcodebug status` (`$xcodebug status` in Codex) to inspect current captures.
 
+Native pi/omp `/xcodebug` dispatches directly to the loaded extension handler,
+without skill/model selection for that dispatch. The package excludes its
+bundled skill from native package discovery; Claude/Codex share `mcp/skills/xcodebug/SKILL.md`.
+If a native host also discovers that user-level shared skill, it routes to the native tool
+when available. Reading a skill alone never executes an action; model-selected
+requests still require a tool call, while the native command runs its handler.
+
 Debug a real iOS device: build, install, launch, and read the app's console
 (stdout/stderr + os_log) inside the agent session. No jailbreak, no LLDB attach,
 no paid account.
@@ -142,8 +149,12 @@ What happens after `command`:
 1. `/bin/sh -lc` runs the whole line, with the project root as the working
    directory (`pi.cwd` → `ctx.cwd` → process cwd).
 2. It waits for the process to exit.
-3. It stops **the capture it targeted** — other apps' captures keep streaming.
-4. It hands back the exit code, elapsed time, how many new lines arrived, the
+3. It stops **the capture it targeted** and cancels its queued reconnect — other
+   apps' captures keep streaming.
+4. When collecting exit diagnostics, it waits for the owned console-launch
+   result and matching crash-report collection independently of the stopped
+   capture; caller cancellation still interrupts that wait.
+5. It hands back the exit code, elapsed time, how many new lines arrived, the
    log path, and the `logs` call (with the right `since`) for the app side.
 
 **Quote the whole line.** `command="cd /repo && npm run test"`. Unquoted, the
@@ -248,6 +259,12 @@ and [disk files](README.md#files) for details and the `logFiles` path list.
 A filtered read (`logs grep=`, `wait`) looks in those files for the lines memory
 has dropped and says in its reply that it did. Logs are deleted 30 days after
 their last write.
+
+Console launch-result JSON is temporary metadata, not a log. Ordinary `stop`
+preserves pending exit diagnostics; session exit instead cancels result reads
+and bounds startup/result cleanup as well as log drainage. Incomplete cleanup
+is reported. Ownership-checked stale-result reclamation and its conservative
+exceptions are documented under [disk files](README.md#files).
 
 ## Three rules of use
 

@@ -28,7 +28,6 @@
   "files": [
     "*.ts",
     "mcp/",
-    "skills/",
     "claude/",
     "README.md",
     "GUIDE.md",
@@ -48,7 +47,8 @@
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "skills": []
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

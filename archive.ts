@@ -14,7 +14,8 @@
  *   device archive - os_log only (framework/system messages, errors)
  * MySDK-style NSLog lines appear only in the live channel.
  */
-import { mkdir, readdir, rm, stat } from "node:fs/promises";
+import { constants, type Stats } from "node:fs";
+import { lstat, mkdir, open, readdir, rm, rmdir, stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { runCommand, timestamp } from "./exec.ts";
 
@@ -64,12 +65,80 @@ export async function clearArchives(workDir: string): Promise<{ removed: number;
 /** The files this extension writes: build, capture and pod install logs, and pulled crash reports. */
 const OWN_LOG = /^(?:build|console|syslog|pod-install|crash)-.+\.(?:log(?:\.\d+)?|ips)$/;
 
+/** Reclaim only expired, marked launch results whose owning process is definitely gone. */
+async function pruneLaunchResult(path: string, cutoff: number): Promise<void> {
+  const same = (a: Stats, b: Stats) => a.dev === b.dev && a.ino === b.ino
+    && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+  const inspect = async (expectedDirectory?: Stats) => {
+    const directory = await lstat(path);
+    if (!directory.isDirectory() || (expectedDirectory
+      ? !same(directory, expectedDirectory) : !(directory.mtimeMs < cutoff))) return;
+    const names = (await readdir(path)).sort();
+    if (!names.includes("owner.json") || names.some(name => name !== "owner.json" && name !== "launch.json")) return;
+    const files: { name: string; info: Stats }[] = [];
+    for (const name of names) {
+      const info = await lstat(join(path, name));
+      if (!info.isFile() || !(info.mtimeMs < cutoff)) return;
+      files.push({ name, info });
+    }
+    const ownerInfo = files.find(file => file.name === "owner.json")!.info;
+    // Refuse links and oversized unknown content before reading an ownership marker.
+    if (ownerInfo.size > 1_024) return;
+    const handle = await open(join(path, "owner.json"), constants.O_RDONLY | constants.O_NOFOLLOW);
+    let ownerText: string;
+    try {
+      if (!same(await handle.stat(), ownerInfo)) return;
+      ownerText = await handle.readFile({ encoding: "utf8" });
+      if (!same(await handle.stat(), ownerInfo)) return;
+    } finally {
+      await handle.close();
+    }
+    const owner = JSON.parse(ownerText);
+    if (!owner || typeof owner !== "object" || Array.isArray(owner) || Object.keys(owner).length !== 4
+      || owner.kind !== "xcodebug.launch-result" || owner.version !== 1
+      || !Number.isSafeInteger(owner.pid) || owner.pid <= 0
+      || !Number.isSafeInteger(owner.createdAt) || owner.createdAt < 0 || !(owner.createdAt < cutoff)) return;
+    try {
+      process.kill(owner.pid, 0);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") return;
+    }
+    for (const file of files) {
+      if (!same(await lstat(join(path, file.name)), file.info)) return;
+    }
+    if (!same(await lstat(path), directory)) return;
+    return { directory, files, ownerText };
+  };
+
+  const initial = await inspect();
+  if (!initial) return;
+  let expectedDirectory = initial.directory;
+  let removed = 0;
+  // Sorted entries remove launch.json first, retaining proof of ownership if cleanup fails.
+  for (const file of initial.files) {
+    const current = await inspect(expectedDirectory);
+    if (!current || current.ownerText !== initial.ownerText || current.files.length !== initial.files.length - removed
+      || current.files.some((entry, index) => entry.name !== initial.files[index + removed].name
+        || !same(entry.info, initial.files[index + removed].info))) return;
+    await unlink(join(path, file.name));
+    removed++;
+    // Only our successful unlink may make an otherwise-expired directory fresh.
+    expectedDirectory = await lstat(path);
+    if (!expectedDirectory.isDirectory() || expectedDirectory.dev !== initial.directory.dev
+      || expectedDirectory.ino !== initial.directory.ino) return;
+  }
+  if ((await readdir(path)).length === 0 && same(await lstat(path), expectedDirectory)) await rmdir(path);
+}
+
 /**
  * Delete this extension's logs that nothing has written to for `maxAgeMs`.
  *
  * Nothing else ever removes them, and they add up to hundreds of megabytes in
  * a few weeks. Age since the last write is the whole test: a capture still
  * running keeps its log fresh, and a file xcodebug did not name is left alone.
+ * Owned launch-result leftovers additionally require an expired marker and a
+ * definitely absent owner; unmarked or uncertain directories are left alone.
  */
 export async function pruneLogs(logDir: string, maxAgeMs: number): Promise<void> {
   let entries: string[];
@@ -80,12 +149,14 @@ export async function pruneLogs(logDir: string, maxAgeMs: number): Promise<void>
   }
   const cutoff = Date.now() - maxAgeMs;
   for (const name of entries) {
-    if (!OWN_LOG.test(name)) continue;
+    const launchResult = name.startsWith(".xcodebug-launch-") && name.length > ".xcodebug-launch-".length;
+    if (!OWN_LOG.test(name) && !launchResult) continue;
     const path = join(logDir, name);
     try {
-      if ((await stat(path)).mtimeMs < cutoff) await rm(path, { force: true });
+      if (launchResult) await pruneLaunchResult(path, cutoff);
+      else if ((await stat(path)).mtimeMs < cutoff) await rm(path, { force: true });
     } catch {
-      // A log that cannot be removed is not worth failing a run over.
+      // A log or owned result that cannot be removed is not worth failing a run over.
     }
   }
 }

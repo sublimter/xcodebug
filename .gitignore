@@ -11,3 +11,4 @@ dist/
 
 # Local runtime output
 *.log
+/.codegraph/

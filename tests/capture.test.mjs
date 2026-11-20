@@ -35,6 +35,26 @@ async function idleCapture(t, dir) {
   return c;
 }
 
+function holdLaunchResultRead(t, dir) {
+  const { promise: reading, resolve: readStarted } = Promise.withResolvers();
+  const { promise: released, resolve: release } = Promise.withResolvers();
+  const original = fs.promises.readFile;
+  let held = false;
+  t.mock.method(fs.promises, "readFile", async (path, ...args) => {
+    if (!held && String(path).startsWith(join(dir, ".xcodebug-launch-")) && String(path).endsWith("/launch.json")) {
+      held = true;
+      const raw = await original(path, ...args);
+      readStarted({ path: String(path), signal: args[0]?.signal });
+      await released;
+      return raw;
+    }
+    return original(path, ...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { release(); t.mock.restoreAll(); syncBuiltinESMExports(); });
+  return { reading, release };
+}
+
 function holdLogWrites(t, path) {
   fs.writeFileSync(path, "");
   let held = true;
@@ -236,6 +256,449 @@ test("a cancelled start never opens a writer or spawns a bridge", { timeout: 10_
   await assert.rejects(c.start(abort.signal), error => error === reason);
   assert.equal(c.running, false);
 });
+
+test("owned launch result survives natural exit followed by stop without entering logs", { timeout: 10_000 }, async t => {
+  const dir = await directory(t);
+  const raw = '{"result":{"process":{"processIdentifier":123}}}\n';
+  const script = `
+    const fs = require('node:fs');
+    const args = process.argv.slice(1);
+    const output = args.indexOf('--json-output');
+    if (output < 0 || args[output + 2] !== '--console' || args.at(-2) !== '--' || args.at(-1) !== 'app-argument') process.exit(2);
+    fs.writeFileSync(args[output + 1], ${JSON.stringify(raw)});
+    console.log('app output');
+    process.exitCode = 1;
+  `;
+  const args = ["-e", script, "--", "--console", "--", "app-argument"];
+  const original = [...args];
+  const c = capture({ logDir: dir, args, collectLaunchResult: true });
+  t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+  let observedResult;
+  let observedExitAt;
+  c.onProcessExit(() => {
+    observedResult = c.launchResult;
+    observedExitAt = c.naturalExitAt;
+    c.stop(false);
+  });
+  await c.start();
+  const result = c.launchResult;
+  assert.equal(await c.waitForExit(5_000), true);
+  assert.equal(observedResult, result);
+  assert.equal(typeof observedExitAt, "number");
+  assert.equal(await result, raw);
+  assert.equal(c.status().exitCode, 1);
+  assert.deepEqual(args, original, "caller launch arguments must not be mutated");
+  assert.match(c.status().commandLine, /--json-output .* --console -- app-argument$/);
+  assert.deepEqual(c.read({ since: 0 }).lines.map(line => line.text), ["app output"]);
+  assert.deepEqual(await readdir(dir), [c.logFile.split("/").at(-1)]);
+});
+
+for (const action of ["stop", "shutdown"]) {
+  test(`${action} keeps its own result-read cancellation semantics after natural exit`, { timeout: 10_000 }, async t => {
+    const dir = await directory(t);
+    const { reading, release } = holdLaunchResultRead(t, dir);
+    const raw = '{"result":{"process":{"processIdentifier":123}}}\n';
+    const script = `
+      const fs = require('node:fs');
+      const args = process.argv.slice(1);
+      fs.writeFileSync(args[args.indexOf('--json-output') + 1], ${JSON.stringify(raw)});
+      console.log('app output');
+    `;
+    const c = capture({ logDir: dir, collectLaunchResult: true, args: ["-e", script, "--", "--console"] });
+    t.after(async () => { await c.shutdown(); });
+    await c.start();
+    const result = c.launchResult;
+    const held = await reading;
+    assert.equal(await c.waitForExit(5_000), true);
+    const resultDir = held.path.slice(0, -"/launch.json".length);
+    const owner = JSON.parse(await fs.promises.readFile(join(resultDir, "owner.json"), "utf8"));
+    assert.deepEqual(Object.keys(owner).sort(), ["createdAt", "kind", "pid", "version"]);
+    assert.equal(owner.kind, "xcodebug.launch-result");
+    assert.equal(owner.version, 1);
+    assert.equal(owner.pid, process.pid);
+    assert.ok(Number.isSafeInteger(owner.createdAt) && owner.createdAt >= c.startedAt && owner.createdAt <= Date.now());
+    assert.equal((await stat(resultDir)).mode & 0o777, 0o700);
+    assert.equal((await stat(join(resultDir, "owner.json"))).mode & 0o777, 0o600);
+    let settled = false;
+    let cleanupSettled = false;
+    void result.then(() => { settled = true; });
+    const cleanup = c.waitForLaunchResults().then(() => { cleanupSettled = true; });
+    if (action === "stop") {
+      c.stop(false);
+      await delay(0);
+      assert.equal(held.signal.aborted, false, "ordinary stop must not cancel independent exit diagnostics");
+      assert.equal(settled, false);
+      assert.equal(cleanupSettled, false);
+      assert.equal(await fs.promises.readFile(held.path, "utf8"), raw);
+      release();
+      assert.equal(await result, raw);
+      await cleanup;
+    } else {
+      assert.equal(await c.shutdown(), true);
+      assert.equal(held.signal.aborted, true);
+      assert.equal(await result, undefined);
+      await cleanup;
+      assert.equal(cleanupSettled, true);
+      assert.equal((await readdir(dir)).some(name => name.startsWith(".xcodebug-launch-")), false,
+        "shutdown must remove the result without releasing the held read");
+      const terminal = c.status();
+      release();
+      await delay(0);
+      assert.deepEqual(c.status(), terminal, "a late result-read callback must not rewrite terminal state");
+      await c.start();
+      assert.equal(c.launchResult, result, "shutdown must not start or register another run");
+      assert.equal(c.running, false);
+      assert.equal(c.starting, false);
+    }
+    assert.deepEqual(c.read({ since: 0 }).lines.map(line => line.text), ["app output"]);
+    assert.deepEqual(await readdir(dir), [c.logFile.split("/").at(-1)]);
+  });
+}
+
+test("owned launch result cleanup failure is reported without losing the result", { timeout: 10_000 }, async t => {
+  const dir = await directory(t);
+  const originalRmdir = fs.promises.rmdir;
+  t.mock.method(fs.promises, "rmdir", async (path, ...args) => {
+    if (String(path).startsWith(join(dir, ".xcodebug-launch-"))) {
+      const error = new Error("owned result directory removal denied");
+      error.code = "EACCES";
+      throw error;
+    }
+    return originalRmdir(path, ...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const raw = '{"result":{"process":{"processIdentifier":123}}}';
+  const script = `
+    const fs = require('node:fs');
+    const args = process.argv.slice(1);
+    fs.writeFileSync(args[args.indexOf('--json-output') + 1], ${JSON.stringify(raw)});
+    console.log('console complete');
+  `;
+  const c = capture({ logDir: dir, collectLaunchResult: true, args: ["-e", script, "--", "--console"] });
+  t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+  await c.start();
+  assert.equal(await c.waitForExit(5_000), true);
+  assert.equal(await c.launchResult, raw);
+  assert.match(c.status().error, /launch result cleanup failed:.*removal denied/);
+});
+
+for (const [scenario, raw] of [["missing", undefined], ["malformed", "{malformed command result"], ["unreadable", undefined]]) {
+  test(`a ${scenario} owned launch result settles and removes its directory`, { timeout: 10_000 }, async t => {
+    const dir = await directory(t);
+    if (scenario === "unreadable") {
+      const original = fs.promises.readFile;
+      t.mock.method(fs.promises, "readFile", async (path, ...args) => {
+        if (String(path).startsWith(join(dir, ".xcodebug-launch-")) && String(path).endsWith("/launch.json")) {
+          const error = new Error("launch result read denied");
+          error.code = "EACCES";
+          throw error;
+        }
+        return original(path, ...args);
+      });
+      syncBuiltinESMExports();
+      t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+    }
+    const script = `
+      const fs = require('node:fs');
+      const args = process.argv.slice(1);
+      const raw = ${JSON.stringify(scenario === "unreadable" ? "unreadable result" : raw)};
+      if (raw !== undefined) fs.writeFileSync(args[args.indexOf('--json-output') + 1], raw);
+      console.log('console complete');
+    `;
+    const c = capture({ logDir: dir, args: ["-e", script, "--", "--console"], collectLaunchResult: true });
+    t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+    await c.start();
+    assert.equal(await c.waitForExit(5_000), true);
+    assert.equal(await c.launchResult, raw);
+    assert.deepEqual(c.read({ since: 0 }).lines.map(line => line.text), ["console complete"]);
+    assert.deepEqual(await readdir(dir), [c.logFile.split("/").at(-1)]);
+  });
+}
+
+test("a manually stopped console and a failed spawn settle missing owned results", { timeout: 15_000 }, async t => {
+  const dir = await directory(t);
+  const c = capture({
+    logDir: dir, collectLaunchResult: true,
+    args: ["-e", "console.log('ready'); setInterval(() => {}, 1000)", "--", "--console"],
+  });
+  t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+  const { promise: ready, resolve } = Promise.withResolvers();
+  c.onLine(line => { if (line.text === "ready") resolve(); });
+  await c.start();
+  await ready;
+  c.stop(false);
+  assert.equal(await c.waitForExit(5_000), true);
+  assert.equal(await c.launchResult, undefined);
+  assert.equal(c.naturalExitAt, undefined);
+  assert.equal((await readdir(dir)).some(name => name.startsWith(".xcodebug-launch-")), false);
+
+  const failed = capture({ logDir: dir, collectLaunchResult: true, command: join(dir, "missing-command"), args: ["--console"] });
+  t.after(async () => { failed.stop(false); await failed.waitForExit(5_000); });
+  await failed.start();
+  assert.equal(await failed.waitForExit(5_000), true);
+  assert.equal(await failed.launchResult, undefined);
+  assert.match(failed.status().error, /ENOENT/);
+  assert.equal((await readdir(dir)).some(name => name.startsWith(".xcodebug-launch-")), false);
+});
+
+for (const cancellation of ["stop", "caller abort"]) {
+  test(`${cancellation} during owned result directory creation leaves no bridge or files`, { timeout: 10_000 }, async t => {
+    const dir = await directory(t);
+    const { promise: created, resolve: directoryCreated } = Promise.withResolvers();
+    const { promise: released, resolve: release } = Promise.withResolvers();
+    const original = fs.promises.mkdtemp;
+    t.mock.method(fs.promises, "mkdtemp", async (...args) => {
+      const path = await original(...args);
+      directoryCreated(path);
+      await released;
+      return path;
+    });
+    syncBuiltinESMExports();
+    t.after(() => { release(); t.mock.restoreAll(); syncBuiltinESMExports(); });
+    const c = capture({ logDir: dir, collectLaunchResult: true, args: ["-e", "setInterval(() => {}, 1000)", "--", "--console"] });
+    t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+    const abort = new AbortController();
+    const reason = new Error("cancelled owned launch startup");
+    const starting = c.start(abort.signal);
+    await created;
+    if (cancellation === "stop") c.stop(false);
+    else abort.abort(reason);
+    release();
+    if (cancellation === "stop") await starting;
+    else await assert.rejects(starting, error => error === reason);
+    assert.equal(await c.launchResult, undefined);
+    assert.equal(c.running, false);
+    assert.equal(c.pid, undefined);
+    assert.deepEqual(await readdir(dir), []);
+  });
+}
+
+for (const operation of ["mkdir", "mkdtemp", "writeFile"]) {
+  test(`shutdown reports a pending ${operation} honestly and cleans startup after it resumes`, { timeout: 10_000 }, async t => {
+    const dir = await directory(t);
+    const { promise: entered, resolve: operationEntered } = Promise.withResolvers();
+    const { promise: released, resolve: release } = Promise.withResolvers();
+    const original = fs.promises[operation];
+    t.mock.method(fs.promises, operation, async (...args) => {
+      const result = await original(...args);
+      operationEntered();
+      await released;
+      return result;
+    });
+    syncBuiltinESMExports();
+    t.after(() => { release(); t.mock.restoreAll(); syncBuiltinESMExports(); });
+    const c = capture({ logDir: dir, collectLaunchResult: true, args: ["-e", "setInterval(() => {}, 1000)", "--", "--console"] });
+    t.after(async () => { await c.shutdown(); });
+    const starting = c.start();
+    const result = c.launchResult;
+    await entered;
+    assert.equal(c.starting, true);
+    assert.equal(c.running, false);
+    let resultSettled = false;
+    let cleanupSettled = false;
+    void result.then(() => { resultSettled = true; });
+    const cleanup = c.waitForLaunchResults().then(() => { cleanupSettled = true; });
+    // The injected pending syscall has no OS handle; keep the loop live for the unref'ed deadline.
+    const keepAlive = setInterval(() => {}, 1_000);
+    try {
+      assert.equal(await c.shutdown(20), false);
+    } finally {
+      clearInterval(keepAlive);
+    }
+    assert.match(c.status().error, /shutdown timed out.*resource cleanup remains pending/);
+    assert.equal(c.starting, true);
+    assert.equal(resultSettled, false, "an unresolved creation syscall still owns its result task");
+    assert.equal(cleanupSettled, false);
+    if (operation !== "mkdir") {
+      assert.equal((await readdir(dir)).filter(name => name.startsWith(".xcodebug-launch-")).length, 1);
+    }
+    release();
+    await starting;
+    await cleanup;
+    assert.equal(await result, undefined);
+    assert.equal(c.starting, false);
+    assert.equal(c.running, false);
+    assert.equal(c.pid, undefined);
+    assert.deepEqual(await readdir(dir), []);
+    assert.equal(await c.shutdown(), true);
+    c.resetForReconnect();
+    await c.start();
+    assert.equal(c.launchResult, result);
+    assert.equal(c.running, false);
+    assert.deepEqual(await readdir(dir), []);
+  });
+}
+
+for (const partial of [false, true]) {
+  test(`a ${partial ? "partial" : "failed"} owner marker write cancels launch and settles cleanup once`, { timeout: 10_000 }, async t => {
+    const dir = await directory(t);
+    const reason = new Error("owner marker write denied");
+    const original = fs.promises.writeFile;
+    t.mock.method(fs.promises, "writeFile", async (path, ...args) => {
+      if (String(path).endsWith("/owner.json")) {
+        if (partial) await original(path, ...args);
+        throw reason;
+      }
+      return original(path, ...args);
+    });
+    syncBuiltinESMExports();
+    t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+    const c = capture({ logDir: dir, collectLaunchResult: true, args: ["-e", "setInterval(() => {}, 1000)", "--", "--console"] });
+    t.after(async () => { await c.shutdown(); });
+    const starting = c.start();
+    const result = c.launchResult;
+    let settlements = 0;
+    void result.then(() => { settlements++; });
+    await assert.rejects(starting, error => error === reason);
+    await c.waitForLaunchResults();
+    assert.equal(await result, undefined);
+    assert.equal(c.starting, false);
+    assert.equal(c.running, false);
+    assert.equal(c.pid, undefined);
+    assert.deepEqual(await readdir(dir), []);
+    assert.equal(await c.shutdown(), true);
+    assert.equal(settlements, 1);
+    assert.equal(c.launchResult, result);
+  });
+}
+
+test("reconnect owns a fresh result while the old bridge's result read is still pending", { timeout: 15_000 }, async t => {
+  const dir = await directory(t);
+  const { promise: reading, resolve: readStarted } = Promise.withResolvers();
+  const { promise: released, resolve: release } = Promise.withResolvers();
+  const original = fs.promises.readFile;
+  const paths = [];
+  t.mock.method(fs.promises, "readFile", async (path, ...args) => {
+    if (String(path).startsWith(join(dir, ".xcodebug-launch-"))) {
+      paths.push(String(path));
+      if (paths.length === 1) { readStarted(); await released; }
+    }
+    return original(path, ...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { release(); t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const counter = join(dir, "launch-count");
+  const script = `
+    const fs = require('node:fs');
+    const args = process.argv.slice(1);
+    const counter = args.at(-1);
+    const run = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) + 1 : 1;
+    fs.writeFileSync(counter, String(run));
+    fs.writeFileSync(args[args.indexOf('--json-output') + 1], JSON.stringify({ run }));
+    console.log('bridge ' + run);
+  `;
+  const c = capture({ logDir: dir, collectLaunchResult: true, args: ["-e", script, "--", "--console", "--", counter] });
+  t.after(async () => { c.stop(false); await c.waitForExit(5_000); });
+  await c.start();
+  const first = c.launchResult;
+  await reading;
+  assert.equal(await c.waitForExit(5_000), true);
+  let firstSettled = false;
+  void first.then(() => { firstSettled = true; });
+  c.resetForReconnect();
+  await c.start();
+  const second = c.launchResult;
+  assert.notEqual(second, first);
+  assert.equal(await c.waitForExit(5_000), true);
+  assert.equal(await second, '{"run":2}');
+  assert.equal(firstSettled, false, "reattaching must not settle or replace the old result");
+  assert.equal(paths.length, 2);
+  assert.notEqual(paths[0], paths[1]);
+  release();
+  assert.equal(await first, '{"run":1}');
+  assert.equal((await readdir(dir)).some(name => name.startsWith(".xcodebug-launch-")), false);
+  assert.deepEqual(c.read({ since: 0 }).lines.map(line => line.text), ["bridge 1", "bridge 2"]);
+});
+
+test("shutdown joins an old reconnect result and the new live bridge without releasing the old read", { timeout: 10_000 }, async t => {
+  const dir = await directory(t);
+  const { reading, release } = holdLaunchResultRead(t, dir);
+  const counter = join(dir, "launch-count");
+  const script = `
+    const fs = require('node:fs');
+    const args = process.argv.slice(1);
+    const counter = args.at(-1);
+    const run = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) + 1 : 1;
+    fs.writeFileSync(counter, String(run));
+    fs.writeFileSync(args[args.indexOf('--json-output') + 1], JSON.stringify({ run }));
+    console.log('bridge ' + run);
+    if (run === 2) setInterval(() => {}, 1000);
+  `;
+  const c = capture({ logDir: dir, collectLaunchResult: true, args: ["-e", script, "--", "--console", "--", counter] });
+  t.after(async () => { await c.shutdown(); });
+  const { promise: ready, resolve: bridgeReady } = Promise.withResolvers();
+  c.onLine(line => { if (line.text === "bridge 2") bridgeReady(); });
+  await c.start();
+  const first = c.launchResult;
+  const held = await reading;
+  assert.equal(await c.waitForExit(5_000), true);
+  c.resetForReconnect();
+  await c.start();
+  const second = c.launchResult;
+  await ready;
+  assert.notEqual(second, first);
+  assert.equal(c.running, true);
+  assert.equal((await readdir(dir)).filter(name => name.startsWith(".xcodebug-launch-")).length, 2);
+  assert.equal(await c.shutdown(), true);
+  assert.equal(held.signal.aborted, true);
+  assert.equal(await first, undefined);
+  assert.equal(await second, undefined);
+  await c.waitForLaunchResults();
+  assert.equal(c.running, false);
+  assert.equal(c.starting, false);
+  assert.equal((await readdir(dir)).some(name => name.startsWith(".xcodebug-launch-")), false);
+  const terminal = c.status();
+  release();
+  await delay(0);
+  assert.deepEqual(c.status(), terminal);
+  assert.equal(c.launchResult, second);
+  assert.deepEqual(c.read({ since: 0 }).lines.map(line => line.text), ["bridge 1", "bridge 2"]);
+});
+
+for (const entry of ["extra file", "payload directory", "marker symlink"]) {
+  test(`owned cleanup retains a result directory containing a ${entry}`, { timeout: 10_000 }, async t => {
+    const dir = await directory(t);
+    const foreign = join(dir, "foreign-content");
+    const raw = '{"owned":true}';
+    const script = `
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const args = process.argv.slice(1);
+      const output = args[args.indexOf('--json-output') + 1];
+      const directory = path.dirname(output);
+      fs.writeFileSync(${JSON.stringify(foreign)}, 'keep foreign content');
+      if (${entry === "payload directory"}) {
+        fs.mkdirSync(output);
+        fs.writeFileSync(path.join(output, 'nested'), 'keep nested content');
+      } else {
+        fs.writeFileSync(output, ${JSON.stringify(raw)});
+        if (${entry === "extra file"}) fs.writeFileSync(path.join(directory, 'foreign.txt'), 'keep extra content');
+        if (${entry === "marker symlink"}) {
+          fs.unlinkSync(path.join(directory, 'owner.json'));
+          fs.symlinkSync(${JSON.stringify(foreign)}, path.join(directory, 'owner.json'));
+        }
+      }
+      console.log('console complete');
+    `;
+    const c = capture({ logDir: dir, collectLaunchResult: true, args: ["-e", script, "--", "--console"] });
+    t.after(async () => { await c.shutdown(); });
+    await c.start();
+    assert.equal(await c.waitForExit(5_000), true);
+    assert.equal(await c.launchResult, entry === "payload directory" ? undefined : raw);
+    await c.waitForLaunchResults();
+    assert.match(c.status().error, /launch result cleanup failed/);
+    const directories = (await readdir(dir)).filter(name => name.startsWith(".xcodebug-launch-"));
+    assert.equal(directories.length, 1);
+    const resultDir = join(dir, directories[0]);
+    assert.equal(await fs.promises.readFile(foreign, "utf8"), "keep foreign content");
+    if (entry === "extra file") assert.equal(await fs.promises.readFile(join(resultDir, "foreign.txt"), "utf8"), "keep extra content");
+    if (entry === "payload directory") assert.equal(await fs.promises.readFile(join(resultDir, "launch.json", "nested"), "utf8"), "keep nested content");
+    assert.equal((await fs.promises.lstat(join(resultDir, "owner.json"))).isSymbolicLink(), entry === "marker symlink");
+    assert.equal(await c.shutdown(), true, "a reported cleanup failure settles the job rather than claiming deletion");
+    assert.equal((await readdir(dir)).includes(directories[0]), true);
+  });
+}
 
 test("file rotation keeps the newest three segments and continues past 150 MiB", { timeout: 60_000 }, async t => {
   const dir = await directory(t);

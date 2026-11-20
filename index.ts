@@ -8,6 +8,7 @@
  */
 import { readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 // `import type` is erased at compile time, so this specifier never reaches the
 // runtime: it only has to name a module the loader can resolve for typechecking.
 // `@earendil-works/pi-coding-agent` is the official one the engine documents for
@@ -18,7 +19,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { Capture, matchesFilter, type FoundLine } from "./capture.ts";
 import { describeDevices, findProcessPid, listDevices, lookupProcess, pullCrashReport, resolveDevice, type DeviceInfo } from "./devices.ts";
-import { lastLines, runCommand, timestamp } from "./exec.ts";
+import { asRecord, lastLines, runCommand, timestamp } from "./exec.ts";
 import { buildForDevice, consoleLaunchArgs, installApp, terminateApp, type BuildOutcome, type BuildTarget } from "./xcode.ts";
 import { checkPodLockSync, describeChanges, detectChanges, directorySignature, runPodInstall, type ChangeReport } from "./changes.ts";
 import { clearArchives, pruneLogs } from "./archive.ts";
@@ -604,7 +605,8 @@ function lastWords(capture: Capture): string | undefined {
  */
 function endedNote(capture: Capture): string {
   const reason = capture.endReason ? ` · ${capture.endReason}` : "";
-  return `${reason}${capture.crashReport ? ` · crash report: ${capture.crashReport}` : ""}`;
+  const termination = capture.terminationReason ? ` · system termination: ${capture.terminationReason}` : "";
+  return `${reason}${termination}${capture.crashReport ? ` · crash report: ${capture.crashReport}` : ""}`;
 }
 
 /**
@@ -894,6 +896,35 @@ export default function xcodebug(pi: ExtensionAPI): void {
     silenceNotified: new Set(),
     recentLines: new Map(),
     watchdogs: new Map(),
+  };
+
+  // History can evict an ended capture before its launch-result cleanup finishes.
+  const ownedCaptures = new Set<Capture>();
+  const retiredCleanupWarnings: string[] = [];
+  let shuttingDown = false;
+  const startCapture = async (capture: Capture, signal?: AbortSignal): Promise<void> => {
+    if (shuttingDown) throw new Error("xcodebug session is shutting down");
+    ownedCaptures.add(capture);
+    const release = (): void => {
+      const result = capture.launchResult;
+      void capture.waitForLaunchResults().then(() => {
+        if (!shuttingDown && !capture.running && !capture.starting && capture.launchResult === result &&
+            ownedCaptures.delete(capture)) {
+          for (const error of capture.launchResultCleanupErrors ?? []) retiredCleanupWarnings.push(`${capture.id}: ${error}`);
+          capture.launchResultCleanupErrors = undefined;
+        }
+      });
+    };
+    const unsubscribe = capture.onExit(() => { unsubscribe(); release(); });
+    try {
+      await capture.start(signal);
+      if (shuttingDown) throw new Error("xcodebug session is shutting down");
+    } finally {
+      if (!capture.running) {
+        unsubscribe();
+        release();
+      }
+    }
   };
 
   /**
@@ -1186,66 +1217,152 @@ export default function xcodebug(pi: ExtensionAPI): void {
       await new Promise((resolve) => setTimeout(resolve, Math.min(250, deadline - Date.now())));
     }
   };
+  const isCurrentBridge = (capture: Capture, launch: number, result: Capture["launchResult"]): boolean =>
+    state.captures.get(capture.id) === capture && capture.relaunches === launch && capture.launchResult === result;
+
   /**
    * Record the pid of the instance a console bridge has just launched.
    *
-   * `replaced` is the instance that launch terminated. It stays in the process
-   * table for a moment afterwards, so the first answer can still be the one that
-   * is about to die - and a pid that names the wrong process makes `terminate`
-   * miss, and makes a later bridge drop look like someone else restarted the app.
+   * `replaced` can linger in the table after launch. A table snapshot is only
+   * useful while this bridge is live; after exit, only that launch's command
+   * result can identify the instance that ended.
    */
   const discoverAppPid = async (capture: Capture, device: DeviceInfo, replaced: number | undefined, signal = capture.signal): Promise<void> => {
-    if (!capture.processName) return;
+    if (!capture.processName || capture.processExited) return;
     const launch = capture.relaunches;
+    const result = capture.launchResult;
     const deadline = Date.now() + 20_000;
-    while (!signal.aborted && Date.now() < deadline && capture.running && capture.relaunches === launch) {
-      const { pid } = await lookupProcess(device, capture.processName, { attempts: 1, signal });
-      if (pid !== undefined && pid !== replaced) {
-        if (capture.relaunches === launch) capture.appPid = pid;
-        return;
+    const onAbort = (): void => capture.abort.abort(signal.reason);
+    if (signal.aborted) onAbort();
+    else if (signal !== capture.signal) signal.addEventListener("abort", onAbort, { once: true });
+    try {
+      while (!capture.signal.aborted && Date.now() < deadline && capture.running &&
+        !capture.processExited && isCurrentBridge(capture, launch, result)) {
+        const { pid } = await lookupProcess(device, capture.processName, { attempts: 1, signal: capture.signal });
+        if (capture.processExited || capture.naturalExitAt !== undefined || !isCurrentBridge(capture, launch, result)) return;
+        if (pid !== undefined && pid !== replaced) {
+          capture.appPid = pid;
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500));
       }
-      await new Promise((resolve) => setTimeout(resolve, 500));
+    } finally {
+      if (signal !== capture.signal) signal.removeEventListener("abort", onAbort);
     }
   };
 
-  /** Captures a crash report is being looked for, so two bridge drops close together search once. */
-  const crashSearches = new Set<string>();
+  /** One identity/report completion job per owned console-launch result. */
+  const crashSearches = new Map<string, {
+    launch: number;
+    result: Capture["launchResult"];
+    identity: Promise<number | undefined>;
+    promise: Promise<void>;
+  }>();
+  const crashSearchAbort = new AbortController();
 
   /**
    * Look for the crash report of an app whose console bridge went down.
    *
    * The device writes one a few seconds after the process died, so this tries a
-   * few times. An app that was only terminated, or that is still running, leaves
-   * none, and then nothing more is said. It runs apart from the capture: a
+   * few times. A missing report is not proof of a crash. The search runs apart
+   * from the capture:
    * `stop` a moment later must not call it off, since that is exactly how a run
    * that ends in a crash is wrapped up.
    */
-  const fetchCrashReport = async (capture: Capture, device: DeviceInfo): Promise<void> => {
+  const fetchCrashReport = async (capture: Capture, device: DeviceInfo, pid: number): Promise<void> => {
     const executable = capture.processName;
-    if (!executable || crashSearches.has(capture.id)) return;
-    crashSearches.add(capture.id);
-    // The instance whose bridge has just gone; a reattach will soon record another.
-    const pid = capture.appPid;
-    // A report is written after the process is gone, so one dated before the
-    // bridge went down belongs to an earlier run of the app.
-    const since = Date.now() - DEVICE_CLOCK_SKEW_MS;
-    try {
-      for (const delay of CRASH_REPORT_DELAYS_MS) {
-        // Unreferenced: a search still waiting must not hold a finished host open.
-        await new Promise((resolve) => {
-          setTimeout(resolve, delay).unref?.();
-        });
-        // The session ended, or has since let go of this capture.
-        if (state.captures.get(capture.id) !== capture) return;
-        const path = await pullCrashReport(device, executable, { since, pid, directory: dirname(capture.logFile) });
-        if (path) {
-          capture.crashReport = path;
-          capture.pushLine("err", `[xcodebug] crash report: ${path}`);
-          return;
-        }
+    if (!executable || capture.naturalExitAt === undefined) return;
+    const launch = capture.relaunches;
+    const result = capture.launchResult;
+    const since = capture.naturalExitAt - DEVICE_CLOCK_SKEW_MS;
+    for (const delay of CRASH_REPORT_DELAYS_MS) {
+      await sleep(delay, undefined, { signal: crashSearchAbort.signal });
+      if (!isCurrentBridge(capture, launch, result)) return;
+      const report = await pullCrashReport(device, executable, { since, pid, directory: dirname(capture.logFile),
+        signal: crashSearchAbort.signal });
+      if (crashSearchAbort.signal.aborted || !isCurrentBridge(capture, launch, result)) return;
+      if (report) {
+        capture.crashReport = report.path;
+        if (!capture.endReason && report.terminationReason) endCapture(capture, "the app exited");
+        capture.terminationReason = report.terminationReason ?? "not recorded in the crash report";
+        capture.pushLine("err", `[xcodebug] system termination: ${capture.terminationReason}`);
+        capture.pushLine("err", `[xcodebug] crash report: ${report.path}`);
+        return;
       }
+    }
+    if (capture.endReason || capture.stoppedByUser) {
+      capture.terminationReason = "unavailable: the device returned no matching crash report";
+      capture.pushLine("err", `[xcodebug] system termination: ${capture.terminationReason}`);
+    }
+  };
+
+  const startCrashReportSearch = (capture: Capture, device: DeviceInfo): void => {
+    if (capture.mode !== "console" || capture.naturalExitAt === undefined || capture.crashReport ||
+      state.captures.get(capture.id) !== capture) return;
+    const launch = capture.relaunches;
+    const result = capture.launchResult;
+    const existing = crashSearches.get(capture.id);
+    if (existing?.launch === launch && existing.result === result) return;
+    // A live-table PID is not evidence of which instance this ended console owned.
+    capture.appPid = undefined;
+    const identity = (async (): Promise<number | undefined> => {
+      const raw = await result;
+      if (crashSearchAbort.signal.aborted || !isCurrentBridge(capture, launch, result)) return;
+      let pid: unknown;
+      try {
+        const data = asRecord(JSON.parse(raw ?? ""));
+        const info = asRecord(data.info);
+        if (info.commandType === "devicectl.device.process.launch" && info.outcome === "success") {
+          pid = asRecord(asRecord(data.result).process).processIdentifier;
+        }
+      } catch {
+        // Missing or malformed launch output cannot establish instance ownership.
+      }
+      if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) {
+        capture.terminationReason = "unavailable: the app identity was not verified by the console launch";
+        capture.pushLine("err", `[xcodebug] system termination: ${capture.terminationReason}`);
+        return;
+      }
+      capture.appPid = pid;
+      capture.terminationReason = undefined;
+      return pid;
+    })();
+    const promise = (async (): Promise<void> => {
+      try {
+        const pid = await identity;
+        if (pid !== undefined && !crashSearchAbort.signal.aborted && isCurrentBridge(capture, launch, result)) {
+          await fetchCrashReport(capture, device, pid);
+        }
+      } catch (error) {
+        if (!crashSearchAbort.signal.aborted && isCurrentBridge(capture, launch, result)) {
+          capture.terminationReason = "unavailable: exit diagnostics failed";
+          capture.pushLine("err", `[xcodebug] ${capture.terminationReason}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      } finally {
+        const current = crashSearches.get(capture.id);
+        if (current?.launch === launch && current.result === result) crashSearches.delete(capture.id);
+      }
+    })();
+    crashSearches.set(capture.id, { launch, result, identity, promise });
+  };
+
+  const waitForCrashReport = async (capture: Capture, signal?: AbortSignal): Promise<void> => {
+    const job = crashSearches.get(capture.id);
+    if (!job || !isCurrentBridge(capture, job.launch, job.result) || signal?.aborted) return;
+    const pending = job.promise;
+    if (!signal) {
+      await pending;
+      return;
+    }
+    let onAbort: () => void = () => {};
+    const cancelled = new Promise<void>(resolve => {
+      onAbort = () => resolve();
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      await Promise.race([pending, cancelled]);
     } finally {
-      crashSearches.delete(capture.id);
+      signal.removeEventListener("abort", onAbort);
     }
   };
 
@@ -1258,7 +1375,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     const last = lastWords(capture);
     capture.endReason = last ? `${reason}; last line before the bridge ended: "${last}"` : reason;
     capture.pushLine("err", `[xcodebug] ${capture.endReason}; stopping capture`);
-    releaseCapture(capture);
+    stopCapture(capture, false);
   };
 
   /**
@@ -1295,6 +1412,15 @@ export default function xcodebug(pi: ExtensionAPI): void {
           const delay = Math.min(1000 * 2 ** (Math.min(attempts, 5) - 1), 15_000);
           await sleepUnlessStopped(capture, delay);
           if (capture.stoppedByUser) return;
+          const diagnosis = crashSearches.get(capture.id);
+          if (diagnosis && isCurrentBridge(capture, diagnosis.launch, diagnosis.result)) {
+            try {
+              await diagnosis.identity;
+            } catch {
+              // The diagnostic job records the failure; ownership remains unverified.
+            }
+            if (capture.stoppedByUser) return;
+          }
 
           // Only the console channel is bound to the app's lifetime, so only it
           // consults the process table. A syslog bridge outlives the app and its
@@ -1335,7 +1461,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
           capture.pushLine("err", `[xcodebug] reconnecting ${label} bridge (attempt ${attempts})`);
           capture.resetForReconnect();
           try {
-            await capture.start();
+            await startCapture(capture);
             if (capture.stoppedByUser) return;
             attempts = 0;
             onReconnect?.(1);
@@ -1369,6 +1495,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
       }
     };
 
+    capture.onProcessExit(() => startCrashReportSearch(capture, device));
+
     capture.onExit((code, signal) => {
       stopPush(capture.id);
       const reason = signal ? `signal ${signal}` : `exit ${code ?? "?"}`;
@@ -1382,10 +1510,6 @@ export default function xcodebug(pi: ExtensionAPI): void {
         releaseCapture(capture);
         return;
       }
-      // An app that dies takes its console with it. Looking for its report
-      // starts here rather than once the reconnect below has settled what
-      // happened, because a `stop` can arrive before it does.
-      if (capture.mode === "console") void fetchCrashReport(capture, device);
       // Always hand off. If a reconnect loop is already running it returns at
       // once and keeps retrying on its own; if none is running, this starts it.
       // An earlier version skipped this while the watchdog was restarting, which
@@ -1704,13 +1828,17 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // say so: "the case ran" and "the app died under the case" must not read
       // alike. Stopping still matters then - it calls off a pending reattach,
       // which would relaunch the app now that the case is over.
-      const how = target.running
+      const wasRunning = target.running && !target.processExited;
+      const wasUserStopped = target.stoppedByUser && !target.endReason;
+      stopCapture(target, false);
+      // Report collection is independent; stop a queued reattach before awaiting it.
+      if (!wasRunning && !wasUserStopped) await waitForCrashReport(target, signal);
+      await target.waitForExit(5_000);
+      const how = wasRunning
         ? `stopped ${target.id}`
-        : target.stoppedByUser
+        : wasUserStopped
           ? `${target.id} was already stopped`
           : `warning: ${target.id} was no longer capturing when the command finished${whyEnded(target)}`;
-      stopCapture(target, false);
-      await target.waitForExit(5_000);
       const status = target.status();
       const added = Math.max(0, status.lineCount - linesAtStart);
       captureNote = `${how} · ${added} new line(s) · ${status.logFile}`;
@@ -1740,6 +1868,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
         elapsedSeconds: elapsedS,
         captureId: target?.id,
         cursor: since,
+        terminationReason: target?.terminationReason,
+        crashReport: target?.crashReport,
       },
       // A non-zero exit is a failed case, and the caller must see it as such
       // rather than as a successful "run finished".
@@ -2095,6 +2225,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         bundleId: resolvedBundleId,
         processName: executable,
         logDir: logDir(ctx),
+        collectLaunchResult: true,
         command: "xcrun",
         args: consoleLaunchArgs(device, resolvedBundleId, {
           args: params.args ?? config.args,
@@ -2102,7 +2233,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
           environment: { ...(config.environment ?? {}), ...(params.environment ?? {}) },
         }),
       });
-      await capture.start(signal);
+      await startCapture(capture, signal);
       state.captures.set(capture.id, capture);
       state.activeCaptureId = capture.id;
       watchExit(capture, device);
@@ -2134,11 +2265,21 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // The previous run for this app was already retired before this capture
       // started (see above), so nothing is left to stop here. Other apps'
       // captures are untouched either way.
+
+      // Discover an operational PID while the console is live. Exit diagnosis
+      // instead uses the identity from this launch's own command result.
+      if (!before.queryFailed) await discoverAppPid(capture, device, before.pid, signal);
+      if (signal?.aborted) {
+        stopCapture(capture, false);
+        await capture.waitForExit(3_000);
+        signal.throwIfAborted();
+      }
+      // Finish console process discovery before opening another device log service.
       // Second channel: idevicesyslog reads the device's unified log directly
       // and survives a dropped --console bridge. It carries os_log only, so
       // NSLog/print lines (MySDK) stay exclusive to the console channel -
       // this is a safety net for the gap, not a replacement.
-      if (executable && params.dualChannel !== false) {
+      if (executable && params.dualChannel !== false && !capture.stoppedByUser) {
         const syslogCapture = new Capture({
           mode: "syslog",
           deviceId: device.id,
@@ -2150,23 +2291,19 @@ export default function xcodebug(pi: ExtensionAPI): void {
           args: ["-u", device.udid ?? device.id, "-p", executable, "--no-colors"],
         });
         try {
-          await syslogCapture.start(signal);
-          state.captures.set(syslogCapture.id, syslogCapture);
-          state.companions.set(capture.id, syslogCapture.id);
-          watchExit(syslogCapture, device);
-          notes.push(`syslog channel: ${syslogCapture.id}`);
+          await startCapture(syslogCapture, signal);
+          if (capture.stoppedByUser) {
+            syslogCapture.stop(false);
+            await syslogCapture.waitForExit(3_000);
+          } else {
+            state.captures.set(syslogCapture.id, syslogCapture);
+            state.companions.set(capture.id, syslogCapture.id);
+            watchExit(syslogCapture, device);
+            notes.push(`syslog channel: ${syslogCapture.id}`);
+          }
         } catch (error) {
           notes.push(`syslog channel unavailable: ${(error as Error).message}`);
         }
-      }
-
-      // The app pid is not part of --console's output; discover it from the
-      // process table so terminate can target the app rather than the bridge.
-      if (!before.queryFailed) await discoverAppPid(capture, device, before.pid, signal);
-      if (signal?.aborted) {
-        stopCapture(capture, false);
-        await capture.waitForExit(3_000);
-        signal.throwIfAborted();
       }
 
       return {
@@ -2203,7 +2340,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         command: "idevicesyslog",
         args,
       });
-      await capture.start(signal);
+      await startCapture(capture, signal);
       state.captures.set(capture.id, capture);
       state.activeCaptureId = capture.id;
       watchExit(capture, device);
@@ -2239,6 +2376,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       }
       // The lines that say so are in the log, but a filtered read leaves them out.
       if (capture.endReason) formatted.text += `\n\n[this capture ended on its own · ${capture.endReason}]`;
+      if (capture.terminationReason) formatted.text += `\n[system termination: ${capture.terminationReason}]`;
       if (capture.crashReport) formatted.text += `\n[crash report: ${capture.crashReport}]`;
       return {
         content: [{ type: "text", text: formatted.text }],
@@ -2258,6 +2396,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       const seen = new Set<number>();
       let finished = false;
       let cancelled = false;
+      let deadlineExpired = false;
       // The backlog is read from disk too, which takes a moment. A line that
       // arrives meanwhile must not settle the wait ahead of the earlier ones.
       let backlogRead = false;
@@ -2288,6 +2427,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       const finish = (timedOut: boolean): void => {
         if (finished) return;
         finished = true;
+        deadlineExpired = timedOut;
         if (timer) clearTimeout(timer);
         unsubscribeLine();
         unsubscribeExit();
@@ -2341,11 +2481,17 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // A pattern already present in the backlog must return immediately,
       // not wait out the timeout.
       if (matches.length > 0 || !capture.running) finish(false);
-      const text = await waiting;
+      let text = await waiting;
+      if (!cancelled && !deadlineExpired && matches.length === 0 && !capture.running) {
+        await waitForCrashReport(capture, signal);
+        if (signal?.aborted) cancelled = true;
+        text = settle(cancelled);
+      }
 
       return {
         content: [{ type: "text", text }],
-        details: { captureId: capture.id, cursor: capture.status().cursor, matched: matches.length },
+        details: { captureId: capture.id, cursor: capture.status().cursor, matched: matches.length,
+          terminationReason: capture.terminationReason, crashReport: capture.crashReport },
         isError: matches.length === 0,
       };
     }
@@ -2673,10 +2819,12 @@ export default function xcodebug(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", async () => {
+    shuttingDown = true;
+    crashSearchAbort.abort();
     stopStatusTicker();
     state.uiCtx?.ui.setStatus("xcodebug", undefined);
     state.uiCtx?.ui.setWidget("xcodebug", undefined);
-    const captures = [...state.captures.values()];
+    const captures = [...new Set([...ownedCaptures, ...state.captures.values()])];
     for (const capture of captures) {
       stopPush(capture.id);
       stopWatchdog(capture.id);
@@ -2685,8 +2833,18 @@ export default function xcodebug(pi: ExtensionAPI): void {
     state.captures.clear();
     state.endedCaptures.clear();
     state.activeCaptureId = undefined;
-    // The host exits once this returns, and a log line still in a pipe then is
-    // lost; each capture bounds its own drain.
-    await Promise.all(captures.map((capture) => capture.waitForExit(3_000)));
+    // Include pending starts and old result reads, not only the visible capture history.
+    const settled = await Promise.all(captures.map((capture) => capture.shutdown(3_000)));
+    ownedCaptures.clear();
+    const warnings = retiredCleanupWarnings.splice(0);
+    for (const [index, capture] of captures.entries()) {
+      for (const error of capture.launchResultCleanupErrors ?? []) warnings.push(`${capture.id}: ${error}`);
+      if (!settled[index]) warnings.push(`${capture.id}: ${capture.status().error}`);
+    }
+    if (warnings.length > 0) {
+      const message = `xcodebug shutdown cleanup incomplete: ${warnings.join("; ")}`;
+      state.uiCtx?.ui.notify(message, "warning");
+      console.error(message);
+    }
   });
 }

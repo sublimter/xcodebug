@@ -5,8 +5,8 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { appendFileSync, createReadStream, createWriteStream, statSync, type WriteStream } from "node:fs";
-import { mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rmdir, unlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { finished } from "node:stream/promises";
 import { timestamp } from "./exec.ts";
 
@@ -40,6 +40,8 @@ export interface CaptureInit {
   logDir: string;
   command: string;
   args: string[];
+  /** Collect the native console launch's raw command result, outside the log stream. */
+  collectLaunchResult?: boolean;
   /** Reuse an existing log file (used when auto-reconnecting a dropped bridge). */
   logFile?: string;
   /** How new lines are mirrored into the session; the reconnect path restarts it. */
@@ -71,6 +73,7 @@ export interface CaptureStatus {
   relaunches: number;
   endReason?: string;
   crashReport?: string;
+  terminationReason?: string;
 }
 
 function clean(text: string): string {
@@ -94,6 +97,32 @@ function sizeOnDisk(path: string): number {
   }
 }
 
+async function removeLaunchResultDirectory(path: string): Promise<void> {
+  const directory = await lstat(path);
+  if (!directory.isDirectory()) throw new Error("owned result path is not a real directory");
+  const entries = (await readdir(path)).sort();
+  if (entries.some(name => name !== "owner.json" && name !== "launch.json")) {
+    throw new Error("owned result directory contains an unexpected entry");
+  }
+  const files = [];
+  for (const name of entries) {
+    const filePath = join(path, name);
+    const file = await lstat(filePath);
+    if (!file.isFile()) throw new Error("owned result payload is not a real file");
+    files.push({ path: filePath, stat: file });
+  }
+  for (const file of files) {
+    const currentDirectory = await lstat(path);
+    const currentFile = await lstat(file.path);
+    if (!currentDirectory.isDirectory() || currentDirectory.dev !== directory.dev || currentDirectory.ino !== directory.ino ||
+        !currentFile.isFile() || currentFile.dev !== file.stat.dev || currentFile.ino !== file.stat.ino) {
+      throw new Error("owned result path changed during cleanup");
+    }
+    await unlink(file.path);
+  }
+  await rmdir(path);
+}
+
 export class Capture {
   readonly id: string;
   readonly mode: CaptureMode;
@@ -101,13 +130,22 @@ export class Capture {
   readonly deviceLabel: string;
   readonly bundleId: string;
   readonly processName?: string;
-  /** App pid on the device; filled in once discovery succeeds, never the bridge pid. */
+  /** Operational live PID; exit diagnosis replaces it with the owned launch result's PID. */
   appPid?: number;
   readonly startedAt = Date.now();
   readonly logFile: string;
 
   readonly command: string;
   readonly launchArgs: string[];
+  /** One owned native command result per bridge start; absent for generic captures. */
+  launchResult?: Promise<string | undefined>;
+  private readonly collectLaunchResult: boolean;
+  private spawnedArgs: string[];
+  private shuttingDown = false;
+  private readonly startups = new Set<Promise<void>>();
+  private readonly resultJobs = new Set<{ done: Promise<void>; cancel: () => void }>();
+  /** Failed result removals survive reattachment and history eviction until session shutdown reports them. */
+  launchResultCleanupErrors?: string[];
   /** Set when the user explicitly stops this capture, so auto-reconnect stays off. */
   stoppedByUser = false;
   /**
@@ -135,6 +173,9 @@ export class Capture {
   endReason?: string;
   /** The crash report pulled from the device after the app died, if it left one. */
   crashReport?: string;
+  terminationReason?: string;
+  /** Bridge exit time before any stop, retained through drain and report collection. */
+  naturalExitAt?: number;
   /**
    * Aborted when this capture is stopped, so an in-flight device probe returns
    * at once instead of running out its own timeout first.
@@ -173,6 +214,7 @@ export class Capture {
   private readonly files = new Set<WriteStream>();
   private readonly blockedFiles = new Set<WriteStream>();
   private readonly exitListeners = new Set<(code: number | undefined, signal: string | undefined) => void>();
+  private readonly processExitListeners = new Set<(code: number | undefined, signal: string | undefined) => void>();
   private readonly lineListeners = new Set<(line: LogLine) => void>();
 
   constructor(init: CaptureInit) {
@@ -186,6 +228,8 @@ export class Capture {
     this.pushMode = init.pushMode;
     this.command = init.command;
     this.launchArgs = init.args;
+    this.collectLaunchResult = init.mode === "console" && init.collectLaunchResult === true;
+    this.spawnedArgs = this.launchArgs;
     this.logFile =
       init.logFile ?? `${init.logDir}/${init.mode}-${init.bundleId}-${timestamp()}.log`;
   }
@@ -195,15 +239,35 @@ export class Capture {
     return this.child !== undefined;
   }
 
+  get starting(): boolean {
+    return this.startups.size > 0;
+  }
+
+  get processExited(): boolean {
+    return this.child
+      ? this.child.exitCode !== null || this.child.signalCode !== null
+      : this.exitCode !== undefined || this.exitSignal !== undefined;
+  }
+
   /** Clear the terminal state so start() can attach a fresh bridge. */
   resetForReconnect(): void {
     this.exitCode = undefined;
     this.exitSignal = undefined;
     this.error = undefined;
+    this.endReason = undefined;
+    this.crashReport = undefined;
+    this.terminationReason = undefined;
+    this.naturalExitAt = undefined;
     this.buffered = { out: "", err: "" };
     // A fresh bridge starts its silence clock now, or the watchdog would see the
     // gap it just repaired and immediately restart the new bridge too.
     this.lastLineAt = Date.now();
+  }
+
+  /** Observe process exit before the pipes and writers finish draining. */
+  onProcessExit(listener: (code: number | undefined, signal: string | undefined) => void): () => void {
+    this.processExitListeners.add(listener);
+    return () => this.processExitListeners.delete(listener);
   }
 
   get pid(): number | undefined {
@@ -221,14 +285,98 @@ export class Capture {
     return () => this.lineListeners.delete(listener);
   }
 
-  async start(signal?: AbortSignal): Promise<void> {
-    await mkdir(dirname(this.logFile), { recursive: true });
-    signal?.throwIfAborted();
-    if (this.stoppedByUser) return;
-    this.openFile(true);
+  start(signal?: AbortSignal): Promise<void> {
+    if (this.shuttingDown) return Promise.resolve();
+    let resolveStartup!: () => void;
+    const startup = new Promise<void>(resolve => { resolveStartup = resolve; });
+    this.startups.add(startup);
+    const operation = this.startRun(signal);
+    const complete = (): void => {
+      this.startups.delete(startup);
+      resolveStartup();
+    };
+    void operation.then(complete, complete);
+    return operation;
+  }
 
-    const child = spawn(this.command, this.launchArgs, { stdio: ["ignore", "pipe", "pipe"] });
-    this.child = child;
+  private async startRun(signal?: AbortSignal): Promise<void> {
+    let resultDir: string | undefined;
+    let resolveResult: ((raw: string | undefined) => void) | undefined;
+    let resolveCleanup: (() => void) | undefined;
+    let resultJob: { done: Promise<void>; cancel: () => void } | undefined;
+    let collecting = false;
+    const resultAbort = this.collectLaunchResult ? new AbortController() : undefined;
+    if (resultAbort) {
+      // Node 20's Promise API requires an executor; it has no withResolvers().
+      this.launchResult = new Promise((resolve) => { resolveResult = resolve; });
+      resultJob = {
+        done: new Promise(resolve => { resolveCleanup = resolve; }),
+        cancel: () => resultAbort.abort(),
+      };
+      this.resultJobs.add(resultJob);
+    }
+    const result = this.launchResult;
+    // Exit diagnosis outlives stop/reconnect; only session shutdown cancels its read.
+    const collectResult = async (): Promise<void> => {
+      if (!resolveResult || !resultAbort || collecting) return;
+      collecting = true;
+      let raw: string | undefined;
+      let onAbort: (() => void) | undefined;
+      try {
+        if (resultDir && !resultAbort.signal.aborted) {
+          raw = await Promise.race([
+            readFile(join(resultDir, "launch.json"), { encoding: "utf8", signal: resultAbort.signal }).catch(() => undefined),
+            new Promise<undefined>(resolve => {
+              onAbort = () => resolve(undefined);
+              resultAbort.signal.addEventListener("abort", onAbort, { once: true });
+              if (resultAbort.signal.aborted) onAbort();
+            }),
+          ]);
+        }
+      } catch {
+        // A killed console or failed spawn may never produce a command result.
+      } finally {
+        if (onAbort) resultAbort.signal.removeEventListener("abort", onAbort);
+        if (resultDir) await removeLaunchResultDirectory(resultDir).catch(error => {
+          const detail = `launch result cleanup failed: ${resultDir}: ${error instanceof Error ? error.message : String(error)}`;
+          (this.launchResultCleanupErrors ??= []).push(detail);
+          if (this.launchResult !== result) return;
+          this.error = this.error ? `${this.error}; ${detail}` : detail;
+        });
+        resolveResult(resultAbort.signal.aborted ? undefined : raw);
+        if (resultJob) this.resultJobs.delete(resultJob);
+        resolveCleanup?.();
+      }
+    };
+    let child: ChildProcess;
+    try {
+      await mkdir(dirname(this.logFile), { recursive: true });
+      signal?.throwIfAborted();
+      if (this.stoppedByUser || this.shuttingDown) { await collectResult(); return; }
+      let args = this.launchArgs;
+      if (this.collectLaunchResult) {
+        resultDir = await mkdtemp(join(dirname(this.logFile), ".xcodebug-launch-"));
+        signal?.throwIfAborted();
+        if (this.stoppedByUser || this.shuttingDown) { await collectResult(); return; }
+        await writeFile(join(resultDir, "owner.json"), JSON.stringify({
+          kind: "xcodebug.launch-result", version: 1, pid: process.pid, createdAt: Date.now(),
+        }), { mode: 0o600, flag: "wx" });
+        signal?.throwIfAborted();
+        if (this.stoppedByUser || this.shuttingDown) { await collectResult(); return; }
+        const consoleIndex = args.indexOf("--console");
+        const separatorIndex = args.indexOf("--");
+        const index = consoleIndex >= 0 ? consoleIndex : separatorIndex >= 0 ? separatorIndex : args.length;
+        args = args.slice();
+        args.splice(index, 0, "--json-output", join(resultDir, "launch.json"));
+      }
+      this.openFile(true);
+      this.spawnedArgs = args;
+      child = spawn(this.command, args, { stdio: ["ignore", "pipe", "pipe"] });
+      this.child = child;
+    } catch (error) {
+      await collectResult();
+      throw error;
+    }
     let finishing = false;
     let drainTimer: NodeJS.Timeout | undefined;
     const drainAbort = new AbortController();
@@ -284,13 +432,24 @@ export class Capture {
       if (this.child === child) this.consume("err", chunk);
     });
     child.on("error", (error: Error) => {
+      void collectResult();
       if (this.child !== child) return;
       this.error = error.message;
       this.pushLine("err", `[xcodebug] failed to start: ${error.message}`);
       finish(undefined, undefined);
     });
     // `close` can itself wait forever while a backed-up writer pauses the pipes.
-    child.on("exit", (code, signal) => beginDrain(code ?? undefined, signal ?? undefined));
+    child.on("exit", (code, signal) => {
+      void collectResult();
+      if (this.child !== child) return;
+      if (!this.stoppedByUser) this.naturalExitAt = Date.now();
+      beginDrain(code ?? undefined, signal ?? undefined);
+      for (const listener of this.processExitListeners) {
+        try { listener(code ?? undefined, signal ?? undefined); } catch {
+          // A listener must never break capture teardown.
+        }
+      }
+    });
     child.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
       if (this.child !== child) return;
       this.flush("out");
@@ -430,6 +589,39 @@ export class Capture {
     } else {
       child.kill("SIGKILL");
     }
+  }
+
+  /** Join every retained per-start result task, including old reconnect results. */
+  async waitForLaunchResults(): Promise<void> {
+    await Promise.all([...this.resultJobs].map(job => job.done));
+  }
+
+  /** Session exit cancels diagnostics as well as the bridge, unlike ordinary stop. */
+  shutdown(timeoutMs = 3_000): Promise<boolean> {
+    this.shuttingDown = true;
+    this.stop(false);
+    for (const job of this.resultJobs) job.cancel();
+    return new Promise(resolve => {
+      let settled = false;
+      let unsubscribe = (): void => {};
+      const done = (cleaned: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsubscribe();
+        if (!cleaned) {
+          const detail = `capture shutdown timed out after ${timeoutMs}ms; resource cleanup remains pending`;
+          this.error = this.error ? `${this.error}; ${detail}` : detail;
+        }
+        resolve(cleaned);
+      };
+      const timer = setTimeout(() => done(false), Math.max(0, timeoutMs));
+      timer.unref();
+      const drained = this.running
+        ? new Promise<void>(resolve => { unsubscribe = this.onExit(() => resolve()); })
+        : Promise.resolve();
+      void Promise.all([Promise.all([...this.startups]), this.waitForLaunchResults(), drained]).then(() => done(true));
+    });
   }
 
   /**
@@ -641,11 +833,12 @@ export class Capture {
       cursor: this.cursor,
       logFile: this.logFile,
       logFiles: [...this.logFiles].sort((a, b) => a[1] - b[1]).map(([path]) => path),
-      commandLine: [this.command, ...this.launchArgs].join(" "),
+      commandLine: [this.command, ...this.spawnedArgs].join(" "),
       error: this.error,
       relaunches: this.relaunches,
       endReason: this.endReason,
       crashReport: this.crashReport,
+      terminationReason: this.terminationReason,
     };
   }
 }

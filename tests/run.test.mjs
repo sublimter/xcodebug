@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import xcodebug from "../index.ts";
+import { pullCrashReport } from "../devices.ts";
 
 const DEVICE = { identifier: "test-device", properties: {
   hardware: { udid: "test-udid", reality: "physical" },
@@ -22,6 +25,9 @@ const INFO_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
 //   launches    one line per console launch; each launch gives the app the pid 4000 + its number
 //   drop        the first launch's console bridge exits, the app keeps running
 //   slow-table  the process table takes two seconds to answer
+//   delayed-table-snapshot  hold a launch query before it reads the current process table
+//   no-launch-result  the bridge exits without writing its native command result
+//   launch-result  override the native result with malformed/untrusted metadata
 //   die         the app is killed: its process is gone and the bridge says so
 //   linger      a launch takes a moment to replace the instance in the process table
 //   crash-name  a crash report by this name is on the device, about the process in crash-pid;
@@ -42,6 +48,22 @@ async function session(t) {
   *" list devices "*) printf '%s\\n' '${JSON.stringify({ result: { devices: [DEVICE] } })}' ;;
   *" device install app "*) exit 0 ;;
   *" device info processes "*)
+    if [ -f "$root/bad-table" ]; then echo invalid-json; exit 0; fi
+    if [ -f "$root/stale-table" ] || { [ -f "$root/late-table" ] && [ -f "$root/launches" ]; }; then
+      if [ -f "$root/late-table" ]; then
+        while [ ! -s "$root/pid" ]; do /bin/sleep 0.01; done
+      fi
+      echo $$ > "$root/table-pid"
+      : > "$root/table-started"
+      if [ -f "$root/delayed-table-snapshot" ]; then
+        while [ ! -f "$root/table-snapshot-release" ]; do /bin/sleep 0.01; done
+      fi
+      saved=$(/bin/cat "$root/pid")
+      : > "$root/table-snapshotted"
+      while [ ! -f "$root/table-release" ]; do /bin/sleep 0.01; done
+      printf '{"result":{"runningProcesses":[{"executable":"file:///private/X/Probe.app/Probe","processIdentifier":%s}]}}\\n' "$saved"
+      exit 0
+    fi
     if [ -f "$root/slow-table" ]; then /bin/sleep 2; fi
     if [ -s "$root/pid" ]; then
       printf '{"result":{"runningProcesses":[{"executable":"file:///private/var/containers/Bundle/Application/X/Probe.app/PlugIns/Widget.appex/Widget","processIdentifier":55},{"executable":"file:///private/var/containers/Bundle/Application/X/Probe.app/Probe","processIdentifier":%s}]}}\\n' "$(/bin/cat "$root/pid")"
@@ -63,18 +85,44 @@ async function session(t) {
     done
     # Pids come round again: the crash from years ago was of a process numbered like the first launch.
     case "$source" in *2020*) pid=4001 ;; *) pid=$(/bin/cat "$root/crash-pid") ;; esac
-    printf '{"bug_type":"309"}\\n{\\n  "pid" : %s,\\n  "procName" : "Probe"\\n}\\n' "$pid" > "$destination" ;;
+    if [ -f "$root/crash-content" ]; then
+      /bin/cat "$root/crash-content" > "$destination"
+    else
+      printf '{"bug_type":"309"}\n{\n  "pid" : %s,\n  "procName" : "Probe",\n  "termination": {"namespace":"FRONTBOARD","code":2343432205,"reasons":["scene-create watchdog transgression"]}\n}\n' "$pid" > "$destination"
+    fi ;;
   *" device process launch "*)
+    result_file=''
+    while [ $# -gt 1 ]; do
+      [ "$1" = "--json-output" ] && result_file="$2"
+      shift
+    done
     echo launched >> "$root/launches"
     n=$(/usr/bin/wc -l < "$root/launches" | /usr/bin/tr -d ' ')
     # The instance being replaced stays in the process table for a moment.
     if [ -f "$root/linger" ]; then /bin/sleep 0.4; fi
-    echo $((4000 + n)) > "$root/pid"
+    launch_pid=$((4000 + n))
+    echo "$launch_pid" > "$root/pid"
+    write_launch_result() {
+      [ -n "$result_file" ] && [ ! -f "$root/no-launch-result" ] || return 0
+      if [ -f "$root/launch-result" ]; then
+        /bin/cat "$root/launch-result" > "$result_file"
+      else
+        printf '{"info":{"commandType":"devicectl.device.process.launch","outcome":"success"},"result":{"process":{"processIdentifier":%s,"executable":"/private/X/Probe.app/Probe"}}}\\n' "$launch_pid" > "$result_file"
+      fi
+    }
     printf 'Launched application with test.probe bundle identifier.\\n'
     printf 'instance %s logging\\n' "$n" >&2
     while :; do
-      if [ "$n" = 1 ] && [ -f "$root/drop" ]; then exit 1; fi
-      if [ -f "$root/die" ]; then /bin/rm -f "$root/pid"; printf 'App terminated due to signal 9.\\n'; exit 1; fi
+      if [ "$n" = 1 ] && [ -f "$root/drop" ]; then write_launch_result; exit 1; fi
+      if [ -f "$root/die" ]; then
+        /bin/rm -f "$root/pid"
+        printf 'App terminated due to signal 9.\\n'
+        write_launch_result
+        if [ -f "$root/hold-pipes" ]; then
+          (while [ ! -f "$root/drain-release" ]; do /bin/sleep 0.01; done) &
+        fi
+        exit 1
+      fi
       /bin/sleep 0.05
     done ;;
   *) exit 1 ;;
@@ -115,8 +163,11 @@ exec /bin/sleep 120`);
   const hooks = new Map();
   xcodebug({ cwd: repo, registerTool(value) { tool = value; }, on(name, fn) { hooks.set(name, fn); },
     registerCommand() {}, sendMessage() {} });
-  const context = { cwd: repo, agentDir: agent, hasUI: true, ui: { setStatus() {}, setWidget() {}, notify() {} } };
-  const call = args => tool.execute("test", { push: "off", dualChannel: false, ...args }, undefined, undefined, context);
+  const notifications = [];
+  const context = { cwd: repo, agentDir: agent, hasUI: true, ui: {
+    setStatus() {}, setWidget() {}, notify(message, level) { notifications.push({ message, level }); },
+  } };
+  const call = (args, signal) => tool.execute("test", { push: "off", dualChannel: false, ...args }, signal, undefined, context);
   const ok = async args => {
     const result = await call(args);
     assert.ok(!result.isError, result.content[0]?.text);
@@ -124,6 +175,7 @@ exec /bin/sleep 120`);
   };
   t.after(async () => {
     try {
+      await Promise.all(["drain-release", "table-release", "table-snapshot-release"].map(name => writeFile(join(root, name), "")));
       await call({ action: "stop" });
       await hooks.get("session_shutdown")();
     } finally {
@@ -132,7 +184,8 @@ exec /bin/sleep 120`);
     }
   });
   return {
-    root, repo, app, git, call, ok,
+    root, repo, app, git, call, ok, notifications,
+    shutdown: () => hooks.get("session_shutdown")(),
     logs: join(agent, "logs", "xcodebug"),
     text: async args => (await ok(args)).content[0].text,
     capture: async () => (await ok({ action: "status" })).details.captures[0],
@@ -152,6 +205,147 @@ async function until(check, what, timeoutMs = 10_000) {
     await delay(50);
   }
 }
+
+function holdLaunchResult(root) {
+  const originalReadFile = fs.promises.readFile;
+  let entered = false;
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  fs.promises.readFile = async (path, ...args) => {
+    const content = await originalReadFile(path, ...args);
+    if (String(path).startsWith(`${root}/`) && /"commandType"\s*:\s*"devicectl\.device\.process\.launch"/.test(String(content))) {
+      entered = true;
+      await pending;
+    }
+    return content;
+  };
+  syncBuiltinESMExports();
+  return { entered: () => entered, release, restore() {
+    release();
+    fs.promises.readFile = originalReadFile;
+    syncBuiltinESMExports();
+  } };
+}
+
+test("session shutdown removes an owned launch result without waiting for its held read", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const metadata = holdLaunchResult(s.root);
+  try {
+    await s.ok({ action: "launch", ...s.prebuilt });
+    await s.flag("die");
+    await until(metadata.entered, "the owned launch-result read to be held");
+    assert.equal((await readdir(s.logs)).filter(name => name.startsWith(".xcodebug-launch-")).length, 1);
+
+    await s.shutdown();
+    assert.deepEqual((await readdir(s.logs)).filter(name => name.startsWith(".xcodebug-launch-")), []);
+    await assert.rejects(s.call({ action: "logs" }), /No active capture/);
+    assert.equal(await s.count("launches"), 1, "shutdown must not restart the app to finish diagnostics");
+  } finally {
+    metadata.restore();
+  }
+});
+
+test("session shutdown cleans pending results after their capture leaves visible history", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const metadata = holdLaunchResult(s.root);
+  try {
+    const first = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+    await s.flag("die");
+    await until(metadata.entered, "the first capture's owned result read to be held");
+    await s.ok({ action: "stop", captureId: first });
+    for (let index = 0; index < 11; index++) {
+      const cycled = (await s.ok({ action: "syslog", device: "test-device", processName: "Cycle" })).details.capture.id;
+      await s.ok({ action: "stop", captureId: cycled });
+    }
+    const visible = (await s.ok({ action: "status" })).details.captures;
+    assert.equal(visible.some(capture => capture.id === first), false, "the old capture must actually be evicted");
+    assert.equal((await readdir(s.logs)).filter(name => name.startsWith(".xcodebug-launch-")).length, 1);
+
+    await s.shutdown();
+    assert.deepEqual((await readdir(s.logs)).filter(name => name.startsWith(".xcodebug-launch-")), []);
+    assert.equal(await s.count("launches"), 1);
+  } finally {
+    metadata.restore();
+  }
+});
+
+test("session shutdown reports failed result deletion even after history eviction", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const original = fs.promises.unlink;
+  t.mock.method(fs.promises, "unlink", async (path, ...args) => {
+    if (String(path).startsWith(join(s.logs, ".xcodebug-launch-")) && String(path).endsWith("/launch.json")) {
+      throw Object.assign(new Error("owned result removal denied"), { code: "EACCES" });
+    }
+    return original(path, ...args);
+  });
+  syncBuiltinESMExports();
+  const stderr = [];
+  t.mock.method(console, "error", (...args) => { stderr.push(args.map(String).join(" ")); });
+  try {
+    const first = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+    await s.flag("die");
+    await until(async () => (await s.capture()).error?.includes("owned result removal denied"), "owned result deletion to fail");
+    await s.ok({ action: "stop", captureId: first });
+    const [resultDirectory] = (await readdir(s.logs)).filter(name => name.startsWith(".xcodebug-launch-"));
+    const path = join(s.logs, resultDirectory);
+    const raw = await readFile(join(path, "launch.json"), "utf8");
+    for (let index = 0; index < 11; index++) {
+      const cycled = (await s.ok({ action: "syslog", device: "test-device", processName: "Cycle" })).details.capture.id;
+      await s.ok({ action: "stop", captureId: cycled });
+    }
+    assert.equal((await s.ok({ action: "status" })).details.captures.some(capture => capture.id === first), false);
+
+    await s.shutdown();
+    assert.equal(await readFile(join(path, "launch.json"), "utf8"), raw);
+    assert.deepEqual((await readdir(path)).sort(), ["launch.json", "owner.json"], "failed deletion must retain ownership proof");
+    const warning = s.notifications.find(notification => notification.level === "warning" && notification.message.includes(first));
+    assert.ok(warning, "session exit must report the evicted capture's failed deletion");
+    assert.ok(warning.message.includes(path));
+    assert.match(warning.message, /cleanup incomplete:.*owned result removal denied/);
+    assert.ok(stderr.some(message => message === warning.message), "headless hosts must receive the same cleanup warning");
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+  }
+});
+
+test("session shutdown joins an unregistered launch startup and prevents a late bridge", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const original = fs.promises.mkdtemp;
+  let directoryCreated;
+  const created = new Promise(resolve => { directoryCreated = resolve; });
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  fs.promises.mkdtemp = async (...args) => {
+    const path = await original(...args);
+    if (String(args[0]).startsWith(join(s.logs, ".xcodebug-launch-"))) {
+      directoryCreated(path);
+      await pending;
+    }
+    return path;
+  };
+  syncBuiltinESMExports();
+  const launching = s.call({ action: "launch", ...s.prebuilt }).then(value => ({ value }), error => ({ error }));
+  try {
+    await created;
+    await assert.rejects(s.call({ action: "logs" }), /No active capture/);
+    let closed = false;
+    const closing = s.shutdown().then(() => { closed = true; });
+    await delay(20);
+    assert.equal(closed, false, "shutdown must join directory creation before claiming cleanup is complete");
+    release();
+    await closing;
+    assert.match((await launching).error?.message ?? "", /session is shutting down/);
+    assert.equal(await s.count("launches"), 0, "the pending launch must never spawn after shutdown");
+    assert.deepEqual((await readdir(s.logs)).filter(name => name.startsWith(".xcodebug-launch-")), []);
+    await assert.rejects(s.call({ action: "logs" }), /No active capture/);
+  } finally {
+    release();
+    await launching;
+    fs.promises.mkdtemp = original;
+    syncBuiltinESMExports();
+  }
+});
 
 test("launch reuses this session's build until the code or the product is no longer what was built", { timeout: 90_000 }, async t => {
   const s = await session(t);
@@ -241,12 +435,12 @@ test("an app that dies under a capture ends it with the reason and its crash rep
   await s.flag("die");
   const waited = await waiting;
   assert.equal(waited.isError, true);
-  assert.match(waited.content[0].text, /^capture ended before "NEVER_LOGGED" appeared \(cursor \d+\) · last line: "App terminated due to signal 9\."/);
+  assert.match(waited.content[0].text, /capture ended before "NEVER_LOGGED" appeared/);
+  assert.match(waited.content[0].text, /system termination: FRONTBOARD 0x8BADF00D: scene-create watchdog transgression/);
+  assert.match(waited.content[0].text, /crash report: \S+Probe-2026-11-19-101010\.ips/);
+  assert.equal(waited.details.terminationReason, "FRONTBOARD 0x8BADF00D: scene-create watchdog transgression");
 
-  const ended = await until(async () => {
-    const capture = await s.capture();
-    return capture.endReason && capture.crashReport ? capture : undefined;
-  }, "the capture to end and its crash report to arrive", 20_000);
+  const ended = await s.capture();
   assert.equal(ended.running, false);
   assert.equal(ended.endReason, 'the app exited; last line before the bridge ended: "App terminated due to signal 9."');
   // This instance's report: not the resource diagnostic dated beside it, and not
@@ -263,6 +457,277 @@ test("an app that dies under a capture ends it with the reason and its crash rep
   const onDisk = await readFile(ended.logFile, "utf8");
   assert.match(onDisk, / \[xcodebug\] the app exited; .+; stopping capture\n/, "why a log stops is part of the log");
   assert.match(onDisk, / \[xcodebug\] crash report: /);
+});
+
+test("an interrupted command returns the system cause and report before replying", { timeout: 60_000 }, async t => {
+  const s = await session(t);
+  const captureId = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+  await s.flag("crash-pid", "4001");
+  await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+  const result = await s.call({ action: "await", captureId,
+    command: `: > '${join(s.root, "die")}'; sleep 1.5; exit 7` });
+  assert.equal(result.isError, true);
+  assert.equal(result.details.exitCode, 7);
+  assert.match(result.content[0].text, /system termination: FRONTBOARD 0x8BADF00D: scene-create watchdog transgression/);
+  assert.match(result.content[0].text, /crash report: \S+Probe-2026-11-19-101010\.ips/);
+  assert.equal(result.details.terminationReason, "FRONTBOARD 0x8BADF00D: scene-create watchdog transgression");
+});
+
+test("command completion stops pending reattach before collecting crash evidence", { timeout: 60_000 }, async t => {
+  const s = await session(t);
+  const launched = await s.ok({ action: "launch", ...s.prebuilt });
+  const result = await s.call({ action: "await", captureId: launched.details.capture.id,
+    command: `: > '${join(s.root, "drop")}'; while kill -0 ${launched.details.capture.pid} 2>/dev/null; do sleep 0.01; done; exit 7` });
+  assert.equal(result.isError, true);
+  assert.equal(result.details.exitCode, 7);
+  assert.equal(result.details.terminationReason, "unavailable: the device returned no matching crash report");
+  assert.equal(result.details.crashReport, undefined);
+  assert.equal(await s.count("launches"), 1, "the finished command must not restart the app while waiting for reports");
+  assert.equal(Number(await readFile(join(s.root, "pid"), "utf8")), launched.details.capture.appPid);
+  assert.doesNotMatch(result.content[0].text, /relaunched the app/);
+  assert.equal((await s.capture()).running, false);
+});
+
+test("a late process-table snapshot of a foreign instance cannot bind its crash report", { timeout: 60_000 }, async t => {
+  const s = await session(t);
+  const metadata = holdLaunchResult(s.root);
+  try {
+    await s.flag("late-table");
+    await s.flag("delayed-table-snapshot");
+    const launching = s.call({ action: "launch", ...s.prebuilt });
+    await until(() => readFile(join(s.root, "table-started")).then(() => true, () => false), "the launch PID query to be held before its snapshot");
+    const captureId = (await s.capture()).id;
+    await s.flag("pid", "9999\n");
+    await s.flag("crash-pid", "9999");
+    await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+    await s.flag("table-snapshot-release");
+    await until(() => readFile(join(s.root, "table-snapshotted")).then(() => true, () => false), "the foreign process snapshot to be saved");
+    const waiting = s.call({ action: "wait", captureId, match: "NEVER_LOGGED" });
+    await s.flag("drop");
+    await until(metadata.entered, "the original launch result read to remain pending after bridge exit");
+    await s.flag("table-release");
+    await launching;
+    metadata.release();
+    const result = await waiting;
+    assert.equal(result.details.crashReport, undefined);
+    assert.doesNotMatch(result.content[0].text, /FRONTBOARD|crash report: /);
+    const ended = await s.capture();
+    assert.equal(ended.appPid, 4001, "owned launch metadata identifies the original instance, not the late table snapshot");
+    assert.equal(ended.crashReport, undefined);
+    assert.equal(Number(await readFile(join(s.root, "pid"), "utf8")), 9999, "the foreign instance is left alone");
+    assert.equal(await s.count("launches"), 1);
+    assert.deepEqual((await readdir(s.logs)).filter(name => name.startsWith("crash-")), []);
+  } finally {
+    metadata.restore();
+  }
+});
+
+test("an already waiting command joins pending launch identity and its matching report", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const metadata = holdLaunchResult(s.root);
+  await s.flag("bad-table");
+  try {
+    const captureId = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+    await s.flag("crash-pid", "4001");
+    await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+    let settled = false;
+    const waiting = s.call({ action: "wait", captureId, match: "NEVER_LOGGED" });
+    void waiting.then(() => { settled = true; }, () => { settled = true; });
+    await s.flag("die");
+    await until(metadata.entered, "the genuine launch result I/O completion to be held");
+    await until(async () => !(await s.capture()).running, "the console drain to finish while launch identity is pending");
+    await delay(0);
+    assert.equal(settled, false, "wait must not reply while exit identity is still unresolved");
+    metadata.release();
+    const result = await waiting;
+    assert.equal(result.isError, true);
+    assert.equal(result.details.terminationReason, "FRONTBOARD 0x8BADF00D: scene-create watchdog transgression");
+    assert.match(await readFile(result.details.crashReport, "utf8"), /"pid" : 4001,/);
+    assert.equal((await s.capture()).appPid, 4001);
+    assert.doesNotMatch(result.content[0].text, /identity.*not verified|unavailable:/);
+  } finally {
+    metadata.restore();
+  }
+});
+
+test("caller cancellation interrupts pending launch identity without discarding the exit diagnosis", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const metadata = holdLaunchResult(s.root);
+  const controller = new AbortController();
+  try {
+    await s.flag("bad-table");
+    const captureId = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+    await s.flag("crash-pid", "4001");
+    await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+    const waiting = s.call({ action: "wait", captureId, match: "NEVER_LOGGED" }, controller.signal);
+    await s.flag("die");
+    await until(metadata.entered, "launch identity I/O to remain pending");
+    await until(async () => !(await s.capture()).running, "the console drain to finish");
+    controller.abort();
+    const cancelled = await waiting;
+    assert.equal(cancelled.isError, true);
+    assert.match(cancelled.content[0].text, /cancelled while waiting/);
+    metadata.release();
+    const ended = await until(async () => {
+      const capture = await s.capture();
+      return capture.crashReport ? capture : undefined;
+    }, "the independently owned diagnosis to finish after cancellation");
+    assert.equal(ended.appPid, 4001);
+    assert.equal(ended.terminationReason, "FRONTBOARD 0x8BADF00D: scene-create watchdog transgression");
+    assert.match(await readFile(ended.crashReport, "utf8"), /"pid" : 4001,/);
+  } finally {
+    metadata.restore();
+  }
+});
+
+test("an exit report cancels an in-flight stale process query before it can relaunch", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const captureId = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+  await s.flag("stale-table");
+  await s.flag("drop");
+  await until(async () => readFile(join(s.root, "table-started")).then(() => true, () => false), "the stale process query to start");
+  await s.flag("crash-pid", "4001");
+  await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+  await rm(join(s.root, "pid"));
+  const result = await s.call({ action: "wait", captureId, match: "NEVER_LOGGED" });
+  assert.equal(result.details.terminationReason, "FRONTBOARD 0x8BADF00D: scene-create watchdog transgression");
+  const queryPid = Number(await readFile(join(s.root, "table-pid"), "utf8"));
+  await until(() => {
+    try { process.kill(queryPid, 0); return false; } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+      return true;
+    }
+  }, "the obsolete process query to be cancelled");
+  await s.flag("table-release");
+  assert.equal(await s.count("launches"), 1, "a confirmed exit must never restart the app");
+  assert.equal((await s.capture()).terminationReason, result.details.terminationReason);
+});
+
+test("an immediately failing driver retains natural exit evidence while pipes drain", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const launched = await s.ok({ action: "launch", ...s.prebuilt });
+  await s.flag("hold-pipes");
+  await s.flag("crash-pid", "4001");
+  await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+  const result = await s.call({ action: "await", captureId: launched.details.capture.id,
+    command: `: > '${join(s.root, "die")}'; while kill -0 ${launched.details.capture.pid} 2>/dev/null; do sleep 0.01; done; exit 7` });
+  await s.flag("drain-release");
+  assert.equal(result.details.exitCode, 7);
+  assert.equal(result.details.terminationReason, "FRONTBOARD 0x8BADF00D: scene-create watchdog transgression");
+  assert.match(result.content[0].text, /system termination: FRONTBOARD 0x8BADF00D/);
+  assert.match(await readFile(result.details.crashReport, "utf8"), /"pid" : 4001,/);
+});
+
+test("an unavailable process table does not hide the owned launch identity or its report", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  await s.flag("bad-table");
+  const launched = await s.ok({ action: "launch", ...s.prebuilt });
+  assert.equal(launched.details.capture.appPid, undefined);
+  await s.flag("crash-pid", "4001");
+  await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+  const waiting = s.call({ action: "wait", captureId: launched.details.capture.id, match: "NEVER_LOGGED" });
+  await s.flag("die");
+  const result = await waiting;
+  assert.equal(result.details.terminationReason, "FRONTBOARD 0x8BADF00D: scene-create watchdog transgression");
+  assert.match(await readFile(result.details.crashReport, "utf8"), /"pid" : 4001,/);
+  assert.equal((await s.capture()).appPid, 4001);
+});
+
+test("missing or malformed native launch results never fall back to table PID or app name", { timeout: 60_000 }, async t => {
+  const nativeResult = { info: { commandType: "devicectl.device.process.launch", outcome: "success" },
+    result: { process: { processIdentifier: 4001, executable: "/private/X/Probe.app/Probe" } } };
+  const cases = [
+    { name: "missing result", missing: true },
+    { name: "invalid JSON", content: '{"info":' },
+    { name: "wrong command", content: JSON.stringify({ ...nativeResult, info: { ...nativeResult.info, commandType: "devicectl.device.info.processes" } }) },
+    { name: "failed outcome", content: JSON.stringify({ ...nativeResult, info: { ...nativeResult.info, outcome: "failed" } }) },
+    { name: "missing process", content: JSON.stringify({ ...nativeResult, result: {} }) },
+    { name: "invalid PID", content: JSON.stringify({ ...nativeResult, result: { process: { ...nativeResult.result.process, processIdentifier: 0 } } }) },
+  ];
+  for (const entry of cases) await t.test(entry.name, async t => {
+    const s = await session(t);
+    if (entry.missing) await s.flag("no-launch-result");
+    else await s.flag("launch-result", entry.content);
+    const launched = await s.ok({ action: "launch", ...s.prebuilt });
+    assert.equal(launched.details.capture.appPid, 4001, "the operational process-table PID is available before exit");
+    await s.flag("crash-pid", "4001");
+    await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+    const waiting = s.call({ action: "wait", captureId: launched.details.capture.id, match: "NEVER_LOGGED" });
+    await s.flag("die");
+    const result = await waiting;
+    assert.match(result.details.terminationReason, /unavailable:.*identity.*not verified/);
+    assert.equal(result.details.crashReport, undefined);
+    assert.doesNotMatch(result.content[0].text, /FRONTBOARD|crash report: /);
+    assert.deepEqual((await readdir(s.logs)).filter(name => name.startsWith("crash-")), []);
+  });
+});
+
+test("an interrupted reattached app reports its own crash, not the previous bridge's search", { timeout: 60_000 }, async t => {
+  const s = await session(t);
+  const captureId = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+  await s.flag("drop");
+  await until(async () => {
+    const capture = await s.capture();
+    return capture.running && capture.relaunches === 1 && capture.appPid === 4002;
+  }, "the reattached instance to start");
+  const waiting = s.call({ action: "wait", captureId, match: "NEVER_LOGGED" });
+  await s.flag("crash-pid", "4002");
+  await s.flag("crash-name", "Probe-2026-11-19-111111.ips");
+  await s.flag("die");
+  const result = await waiting;
+  assert.equal(result.details.terminationReason, "FRONTBOARD 0x8BADF00D: scene-create watchdog transgression");
+  assert.match(await readFile(result.details.crashReport, "utf8"), /"pid" : 4002,/);
+});
+
+test("crash evidence collection remains cancellable", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const captureId = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+  const controller = new AbortController();
+  const waiting = s.call({ action: "wait", captureId, match: "NEVER_LOGGED" }, controller.signal);
+  await s.flag("die");
+  await until(async () => (await s.capture()).endReason, "app death to be confirmed");
+  controller.abort();
+  const result = await waiting;
+  assert.match(result.content[0].text, /cancelled while waiting/);
+});
+
+test("stopping during launch PID discovery never opens a syslog companion", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  await s.flag("slow-table");
+  await s.flag("crash-pid", "4001");
+  await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+  const launching = s.call({ action: "launch", ...s.prebuilt, dualChannel: true }, new AbortController().signal);
+  await until(async () => (await s.count("launches")) === 1, "the console launch to start");
+  await s.ok({ action: "stop", keepApp: true });
+  await launching;
+  const status = await s.ok({ action: "status" });
+  assert.equal(status.details.captures.some(capture => capture.running), false, "stop must leave no background log channel");
+  assert.equal(status.details.captures.some(capture => capture.terminationReason || capture.crashReport), false,
+    "a manually stopped bridge must not initiate a crash search even if a candidate report exists");
+});
+
+test("crash metadata uses the report PID and supports standalone and Apple JSON", { timeout: 30_000 }, async t => {
+  const cases = [
+    { name: "standalone JSON", content: JSON.stringify({ pid: 4001, termination: { namespace: "SIGNAL", code: 11, indicator: "Segmentation fault: 11" } }), expected: "SIGNAL 0xB: Segmentation fault: 11" },
+    { name: "empty reasons with indicator", content: JSON.stringify({ pid: 4001, termination: { namespace: "SIGNAL", code: 6, reasons: [], indicator: "Abort trap: 6" } }), expected: "SIGNAL 0x6: Abort trap: 6" },
+    { name: "Apple header", content: '{"bug_type":"309"}\n' + JSON.stringify({ pid: 4001, termination: { namespace: "FRONTBOARD", code: "0x8BADF00D", reasons: [null, "scene-create watchdog transgression"] } }), expected: "FRONTBOARD 0x8BADF00D: scene-create watchdog transgression" },
+    { name: "missing termination", content: JSON.stringify({ pid: 4001 }), expected: undefined },
+    { name: "malformed JSON", content: '{"pid":4001,', rejected: true },
+    { name: "another process nested in the report", content: JSON.stringify({ pid: 9999, child: { pid: 4001 } }), rejected: true },
+  ];
+  for (const entry of cases) await t.test(entry.name, async t => {
+    const s = await session(t);
+    await mkdir(s.logs, { recursive: true });
+    await s.flag("crash-name", "Probe-2026-11-19-101010.ips");
+    await s.flag("crash-pid", "4001");
+    await s.flag("crash-content", entry.content);
+    const report = await pullCrashReport({ id: "test-device" }, "Probe", { since: Date.now() - 5000, pid: 4001, directory: s.logs });
+    if (entry.rejected) assert.equal(report, undefined);
+    else {
+      assert.equal(report.terminationReason, entry.expected);
+      assert.equal(await readFile(report.path, "utf8"), entry.content);
+    }
+  });
 });
 
 test("a console reattach is reported as the relaunch it is", { timeout: 60_000 }, async t => {
