@@ -94,16 +94,23 @@ claude mcp list     # xcodebug: … ✔ Connected
 
 After installing the package, run the setup command once to register the MCP
 server when missing and add the timeout without replacing an existing xcodebug
+command or argument list:
 
 ```bash
 xcodebug-setup-codex
 ```
 
 From a checkout, use `node bin/xcodebug-setup-codex.mjs`. The command uses the
-Codex app-server config API. It registers xcodebug with Bun if it is missing,
-then writes `tool_timeout_sec = 4200`. It does not run automatically during npm
-install because package installation should not silently modify a user's Codex
-configuration. The equivalent manual setting is:
+Codex app-server config API available in current Codex releases. It registers
+xcodebug with Bun if it is missing, then writes `tool_timeout_sec = 4200` only
+when that field is absent. An existing custom timeout is preserved. The command
+warns when a `.codex/config.toml` in the current directory or a parent defines
+the same project-level xcodebug server; that project configuration can override
+the user-level setting. It also warns when an existing registration points to
+another server path. It does not migrate or edit project configuration, and it
+does not run automatically during npm install because package installation
+should not silently modify a user's Codex configuration. If the installed
+Codex does not support the config API, use the manual TOML setting below.
 
 ```toml
 [mcp_servers.xcodebug]
