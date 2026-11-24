@@ -649,6 +649,26 @@ test("caller cancellation interrupts pending launch identity without discarding 
   }
 });
 
+test("wait deadline includes a pending native exit diagnosis without a caller signal", { timeout: 15000 }, async t => {
+  const s = await session(t);
+  const metadata = holdLaunchResult(s.root);
+  let timer;
+  try {
+    await s.flag("bad-table");
+    const captureId = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+    const waiting = s.call({ action: "wait", captureId, match: "NEVER_LOGGED", timeoutSeconds: 1 });
+    await s.flag("die");
+    await until(metadata.entered, "the exit diagnosis to wait for owned launch metadata");
+    const result = await Promise.race([waiting, new Promise(resolve => { timer = setTimeout(resolve, 2500); })]);
+    assert.ok(result, "the wait deadline must include pending exit diagnostics");
+    assert.equal(result.isError, true);
+    assert.equal(result.details.crashReport, undefined);
+  } finally {
+    clearTimeout(timer);
+    metadata.restore();
+  }
+});
+
 test("an exit report cancels an in-flight stale process query before it can relaunch", { timeout: 30_000 }, async t => {
   const s = await session(t);
   const captureId = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;

@@ -824,23 +824,26 @@ export default function xcodebug(pi: ExtensionAPI): void {
     crashSearches.set(capture.id, { launch, result, identity, promise });
   };
 
-  const waitForCrashReport = async (capture: Capture, signal?: AbortSignal): Promise<void> => {
+  const waitForCrashReport = async (capture: Capture, signal?: AbortSignal, timeoutMs?: number): Promise<void> => {
     const job = crashSearches.get(capture.id);
     if (!job || !isCurrentBridge(capture, job.launch, job.result) || signal?.aborted) return;
     const pending = job.promise;
-    if (!signal) {
+    if (!signal && timeoutMs === undefined) {
       await pending;
       return;
     }
     let onAbort: () => void = () => {};
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const cancelled = new Promise<void>(resolve => {
       onAbort = () => resolve();
-      signal.addEventListener("abort", onAbort, { once: true });
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (timeoutMs !== undefined) timer = setTimeout(onAbort, timeoutMs);
     });
     try {
       await Promise.race([pending, cancelled]);
     } finally {
-      signal.removeEventListener("abort", onAbort);
+      signal?.removeEventListener("abort", onAbort);
+      clearTimeout(timer);
     }
   };
 
@@ -1907,9 +1910,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       let text = result.text;
       if (result.ended && !result.cancelled && !result.timedOut && result.matched === 0) {
         const remaining = Math.max(0, timeoutMs - (Date.now() - waitStarted));
-        const deadline = AbortSignal.timeout(remaining);
-        const crashSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
-        await waitForCrashReport(capture, crashSignal);
+        await waitForCrashReport(capture, signal, remaining);
         text = signal?.aborted ? `cancelled while waiting (cursor ${result.cursor})` : appendEvidenceNote(text, whyEnded(capture));
       }
       if (!result.cancelled && !signal?.aborted && result.missing === 0) rememberCursor(capture, result.cursor);

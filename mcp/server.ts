@@ -23,6 +23,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { validateParameters } from "../parameters.ts";
+import { asRecord, asString } from "../exec.ts";
 import { runtimeVersion } from "../version.ts";
 
 /** Only the fields index.ts reads off its context. */
@@ -149,6 +150,36 @@ try {
 const statusResource = { uri: "ui://xcodebug/statusline", name: "xcodebug live status", mimeType: "application/json" };
 const normalizeStatusText = (value: string | undefined): string | undefined =>
   value?.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
+
+function idleCodexStatusline(meta: unknown): string | undefined {
+  const state = asRecord(asRecord(meta)["com.openai/codex-statusline-state"]);
+  const items = asRecord(state.config).statusline_items;
+  if (!Array.isArray(items)) return;
+  const thread = asRecord(state.thread);
+  const model = asRecord(thread.model);
+  const name = asString(model.display_name);
+  const reasoning = asString(model.reasoning_level) ?? "default";
+  const tier = asString(model.service_tier_display_name);
+  const cwd = asString(asRecord(thread.workspace).cwd);
+  const used = asRecord(asRecord(thread.usage).context).used_percentage;
+  const home = homedir();
+  // shortcut: mirror the four configured default items; extend when other items are enabled.
+  return items.map(item => {
+    switch (item) {
+      case "model-with-reasoning":
+        return name ? `${name} ${reasoning}${tier ? ` ${tier.toLowerCase()}` : ""}` : undefined;
+      case "current-dir":
+        return cwd === home ? "~" : cwd?.startsWith(`${home}/`) ? `~${cwd.slice(home.length)}` : cwd;
+      case "context-remaining":
+        return typeof used === "number" && Number.isInteger(used) && used >= 0 && used <= 100
+          ? `Context ${100 - used}% left` : undefined;
+      case "fast-mode":
+        return tier ?? (model.service_tier === "normal" ? "Standard" : undefined);
+      default:
+        return undefined;
+    }
+  }).filter(Boolean).join(" · ") || undefined;
+}
 const uiTool = {
   name: "xcodebug_ui",
   description: "Read the current display snapshot for the xcodebug Claude Code mod. For capture details or log analysis use xcodebug with action=status or action=logs.",
@@ -355,7 +386,8 @@ input.on("line", (line) => {
     }
     const { status, rows } = uiSnapshot;
     const capturing = rows[0]?.startsWith("Xcodebug · capturing ");
-    const label = capturing ? status?.replace(/ · \/xcodebug stop to end$/, "") : status;
+    const label = (capturing ? status?.replace(/ · \/xcodebug stop to end$/, "") : status) ??
+      (rows.length === 0 ? idleCodexStatusline((message.params as { _meta?: unknown } | undefined)?._meta) : undefined);
     // Keep every text leaf valid UTF-8; Codex rejects UI trees containing lone surrogates.
     const normalized = normalizeStatusText(label);
     const preview = normalized && normalized.length > 1024

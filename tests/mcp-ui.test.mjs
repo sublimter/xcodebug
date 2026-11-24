@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
@@ -124,12 +124,43 @@ done
   });
   const [entry] = tools.find(tool => tool.name === "xcodebug_ui")._meta["openai/ui"].entrypoints;
   assert.equal(entry.type, "statusline");
-  const statusline = async () => {
-    const { contents: [resource] } = await request("resources/read", { uri: entry.resourceUri });
+  const statusline = async state => {
+    const { contents: [resource] } = await request("resources/read", {
+      uri: entry.resourceUri,
+      ...(state ? { _meta: { "com.openai/codex-statusline-state": state } } : {}),
+    });
     assert.equal(resource.mimeType, "application/json");
     return JSON.parse(resource.text);
   };
+  const codexState = {
+    config: { statusline_items: ["model-with-reasoning", "current-dir", "context-remaining", "fast-mode"] },
+    thread: {
+      model: { display_name: "GPT-Test", reasoning_level: "high", service_tier: "normal" },
+      workspace: { cwd: join(homedir(), "project") },
+      usage: { context: { used_percentage: 25 } },
+    },
+  };
+  const defaultFooter = "GPT-Test high · ~/project · Context 75% left · Standard";
+  assert.equal(await statusline(codexState), defaultFooter);
   assert.equal(await statusline(), null);
+  await t.test("idle footer omits unconfirmed or unnamed service tiers without losing other fields", async () => {
+    for (const serviceTier of [undefined, "fast"]) {
+      const state = { ...codexState, thread: { ...codexState.thread,
+        model: { ...codexState.thread.model, service_tier: serviceTier },
+      } };
+      assert.equal(await statusline(state), "GPT-Test high · ~/project · Context 75% left");
+    }
+  });
+  await t.test("idle restoration follows each native snapshot and omits unknown context usage", async () => {
+    const nextState = {
+      config: { statusline_items: ["fast-mode", "context-remaining", "current-dir", "model-with-reasoning"] },
+      thread: { ...codexState.thread,
+        model: { display_name: "GPT-Other", reasoning_level: "low", service_tier: "fast", service_tier_display_name: "Fast" },
+        usage: { context: {} },
+      },
+    };
+    assert.equal(await statusline(nextState), "Fast · ~/project · GPT-Other low fast");
+  });
   // The mod reads this file between tool calls; it must say what xcodebug_ui says.
   const { file } = await snapshot();
   const published = async () => JSON.parse(await readFile(file, "utf8"));
@@ -157,14 +188,16 @@ done
     }
     assert.deepEqual((await snapshot()).rows, []);
     assert.deepEqual((await published()).rows, []);
+    assert.equal(await statusline(codexState), defaultFooter);
   });
   await t.test("a long command stays within the Codex text budget and executes unchanged", async () => {
     const command = `: > command-started; while [ ! -f command-release ]; do sleep 0.05; done; printf 'command-complete\\n' # ${"🚀".repeat(4500)}`;
     const running = action({ action: "status", command });
     try {
       await waitForStart("command-started");
-      const footer = await statusline();
+      const footer = await statusline(codexState);
       assert.match(footer, /command:/);
+      assert.doesNotMatch(footer, /GPT-Test|Context 75% left/);
       assert.ok(Buffer.byteLength(footer, "utf8") <= 16 * 1024, "Codex rejects trees over its UTF-8 text budget");
       assert.equal(footer, footer.toWellFormed());
       assert.ok(footer.includes("🚀"), "valid emoji pairs must survive preview normalization");
@@ -176,6 +209,7 @@ done
       assert.match(result.content[0].text, /command-complete/);
     }
     assert.equal(await statusline(), null);
+    assert.equal(await statusline(codexState), defaultFooter);
   });
   await t.test("normalizes malformed short status text", async () => {
     const malformed = String.fromCharCode(0xd800);
@@ -251,7 +285,7 @@ done
   const duringWait = await Promise.race([snapshot(), delay(700).then(() => { throw new Error("UI read was blocked by wait"); })]);
   assert.equal(waitSettled, false);
   assert.ok(duringWait.rows.some(row => row.includes("UI heartbeat")));
-  const footer = await Promise.race([statusline(), delay(700).then(() => { throw new Error("statusline was blocked by wait"); })]);
+  const footer = await Promise.race([statusline(codexState), delay(700).then(() => { throw new Error("statusline was blocked by wait"); })]);
   assert.match(footer.children[0], /capturing/);
   assert.match(footer.children[1], /UI heartbeat/);
   assert.doesNotMatch(footer.children[0], /\/xcodebug stop/);
@@ -261,6 +295,7 @@ done
   assert.deepEqual((await snapshot()).rows, [], "stopped captures must clear the band");
   assert.deepEqual((await published()).rows, [], "the file must clear with the band");
   assert.equal(await statusline(), null);
+  assert.equal(await statusline(codexState), defaultFooter);
 });
 
 // Claude Code ends a stdio server with SIGINT, not by closing its stdin.

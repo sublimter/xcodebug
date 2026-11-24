@@ -113,9 +113,11 @@ requirements, upgrade/disable steps and missing-display troubleshooting.
 
 For an optional footer in Codex CLI 0.171.0 or later, follow the
 [Codex live display setup](README.md#codex-live-display-experimental). The
-footer shows the current operation or one running capture and its
-latest log line. It refreshes between tool calls and clears once no operation
-or capture remains. Use `logs` or `wait` to bring log evidence into the conversation.
+footer shows xcodebug's operation or running capture and its latest log line.
+After all operations and captures end, it restores the configured model/reasoning,
+directory, context-remaining, and fast-mode content from Codex's current snapshot.
+Select the provider once; no manual switching is needed per run. Other native
+items and styling are not mirrored. Use `logs` or `wait` for log evidence.
 
 ## Running a command alongside a capture
 

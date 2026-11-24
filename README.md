@@ -185,10 +185,17 @@ See Codex's
 [provider configuration](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/app/status_line_settings.rs)
 and [discovery deadline](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/statusline_provider.rs).
 
-The footer shows the current operation or capture and its latest log line. It
-refreshes even between tool calls and clears when no operation or capture is
-active. This is a display preview, not a log stream into the conversation; use
-`action=logs` or `action=wait` for log evidence.
+The footer shows xcodebug's operation or running capture and its latest log line,
+including between tool calls. When no operation or capture remains, it restores
+the configured `model-with-reasoning`, `current-dir`, `context-remaining`, and
+`fast-mode` content from Codex's current statusline snapshot, in the configured
+order. Unavailable context usage or tier information is omitted rather than
+shown as a guessed value.
+The provider stays selected; it does not rewrite global settings at each start
+or stop. Codex currently offers no delegation to its native default renderer, so
+other built-in items and their native styling are not mirrored. Clients that do
+not supply a statusline snapshot receive empty idle content. Use `action=logs`
+or `action=wait` for log evidence; the footer does not stream logs into the model.
 Long status text is shortened in the footer without changing the command or
 its output.
 
