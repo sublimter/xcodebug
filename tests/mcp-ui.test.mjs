@@ -100,7 +100,11 @@ done
     await Promise.all(["install-release", "build-release", "command-release", "unicode-release"].map(name => writeFile(join(root, name), "")));
     try { await action({ action: "stop" }); } finally {
       child.stdin.end();
-      child.kill();
+      if (child.exitCode === null) {
+        const exited = new Promise(resolve => child.once("exit", resolve));
+        child.kill();
+        await exited;
+      }
       for (const entry of pending.values()) clearTimeout(entry.timer);
       await rm(root, { recursive: true, force: true });
     }
