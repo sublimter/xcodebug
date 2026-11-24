@@ -119,7 +119,7 @@ async function session(t) {
         printf 'App terminated due to signal 9.\\n'
         write_launch_result
         if [ -f "$root/hold-pipes" ]; then
-          (while [ ! -f "$root/drain-release" ]; do /bin/sleep 0.01; done) &
+          (while [ -d "$root" ] && [ ! -f "$root/drain-release" ]; do /bin/sleep 0.01; done) &
         fi
         exit 1
       fi
@@ -130,6 +130,7 @@ esac`);
   await script("xcodebuild", `case " $* " in
   *" -version "*) echo "Xcode fake" ;;
   *" -showBuildSettings "*) printf '%s\\n' '${JSON.stringify([{ buildSettings: {
+    PRODUCT_TYPE: "com.apple.product-type.application", PLATFORM_NAME: "iphoneos",
     TARGET_BUILD_DIR: join(root, "out"), WRAPPER_NAME: "Probe.app", PRODUCT_BUNDLE_IDENTIFIER: "test.probe" } }])}' ;;
   *)
     echo built >> "$root/builds"
@@ -226,6 +227,74 @@ function holdLaunchResult(root) {
     syncBuiltinESMExports();
   } };
 }
+
+test("unknown arguments and invalid types are rejected before any device work", async t => {
+  const s = await session(t);
+  await assert.rejects(s.call({ action: "status", typo: true }), /unknown.*typo/i);
+  await assert.rejects(s.call({ action: "status", since: "3" }), /since/);
+  await assert.rejects(s.call({ action: "launch", ...s.prebuilt, unexpected: 1 }), /unknown.*unexpected/i);
+  assert.equal(await s.count("launches"), 0);
+});
+
+test("a second wait uses the delivered cursor and explicit since=0 can replay old evidence", { timeout: 15000 }, async t => {
+  const s = await session(t);
+  const id = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+  const first = await s.ok({ action: "wait", captureId: id, match: "instance 1 logging", timeoutSeconds: 1 });
+  assert.equal(first.details.matched, 1);
+  const second = await s.call({ action: "wait", captureId: id, match: "instance 1 logging", timeoutSeconds: 1 });
+  assert.equal(second.isError, true, second.content[0].text);
+  assert.match(second.content[0].text, /timed out/);
+  const replay = await s.ok({ action: "wait", captureId: id, match: "instance 1 logging", since: 0 });
+  assert.match(replay.content[0].text, /predates this wait/);
+});
+
+test("absence assertion passes only a complete live interval and fails on a forbidden line", { timeout: 15000 }, async t => {
+  const s = await session(t);
+  const id = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+  const passed = await s.ok({ action: "wait", captureId: id, match: "NEVER_LOGGED", absent: true, timeoutSeconds: 1 });
+  assert.equal(passed.details.assertion, "absent");
+  assert.match(passed.content[0].text, /no matching line observed/);
+  const forbidden = await s.call({ action: "wait", captureId: id, match: "instance 1 logging", absent: true, since: 0, timeoutSeconds: 1 });
+  assert.equal(forbidden.isError, true);
+  assert.match(forbidden.content[0].text, /forbidden/);
+  await s.ok({ action: "stop", captureId: id });
+  const incomplete = await s.call({ action: "wait", captureId: id, match: "NEVER_LOGGED", absent: true, timeoutSeconds: 1 });
+  assert.equal(incomplete.isError, true);
+  assert.match(incomplete.content[0].text, /inconclusive/);
+});
+
+test("run records survive a new server session and bind command, build and capture identity", { timeout: 20000 }, async t => {
+  const s = await session(t);
+  const started = await s.ok({ action: "launch", ...s.built });
+  const id = started.details.capture.id;
+  const run = await s.call({ action: "await", captureId: id, command: "exit 7 # private-run-argument" });
+  assert.equal(run.details.exitCode, 7);
+  await assert.rejects(s.call({ action: "history", captureId: id, command: "exit 0" }), /read-only/);
+  const first = await s.call({ action: "history", captureId: id });
+  assert.ok(!first.isError, first.content[0].text);
+  assert.equal(first.details.runs[0].captureId, id);
+  assert.equal(first.details.runs[0].command.exitCode, 7);
+  assert.ok(first.details.runs[0].gitHead);
+  assert.ok(first.details.runs[0].fingerprint);
+  assert.equal(first.details.runs[0].build.source, "built");
+  assert.match(first.details.runs[0].build.logFile, /build-.*\.log$/);
+  assert.equal(first.details.runs[0].command.label, "exit");
+  assert.match(first.details.runs[0].command.sha256, /^[a-f0-9]{64}$/);
+  const stored = await readFile(join(s.logs, "runs", `${id}.json`), "utf8");
+  assert.doesNotMatch(stored, /private-run-argument/);
+  assert.equal(first.details.runs[0].running, false);
+  await s.shutdown();
+  let tool;
+  const hooks = new Map();
+  xcodebug({ cwd: s.repo, registerTool(value) { tool = value; }, on(name, fn) { hooks.set(name, fn); }, registerCommand() {}, sendMessage() {} });
+  const context = { cwd: s.repo, agentDir: join(s.root, "agent"), hasUI: false, ui: { setStatus() {}, setWidget() {}, notify() {} } };
+  try {
+    const result = await tool.execute("history", { action: "history", captureId: id }, undefined, undefined, context);
+    assert.equal(result.details.runs[0].captureId, id);
+    assert.equal(result.details.runs[0].command.exitCode, 7);
+    assert.equal(result.details.runs[0].logFile, started.details.capture.logFile);
+  } finally { await hooks.get("session_shutdown")(); }
+});
 
 test("session shutdown removes an owned launch result without waiting for its held read", { timeout: 20_000 }, async t => {
   const s = await session(t);
@@ -417,9 +486,9 @@ test("a line the buffer has dropped is still found, and the reply says where it 
   assert.match(tail, /\nnote: 10001 older line\(s\) are no longer in memory; read them from \S+\.log$/);
   assert.doesNotMatch(await s.text({ action: "logs", captureId, since: 29_990 }), /note:/);
 
-  // One wait for either outcome of a step, which a substring cannot express.
-  assert.match(await s.text({ action: "wait", captureId, match: "^EARLY_(MARKER|FAILURE) ", regex: true, timeoutSeconds: 5 }), /^matched 1 line/);
-  const literal = await s.call({ action: "wait", captureId, match: "^EARLY_(MARKER|FAILURE) ", timeoutSeconds: 1 });
+  // Replay the original interval to compare regex and substring matching.
+  assert.match(await s.text({ action: "wait", captureId, since: 0, match: "^EARLY_(MARKER|FAILURE) ", regex: true, timeoutSeconds: 5 }), /^matched 1 line/);
+  const literal = await s.call({ action: "wait", captureId, since: 0, match: "^EARLY_(MARKER|FAILURE) ", timeoutSeconds: 1 });
   assert.match(literal.content[0].text, /^timed out after 1s waiting for "\^EARLY_\(MARKER\|FAILURE\) "/);
   await assert.rejects(s.call({ action: "wait", captureId, match: "EARLY_(", regex: true }), /is not a valid regular expression/);
 });

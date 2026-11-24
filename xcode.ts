@@ -6,8 +6,9 @@
  * os_log output as well. No jailbreak and no debugger attach are involved.
  */
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { asRecord, asString, lastLines, runCommand, timestamp } from "./exec.ts";
+import { basename, dirname, join, resolve } from "node:path";
+import { asString, lastLines, runCommand, timestamp } from "./exec.ts";
+import { appBuildSettings } from "./project.ts";
 import { BuildProgressTracker, formatProgress } from "./progress.ts";
 import type { DeviceInfo } from "./devices.ts";
 
@@ -204,8 +205,6 @@ export async function buildForDevice(
       summary: `${reason}\n${detail}`,
     };
   }
-  options.onProgress?.(formatProgress(tracker.finish("done")));
-
   // Resolve the product path from the SAME destination the build used. Without
   // -destination, xcodebuild reports the default platform (maccatalyst for a
   // framework scheme), and appPath would point at the wrong product.
@@ -219,40 +218,32 @@ export async function buildForDevice(
       signal: options.signal,
     },
   );
-  let buildDir: string | undefined;
-  let wrapper: string | undefined;
-  let bundleId: string | undefined;
-  if (settings.code === 0) {
-    try {
-      const parsed = JSON.parse(settings.stdout);
-      const entries = Array.isArray(parsed) ? parsed : [parsed];
-      for (const entry of entries) {
-        const values = asRecord(asRecord(entry).buildSettings);
-        if (asString(values.TARGET_BUILD_DIR) && asString(values.WRAPPER_NAME)) {
-          buildDir = asString(values.TARGET_BUILD_DIR);
-          wrapper = asString(values.WRAPPER_NAME);
-          bundleId = asString(values.PRODUCT_BUNDLE_IDENTIFIER);
-          break;
-        }
-      }
-    } catch {
-      // Fall through to the log-only success report.
+  try {
+    if (settings.code !== 0 || settings.truncated) {
+      throw new Error(settings.truncated ? "xcodebuild -showBuildSettings output was truncated." :
+        `xcodebuild -showBuildSettings failed (exit ${settings.code}): ${lastLines(settings.stderr || settings.stdout, 5)}`);
     }
+    const values = appBuildSettings(JSON.parse(settings.stdout), target.scheme);
+    if (!values) throw new Error(`No installable iOS app target in scheme ${target.scheme}.`);
+    const buildDir = asString(values.TARGET_BUILD_DIR);
+    const wrapper = asString(values.WRAPPER_NAME ?? values.FULL_PRODUCT_NAME);
+    if (!buildDir || !wrapper?.endsWith(".app") || basename(wrapper) !== wrapper) {
+      throw new Error(`Missing app product path in build settings for scheme ${target.scheme}.`);
+    }
+    const appPath = resolve(options.cwd, buildDir, wrapper);
+    const [executable, bundleId] = await Promise.all([
+      readPlistValue(appPath, "CFBundleExecutable"), readPlistValue(appPath, "CFBundleIdentifier"),
+    ]);
+    options.onProgress?.(formatProgress(tracker.finish("done")));
+    return {
+      ok: true, appPath, executable: executable ?? asString(values.EXECUTABLE_NAME),
+      bundleId: bundleId ?? asString(values.PRODUCT_BUNDLE_IDENTIFIER), logFile, durationMs,
+      summary: `build succeeded in ${(durationMs / 1000).toFixed(1)}s\napp: ${appPath}`,
+    };
+  } catch (error) {
+    options.onProgress?.(formatProgress(tracker.finish("failed")));
+    return { ok: false, logFile, durationMs, summary: `Cannot resolve the built iOS app: ${(error as Error).message}` };
   }
-
-  const appPath = buildDir && wrapper ? join(buildDir, wrapper) : undefined;
-  const executable = appPath ? await readPlistValue(appPath, "CFBundleExecutable") : undefined;
-  const plistBundleId = appPath ? await readPlistValue(appPath, "CFBundleIdentifier") : undefined;
-
-  return {
-    ok: true,
-    appPath,
-    bundleId: plistBundleId ?? bundleId,
-    executable,
-    logFile,
-    durationMs,
-    summary: `build succeeded in ${(durationMs / 1000).toFixed(1)}s${appPath ? `\napp: ${appPath}` : ""}`,
-  };
 }
 
 export async function installApp(

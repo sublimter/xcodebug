@@ -6,7 +6,6 @@
  * OS_ACTIVITY_DT_MODE=YES, which bridges the app's stdout/stderr plus os_log —
  * the same surface Xcode's debug console shows. No jailbreak, no debugger.
  */
-import { readdir, readFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 // `import type` is erased at compile time, so this specifier never reaches the
@@ -16,13 +15,18 @@ import { setTimeout as sleep } from "node:timers/promises";
 // the loader maps to the same module, so a fork-only name would tie this file to
 // one distribution of the engine.
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-import { Capture, matchesFilter, type FoundLine } from "./capture.ts";
+import { parameters, parseCommandArgs, validateParameters, type ToolParams } from "./parameters.ts";
+import { Capture } from "./capture.ts";
+import { clipBytes, formatEvidenceLines, formatLogLines, MAX_REPLY_BYTES } from "./log-output.ts";
+import { waitForEvidence } from "./log-wait.ts";
+import { runtimeVersion } from "./version.ts";
+import { commandIdentity, pruneRunHistory, RunHistory, runHistoryResult, type RunIdentity } from "./history.ts";
 import { describeDevices, findProcessPid, listDevices, lookupProcess, pullCrashReport, resolveDevice, type DeviceInfo } from "./devices.ts";
 import { asRecord, lastLines, runCommand, timestamp } from "./exec.ts";
 import { buildForDevice, consoleLaunchArgs, installApp, terminateApp, type BuildOutcome, type BuildTarget } from "./xcode.ts";
 import { checkPodLockSync, describeChanges, detectChanges, directorySignature, runPodInstall, type ChangeReport } from "./changes.ts";
 import { clearArchives, pruneLogs } from "./archive.ts";
+import { detectContainer, readConfigDetails, withContainer, type ProjectConfig } from "./project.ts";
 
 const CAPTURE_PREFIX = "xcodebug";
 const PUSH_INTERVAL_MS = 4_000;
@@ -61,20 +65,7 @@ const LOG_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
  * defaults the file was written to override. Listed as exemptions so that an
  * action added later refuses too.
  */
-const CONFIG_FREE_ACTIONS = new Set(["doctor", "devices", "logs", "wait", "status", "stop", "await"]);
-
-interface ProjectConfig {
-  workspace?: string;
-  project?: string;
-  scheme?: string;
-  configuration?: string;
-  bundleId?: string;
-  device?: string;
-  derivedDataPath?: string;
-  args?: string[];
-  environment?: Record<string, string>;
-}
-
+const CONFIG_FREE_ACTIONS = new Set(["doctor", "devices", "logs", "wait", "history", "status", "stop", "await"]);
 
 interface SessionState {
   captures: Map<string, Capture>;
@@ -89,7 +80,7 @@ interface SessionState {
    * debugs several apps and the build of one says nothing about another. The
    * last entry is the most recent build.
    */
-  builds: Map<string, { fingerprint: string; appPath: string; product: string; bundleId?: string; executable?: string }>;
+  builds: Map<string, { fingerprint: string; gitHead?: string; appPath: string; product: string; logFile: string; bundleId?: string; executable?: string }>;
   /** Old logs are cleared once per session, by its first run. */
   logsPruned?: boolean;
   /** Key of the new-component-file set pod install has already handled. */
@@ -128,6 +119,7 @@ interface SessionState {
     workspace?: string;
     project?: string;
     configuration?: string;
+    xcodebuildArgs?: string[];
     derivedDataPath?: string;
     push?: "off" | "context" | "wake";
     match?: string;
@@ -254,10 +246,10 @@ async function clearArchiveBeforeNewRun(ctx: ExtensionContext): Promise<string |
 }
 
 /** A build is another run's only when target, configuration and device all match. */
-function buildKeyOf(target: BuildTarget, device: DeviceInfo): string {
+function buildKeyOf(target: BuildTarget, device: DeviceInfo, cwd: string): string {
   return JSON.stringify([
     target.workspace, target.project, target.scheme, target.configuration, target.derivedDataPath,
-    device.udid ?? device.id,
+    target.extraArgs ?? [], cwd, device.udid ?? device.id,
   ]);
 }
 
@@ -282,127 +274,6 @@ async function readBundleIdentifier(appPath: string): Promise<string | undefined
   return value.length > 0 ? value : undefined;
 }
 
-async function readConfig(cwd: string): Promise<ProjectConfig> {
-  const path = join(cwd, ".xcodebug.json");
-  let text: string;
-  try {
-    text = await readFile(path, "utf8");
-  } catch {
-    return {};
-  }
-  try {
-    return JSON.parse(text) as ProjectConfig;
-  } catch (error) {
-    // Reading a config that does not parse as "no config" runs with the very
-    // defaults it was written to override - another scheme, another device.
-    throw new Error(`${path} is not valid JSON: ${(error as Error).message}`);
-  }
-}
-
-/**
- * Find the Xcode container that owns this directory.
- *
- * Walks up from cwd. Which container to use is decided by CocoaPods, not by
- * what happens to be on disk:
- *   - a directory holding `Podfile` or `Podfile.lock` is a CocoaPods project,
- *     and its `.xcworkspace` is the container that links the Pods targets;
- *   - otherwise a plain `.xcodeproj` is used as-is.
- *
- * Scanning only cwd fails as soon as the user runs the command from a
- * subdirectory, so the walk covers up to 8 levels.
- */
-async function detectContainer(cwd: string): Promise<{
-  workspace?: string;
-  project?: string;
-  cocoaPods: boolean;
-  /** App containers found below cwd when more than one matched. */
-  ambiguous?: string[];
-}> {
-  let dir = cwd;
-  for (let depth = 0; depth < 8; depth += 1) {
-    let entries: import("node:fs").Dirent[];
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      break;
-    }
-    const names = new Set(entries.map((e) => e.name));
-    const isCocoaPods = names.has("Podfile") || names.has("Podfile.lock");
-    const workspace = entries.find((e) => e.isDirectory() && e.name.endsWith(".xcworkspace"));
-    const project = entries.find((e) => e.isDirectory() && e.name.endsWith(".xcodeproj"));
-
-    if (isCocoaPods) {
-      // CocoaPods project: the workspace is required. If it is missing, the
-      // user still needs `pod install`, but the project is the only container.
-      if (workspace) return { workspace: join(dir, workspace.name), cocoaPods: true };
-      if (project) return { project: join(dir, project.name), cocoaPods: true };
-    } else if (project) {
-      return { project: join(dir, project.name), cocoaPods: false };
-    }
-
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-
-  // Nothing above qualified. A monorepo can keep its app one level down (this
-  // repo has Example/ here and no container at the root at all).
-  const below = await findAppContainerBelow(cwd);
-  if (below.container) return below.container;
-  return { cocoaPods: false, ambiguous: below.ambiguous };
-}
-
-/**
- * Look for the app container *below* cwd, used only when the upward walk found
- * nothing.
- *
- * The signature is deliberately narrow: a directory counts only if it holds a
- * `Podfile` and an `.xcworkspace` side by side. That is what an app project
- * looks like, and it excludes the pod-only projects a monorepo is full of
- * (`Projects/*` here - about a hundred of them - none of which has a Podfile),
- * so they cannot be picked by accident.
- *
- * Ambiguity is reported rather than resolved: choosing which app to build is
- * not a decision this function is entitled to make.
- */
-async function findAppContainerBelow(cwd: string): Promise<{
-  container?: { workspace?: string; project?: string; cocoaPods: boolean };
-  ambiguous: string[];
-}> {
-  const matches: Array<{ workspace: string; dir: string }> = [];
-  const SKIP = new Set(["Pods", "Carthage", "node_modules", ".git", "build", "DerivedData"]);
-
-  const scan = async (dir: string, depth: number): Promise<void> => {
-    if (depth > 2) return;
-    let entries: import("node:fs").Dirent[];
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    const names = new Set(entries.map((e) => e.name));
-    if (names.has("Podfile")) {
-      const workspace = entries.find((e) => e.isDirectory() && e.name.endsWith(".xcworkspace"));
-      if (workspace) {
-        matches.push({ workspace: join(dir, workspace.name), dir });
-        // A matched app is the answer for its subtree; do not look inside it.
-        return;
-      }
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      if (entry.name.startsWith(".") || SKIP.has(entry.name)) continue;
-      if (entry.name.endsWith(".xcodeproj") || entry.name.endsWith(".xcworkspace")) continue;
-      await scan(join(dir, entry.name), depth + 1);
-    }
-  };
-
-  await scan(cwd, 0);
-  if (matches.length === 1) return { container: { workspace: matches[0].workspace, cocoaPods: true }, ambiguous: [] };
-  return { ambiguous: matches.map((m) => m.dir) };
-}
-
-/**
 /**
  * How a new capture mirrors lines into the session.
  *
@@ -412,147 +283,6 @@ async function findAppContainerBelow(cwd: string): Promise<{
  */
 function defaultPushMode(params: { push?: "off" | "context" | "wake" }): "off" | "context" | "wake" {
   return params.push ?? "context";
-}
-
-/**
- * Pick the scheme to build.
- *
- * This repo's convention is that the workspace and its app scheme share a name
- * (`MyApp.xcworkspace` -> scheme `MyApp`), so the container's own
- * name is the first guess. It is only a guess: a component demo's workspace
- * name need not match a scheme, so `withContainer` verifies it against
- * `xcodebuild -list` and falls back to reading the scheme files.
- */
-function schemeFromContainer(container: string): string | undefined {
-  const name = container.split("/").pop()?.replace(/\.(xcworkspace|xcodeproj)$/, "");
-  return name && name.length > 0 ? name : undefined;
-}
-
-/**
- * The scheme that builds an installable `.app`, read from the scheme files.
- *
- * A workspace can list hundreds of pod schemes, and probing each with
- * `-showBuildSettings` takes seconds apiece, so this reads the XML instead:
- * an app scheme declares its product as `BuildableName = "X.app"`.
- *
- * A workspace usually holds no schemes of its own: the schemes live in the
- * sibling `.xcodeproj` that the workspace wraps (in this repo,
- * `MyApp.xcworkspace` has none while `MyApp.xcodeproj` has them), so
- * both are scanned.
- */
-async function appSchemeFromFiles(containerPath: string): Promise<{
-  scheme?: string;
-  /** Directories that were searched, so a failure can say where it looked. */
-  searched: string[];
-}> {
-  const candidates: string[] = [];
-  const searched: string[] = [];
-  // A workspace wraps its .xcodeproj and usually keeps no schemes itself, so the
-  // sibling project (same directory, same base name) is scanned too.
-  const roots = [containerPath];
-  if (containerPath.endsWith(".xcworkspace")) {
-    const sibling = containerPath.replace(/\.xcworkspace$/, ".xcodeproj");
-    try {
-      await readdir(sibling);
-      roots.push(sibling);
-    } catch {
-      // No sibling project; the workspace's own schemes are all there is.
-    }
-  }
-  const dirs: string[] = [];
-  for (const root of roots) {
-    dirs.push(join(root, "xcshareddata", "xcschemes"));
-    const users = join(root, "xcuserdata");
-    try {
-      for (const entry of await readdir(users, { withFileTypes: true })) {
-        if (entry.isDirectory() && entry.name.endsWith(".xcuserdatad")) {
-          dirs.push(join(users, entry.name, "xcschemes"));
-        }
-      }
-    } catch {
-      // No per-user schemes; the shared directory is still worth trying.
-    }
-  }
-  for (const dir of dirs) {
-    searched.push(dir);
-    try {
-      for (const entry of await readdir(dir, { withFileTypes: true })) {
-        if (!entry.isFile() || !entry.name.endsWith(".xcscheme")) continue;
-        const file = join(dir, entry.name);
-        try {
-          const xml = await readFile(file, "utf8");
-          if (/BuildableName\s*=\s*"[^"]*\.app"/.test(xml)) {
-            candidates.push(entry.name.replace(/\.xcscheme$/, ""));
-          }
-        } catch {
-          // An unreadable scheme is simply not a candidate; the error surfaces
-          // through the "searched" list when nothing is found at all.
-        }
-      }
-    } catch {
-      // Directory absent or unreadable - recorded in `searched` either way.
-    }
-  }
-  return { scheme: candidates[0], searched };
-}
-
-/**
- * Ask xcodebuild for the schemes it knows.
- *
- * The three outcomes must stay distinct: "listed, and the guess is there",
- * "listed, and it is not", and "could not list". Collapsing the last into an
- * empty list made a failed `xcodebuild -list` silently accept a guessed scheme,
- * which then failed later with an unrelated-looking build error.
- */
-async function listSchemes(
-  container: { workspace?: string; project?: string },
-  cwd: string,
-): Promise<{ ok: boolean; schemes: string[]; reason?: string }> {
-  const flag = container.workspace ? "-workspace" : "-project";
-  const path = container.workspace ?? container.project;
-  if (!path) return { ok: false, schemes: [], reason: "no container" };
-  const result = await runCommand("xcodebuild", [flag, path, "-list", "-json"], { cwd, timeoutMs: 120_000 });
-  if (result.code !== 0) {
-    return {
-      ok: false,
-      schemes: [],
-      reason: `xcodebuild -list exited ${result.code}: ${(result.stderr || result.stdout).trim().slice(0, 200)}`,
-    };
-  }
-  try {
-    const parsed = JSON.parse(result.stdout) as {
-      workspace?: { schemes?: string[] };
-      project?: { schemes?: string[] };
-    };
-    return { ok: true, schemes: parsed.workspace?.schemes ?? parsed.project?.schemes ?? [] };
-  } catch {
-    return { ok: false, schemes: [], reason: "xcodebuild -list returned unparseable JSON" };
-  }
-}
-
-function resolveBuildTarget(config: ProjectConfig, params: {
-  scheme?: string;
-  workspace?: string;
-  project?: string;
-  configuration?: string;
-  derivedDataPath?: string;
-  extraArgs?: string[];
-}): BuildTarget {
-  const scheme = params.scheme ?? config.scheme;
-  if (!scheme) {
-    throw new Error(
-      'No scheme: pass scheme, or add "scheme" to .xcodebug.json in the project root. ' +
-        "List schemes with: xcodebuild -workspace <path>.xcworkspace -list",
-    );
-  }
-  return {
-    scheme,
-    workspace: params.workspace ?? config.workspace,
-    project: params.project ?? config.project,
-    configuration: params.configuration ?? config.configuration ?? "Debug",
-    derivedDataPath: params.derivedDataPath ?? config.derivedDataPath,
-    extraArgs: params.extraArgs,
-  };
 }
 
 /**
@@ -567,25 +297,6 @@ function toFilter(text: string | undefined, regex: boolean | undefined): string 
   } catch (error) {
     throw new Error(`"${text}" is not a valid regular expression: ${(error as Error).message}`);
   }
-}
-
-/**
- * What a reply owes its reader when the lines asked for start before the buffer
- * does: without it "no match" reads as "never logged" when the line was only
- * evicted. `missing` is absent for a read that did not look on disk.
- */
-function evictedNote(read: { evicted: number; missing?: number }, logFile: string): string {
-  if (read.evicted === 0) return "";
-  if (read.missing === undefined) {
-    return `\nnote: ${read.evicted} older line(s) are no longer in memory; read them from ${logFile}`;
-  }
-  const found = read.evicted - read.missing;
-  const parts = [
-    found > 0 ? `${found} line(s) no longer in memory were searched in ${logFile}` : "",
-    // Overwritten by rotation, or never written: either way this read cannot speak for them.
-    read.missing > 0 ? `${read.missing} line(s) are in neither memory nor the log files and were not searched` : "",
-  ];
-  return `\nnote: ${parts.filter(Boolean).join("; ")}`;
 }
 
 /**
@@ -619,272 +330,28 @@ function whyEnded(capture: Capture): string {
   return `${last ? ` · last line: "${last}"` : ""}${endedNote(capture)}`;
 }
 
-/** Host time of a line, for lining a log up with a test runner's own output. */
-function clock(at: number): string {
-  const date = new Date(at);
-  const pad = (value: number, width = 2): string => String(value).padStart(width, "0");
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)} `;
+function appendEvidenceNote(text: string, note: string): string {
+  const remaining = MAX_REPLY_BYTES - Buffer.byteLength(text);
+  if (Buffer.byteLength(note) <= remaining) return text + note;
+  const marker = "\n[note truncated]";
+  if (remaining < Buffer.byteLength(marker)) return text;
+  return text + clipBytes(note, remaining - Buffer.byteLength(marker)) + marker;
 }
 
-async function formatLogLines(
-  capture: Capture,
-  options: { since: number; limit: number; grep?: string | RegExp; times?: boolean; signal?: AbortSignal },
-): Promise<{ text: string; cursor: number; total: number }> {
-  const { since, limit, grep } = options;
-  // A filtered read looks on disk for what the buffer dropped. An unfiltered one
-  // returns the newest lines anyway, so the dropped ones only add to "omitted".
-  const read = grep ? await capture.search({ since, limit, grep, signal: options.signal }) : capture.read({ since, limit });
-  const total = grep ? read.total : read.total + read.evicted;
-  const note = evictedNote(read, capture.logFile);
-  if (read.lines.length === 0) {
-    const what = grep ? `no line matching ${typeof grep === "string" ? `"${grep}"` : grep}` : "no new lines";
-    return { text: `(${what} since ${since}; capture cursor is ${read.cursor})${note}`, cursor: read.cursor, total: 0 };
-  }
-  const lines: FoundLine[] = read.lines;
-  const body = lines
-    .map((line) => {
-      // In console mode devicectl's own status lines arrive on stdout while the
-      // app's output arrives on stderr, so only stdout needs a label.
-      const tag = capture.mode === "console" && line.stream === "out" ? "[devicectl] " : "";
-      return `${String(line.index).padStart(6, " ")} ${options.times ? clock(line.at) : ""}${tag}${line.text}`;
-    })
-    .join("\n");
-  const omitted = total - lines.length;
-  const header = `${lines.length} line(s)${omitted > 0 ? ` (${omitted} older omitted)` : ""} · cursor ${read.cursor}`;
-  return { text: `${header}\n${body}${note}`, cursor: read.cursor, total };
+function replyText(text: string, action?: string): string {
+  const warning = runtimeVersion.warning();
+  if (!warning) return text;
+  const note = `\n${warning}`;
+  return action === "logs" || action === "wait" ? appendEvidenceNote(text, note) : text + note;
 }
-
-/** Fill in the container when the caller and the config both omit it. */
-async function withContainer(
-  cwd: string,
-  config: ProjectConfig,
-  params: { scheme?: string; workspace?: string; project?: string; configuration?: string; derivedDataPath?: string; extraArgs?: string[] },
-): Promise<BuildTarget> {
-  const detected = await detectContainer(cwd);
-  const workspace = params.workspace ?? config.workspace ?? detected.workspace;
-  const project = params.project ?? config.project ?? detected.project;
-  const configuration = params.configuration ?? config.configuration ?? "Debug";
-  const container = workspace ?? project;
-  // An explicit scheme wins. Otherwise the container's own name is the first
-  // guess, checked against the container's real scheme list: a component demo's
-  // workspace name need not be a scheme, and an unknown scheme makes xcodebuild
-  // fail with a message that hides the real problem.
-  let scheme = params.scheme ?? config.scheme;
-  if (!scheme && container) {
-    const guess = schemeFromContainer(container);
-    if (guess) {
-      const listed = await listSchemes({ workspace, project }, cwd);
-      if (listed.ok && listed.schemes.includes(guess)) {
-        scheme = guess;
-      } else {
-        // Either the guess is absent from a list we could read, or the list
-        // could not be read at all - both need the file scan.
-        const scanned = await appSchemeFromFiles(container);
-        if (scanned.scheme) {
-          scheme = scanned.scheme;
-        } else if (!listed.ok) {
-          // The list could not be read, so the guess is unverified rather than
-          // wrong. Use it and let xcodebuild report; there is no better evidence
-          // to act on, and refusing here would block a build that may well work.
-          scheme = guess;
-        } else {
-          // The list was read and the guess is not in it, and no scheme file
-          // declares an .app product: the guess is known to be wrong. Carrying
-          // on would fail later with a message that hides this.
-          throw new Error(
-            `Scheme "${guess}" is not in xcodebuild -list and no scheme file declares a .app product. ` +
-              `Pass scheme=..., or add "scheme" to .xcodebug.json. ` +
-              `Container: ${container}. Searched: ${scanned.searched.join(", ") || "(no scheme directories)"}.`,
-          );
-        }
-      }
-    }
-  }
-  if (!scheme) {
-    throw new Error(
-      "No scheme found. Pass scheme=..., or add \"scheme\" to .xcodebug.json. " +
-        `Container: ${container ?? "(none)"}.` +
-        // More than one app project sits below cwd, so naming them beats
-        // leaving the user to guess why nothing was picked.
-        (detected.ambiguous && detected.ambiguous.length > 0
-          ? ` Found several app projects below ${cwd}: ${detected.ambiguous.join(", ")}. ` +
-            `Run from one of them, or pass workspace=... .`
-          : ""),
-    );
-  }
-  return resolveBuildTarget(config, { ...params, scheme, workspace, project, configuration });
-}
-
-/**
- * Split a command line into tokens, honouring quotes.
- *
- * `command="npm run test:weather"` has to survive as ONE value: splitting
- * on whitespace would turn the rest of the shell line into goal words and run
- * `npm` with no arguments. Both quote styles are accepted, and a quote may sit
- * anywhere in a token so `command="cd a b && npm test"` works too.
- */
-function tokenizeArgs(raw: string): string[] {
-  const tokens: string[] = [];
-  let current = "";
-  let quote: string | undefined;
-  let started = false;
-  for (const char of raw) {
-    if (quote) {
-      if (char === quote) quote = undefined;
-      else current += char;
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-      started = true;
-      continue;
-    }
-    if (/\s/.test(char)) {
-      if (started) tokens.push(current);
-      current = "";
-      started = false;
-      continue;
-    }
-    current += char;
-    started = true;
-  }
-  if (started) tokens.push(current);
-  return tokens;
-}
-/**
- * Turn a command line into tool params.
- *
- * `/xcodebug 验证天气添加城市`  -> launch, with the phrase as the log filter goal
- * `/xcodebug logs grep=MySDK` -> logs
- * `/xcodebug stop`              -> stop
- *
- * Bare key=value tokens override anything derived from the free-text goal.
- */
-function parseCommandArgs(raw: string): ToolParams {
-  // `command=` is a whole shell line, but the tokenizer splits on whitespace
-  // before the value is ever read: unquoted, `command=cd /repo && npm test`
-  // arrives as command="cd" and the rest of the line is silently demoted to
-  // goal words. `cd` with no arguments exits 0, so the run reports success
-  // having run no test at all - the one failure that looks exactly like a pass.
-  // Quoting is always available, so refuse the shape instead of guessing.
-  if (/(?:^|\s)(?:--)?command=/.test(raw) && !/(?:^|\s)(?:--)?command=["']/.test(raw)) {
-    throw new Error(
-      'command= must be quoted: command="cd /repo && npm run test". ' +
-        "Unquoted, only the first word reaches the shell line.",
-    );
-  }
-  const tokens = tokenizeArgs(raw);
-  const known = new Set([
-    "devices", "changes", "build", "install", "launch", "syslog",
-    "logs", "wait", "status", "stop", "terminate", "doctor", "restart", "await",
-  ]);
-
-  const params: Record<string, unknown> = {};
-  const free: string[] = [];
-  const numberKeys = ["limit", "since", "timeoutSeconds"];
-  const boolKeys = ["force", "installPods", "dualChannel", "keepApp", "terminateExisting", "build", "regex", "times"];
-
-  const assign = (key: string, value: string): void => {
-    if (numberKeys.includes(key)) {
-      const n = Number(value);
-      if (Number.isFinite(n)) params[key] = n;
-    } else if (boolKeys.includes(key)) {
-      params[key] = value !== "false";
-    } else {
-      params[key] = value;
-    }
-  };
-
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index]!;
-    // `--key=value` and `--key value` are both ordinary ways to spell a param.
-    // A bare `--flag` is a switch: turning it into a goal word would silently
-    // describe the run as verifying "--force".
-    if (token.startsWith("--")) {
-      const body = token.slice(2);
-      const eqFlag = body.indexOf("=");
-      if (eqFlag > 0) {
-        assign(body.slice(0, eqFlag), body.slice(eqFlag + 1));
-        continue;
-      }
-      const next = tokens[index + 1];
-      if (!boolKeys.includes(body) && next !== undefined && !next.startsWith("-")) {
-        assign(body, next);
-        index += 1;
-      } else if (numberKeys.includes(body)) {
-        throw new Error(`--${body} needs a numeric value`);
-      } else {
-        params[body] = true;
-      }
-      continue;
-    }
-    const eq = token.indexOf("=");
-    if (eq > 0) {
-      assign(token.slice(0, eq), token.slice(eq + 1));
-    } else {
-      free.push(token);
-    }
-  }
-
-  const head = free[0];
-  if (head && known.has(head)) {
-    params.action = head;
-    free.shift();
-  } else {
-    // Bare `/xcodebug` and `/xcodebug 分析xxx` both mean "start the run": launch
-    // the app and keep listening with no deadline, so the user stays in control.
-    // `command=` is NOT an action - it is an extra phase appended to whatever
-    // the main action is (see `runCaseThenStop`), because a command run is only
-    // useful when the app is already being captured.
-    params.action = "launch";
-  }
-
-  const goal = free.join(" ").trim();
-  if (goal) {
-    // The goal is a human phrase ("验证天气添加城市"); it is not a log filter.
-    params.goal = goal;
-  }
-  return params as unknown as ToolParams;
-}
-
-type ToolParams = {
-  action: string;
-  /** Free-text description of what the user wants verified (command path only). */
-  goal?: string;
-  device?: string;
-  scheme?: string;
-  workspace?: string;
-  project?: string;
-  configuration?: string;
-  derivedDataPath?: string;
-  bundleId?: string;
-  appPath?: string;
-  processName?: string;
-  captureId?: string;
-  since?: number;
-  limit?: number;
-  grep?: string;
-  match?: string;
-  /** `match`/`grep` are regular expressions rather than substrings. */
-  regex?: boolean;
-  /** Prefix returned lines with the host time they arrived. */
-  times?: boolean;
-  timeoutSeconds?: number;
-  push?: "off" | "context" | "wake";
-  force?: boolean;
-  installPods?: boolean;
-  changes?: boolean;
-  dualChannel?: boolean;
-  terminateExisting?: boolean;
-  keepApp?: boolean;
-  build?: boolean;
-  /** `await`/`command=`: a shell line run to completion after the app is up. */
-  command?: string;
-  args?: string[];
-  environment?: Record<string, string>;
-};
 
 export default function xcodebug(pi: ExtensionAPI): void {
+  const history = new RunHistory(LOG_RETENTION_MS);
+  // Only explicit log queries advance the next wait. Evicting a capture releases its cursor.
+  const queryCursors = new WeakMap<Capture, number>();
+  const rememberCursor = (capture: Capture, cursor: number): void => {
+    queryCursors.set(capture, Math.max(cursor, queryCursors.get(capture) ?? 0));
+  };
   const state: SessionState = {
     captures: new Map(),
     endedCaptures: new Set(),
@@ -902,8 +369,9 @@ export default function xcodebug(pi: ExtensionAPI): void {
   const ownedCaptures = new Set<Capture>();
   const retiredCleanupWarnings: string[] = [];
   let shuttingDown = false;
-  const startCapture = async (capture: Capture, signal?: AbortSignal): Promise<void> => {
+  const startCapture = async (capture: Capture, signal?: AbortSignal, identity?: RunIdentity): Promise<void> => {
     if (shuttingDown) throw new Error("xcodebug session is shutting down");
+    if (identity) history.begin(capture, dirname(capture.logFile), identity);
     ownedCaptures.add(capture);
     const release = (): void => {
       const result = capture.launchResult;
@@ -919,6 +387,11 @@ export default function xcodebug(pi: ExtensionAPI): void {
     try {
       await capture.start(signal);
       if (shuttingDown) throw new Error("xcodebug session is shutting down");
+      if (!capture.stoppedByUser && !capture.processExited) history.update(capture, { state: "running" });
+    } catch (error) {
+      history.update(capture, { state: capture.stoppedByUser || identity ? "ended" : "reconnecting",
+        endReason: identity && !capture.stoppedByUser ? "capture failed to start" : undefined });
+      throw error;
     } finally {
       if (!capture.running) {
         unsubscribe();
@@ -1089,6 +562,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       if (companion) {
         stopPush(companion.id);
         stopWatchdog(companion.id);
+        history.stop(companion, "primary capture stopped");
         companion.stop(false);
       }
     }
@@ -1110,6 +584,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     state.pushCursors.delete(capture.id);
     if (![...state.captures.values()].some((c) => c !== capture && c.running)) stopStatusTicker();
     refreshStatus();
+    history.stop(capture, terminateApp ? "terminated" : "capture stopped");
     capture.stop(terminateApp);
     if (!capture.running) releaseCapture(capture);
     if (state.activeCaptureId === capture.id) state.activeCaptureId = undefined;
@@ -1177,17 +652,15 @@ export default function xcodebug(pi: ExtensionAPI): void {
       state.recentLines.set(capture.id, recent.slice(-5));
       refreshStatus();
       state.pushCursors.set(capture.id, read.cursor);
-      const omitted = read.total - read.lines.length;
-      const body = read.lines.map((line) => line.text).join("\n");
-      const header = [
-        `[xcodebug ${capture.mode}] ${capture.deviceLabel} · ${capture.bundleId} · ${read.lines.length} new line(s)${omitted > 0 ? ` (+${omitted} older dropped)` : ""}`,
-        `cursor ${read.cursor}`,
-      ].join(" · ");
+      const body = formatEvidenceLines(read.lines, false, capture.mode === "console");
+      const omitted = read.total - body.shown;
+      const header = `[xcodebug ${capture.mode}] ${capture.deviceLabel} · ${capture.bundleId} · ${body.shown} new line(s)${omitted > 0 ? ` (+${omitted} older dropped)` : ""} · cursor ${read.cursor}`;
+      const note = body.truncated ? `\nnote: output truncated; full evidence in log: ${capture.logFile}` : "";
       try {
         pi.sendMessage(
           {
             customType: CAPTURE_PREFIX,
-            content: `${header}\n${body}`,
+            content: `${clipBytes(header, 1024)}\n${body.text}${note}`,
             // The model needs every line to analyse the run; the reader does not
             // need the firehose on screen. display:false keeps the content in
             // context and out of the transcript.
@@ -1242,6 +715,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         if (capture.processExited || capture.naturalExitAt !== undefined || !isCurrentBridge(capture, launch, result)) return;
         if (pid !== undefined && pid !== replaced) {
           capture.appPid = pid;
+          history.update(capture);
           return;
         }
         await new Promise((resolve) => setTimeout(resolve, 500));
@@ -1327,6 +801,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       capture.terminationReason = undefined;
       return pid;
     })();
+    history.update(capture, { crashStatus: "pending" });
     const promise = (async (): Promise<void> => {
       try {
         const pid = await identity;
@@ -1341,6 +816,9 @@ export default function xcodebug(pi: ExtensionAPI): void {
       } finally {
         const current = crashSearches.get(capture.id);
         if (current?.launch === launch && current.result === result) crashSearches.delete(capture.id);
+        if (isCurrentBridge(capture, launch, result)) history.update(capture, {
+          crashStatus: capture.crashReport ? "found" : crashSearchAbort.signal.aborted ? "cancelled" : "unavailable",
+        });
       }
     })();
     crashSearches.set(capture.id, { launch, result, identity, promise });
@@ -1485,6 +963,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
             } else {
               capture.pushLine("err", `[xcodebug] ${label} bridge reattached`);
             }
+            history.update(capture, { crashStatus: undefined });
             return;
           } catch (error) {
             capture.pushLine("err", `[xcodebug] reconnect failed: ${(error as Error).message}`);
@@ -1620,9 +1099,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
     return capture;
   };
 
-  const resolveDeviceParam = async (selector: string | undefined, root: string): Promise<DeviceInfo> => {
-    const config = await readConfig(root);
-    const { device } = await resolveDevice(selector ?? config.device);
+  const resolveDeviceParam = async (selector: string | undefined): Promise<DeviceInfo> => {
+    const { device } = await resolveDevice(selector);
     return device;
   };
 
@@ -1745,21 +1223,23 @@ export default function xcodebug(pi: ExtensionAPI): void {
    */
   const rememberBuild = async (
     key: string,
-    before: string,
+    before: ChangeReport,
     root: string,
     containerPath: string | undefined,
     outcome: BuildOutcome,
   ): Promise<string | undefined> => {
     if (!outcome.appPath) return undefined;
     const after = (await detectChanges(root, containerPath)).fingerprint;
-    if (after !== before) {
+    if (after !== before.fingerprint) {
       return "the working tree changed while this was building, so the next run builds again instead of reusing it";
     }
     const product = await directorySignature(outcome.appPath);
     if (product === undefined) return undefined;
     state.builds.set(key, {
       fingerprint: after,
+      gitHead: before.gitHead,
       appPath: outcome.appPath,
+      logFile: outcome.logFile,
       product,
       bundleId: outcome.bundleId,
       executable: outcome.executable,
@@ -1809,6 +1289,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
     const since = target?.status().cursor ?? 0;
     const linesAtStart = target?.status().lineCount ?? 0;
     const relaunchesAtStart = target?.relaunches ?? 0;
+    const command = commandIdentity(params.command, startedAt);
+    if (target) history.update(target, { command });
     const result = await runCommand(bin, argv, {
       cwd,
       timeoutMs,
@@ -1817,6 +1299,11 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // console capture already holds the app side of the story.
       maxBytes: 400_000,
     });
+    if (target) {
+      const endedAt = Date.now();
+      history.update(target, { command: { ...command, endedAt, durationMs: endedAt - startedAt,
+        exitCode: result.code, timedOut: result.timedOut, cancelled: signal?.aborted } });
+    }
     const elapsedS = Math.round((Date.now() - startedAt) / 1000);
 
     // Stopping is scoped to the targeted capture: a second app under debug
@@ -1894,19 +1381,22 @@ export default function xcodebug(pi: ExtensionAPI): void {
     // lookup below (config, change detection, container discovery, the command's
     // working directory) must agree on one root or they disagree about the project.
     const projectRoot = resolveProjectRoot(pi, ctx);
-    const configRead = await readConfig(projectRoot).then(
-      (value) => ({ value, error: undefined }),
-      (error: Error) => ({ value: {} as ProjectConfig, error }),
-    );
-    const config = configRead.value;
     const action = params.action;
-    if (configRead.error && !CONFIG_FREE_ACTIONS.has(action)) throw configRead.error;
+    const configRead = (action === "doctor" || !CONFIG_FREE_ACTIONS.has(action))
+      ? await readConfigDetails(projectRoot).then(
+        ({ config, path }) => ({ config, path, error: undefined }),
+        (error: Error) => ({ config: {} as ProjectConfig, path: undefined, error }),
+      ) : { config: {} as ProjectConfig, path: undefined, error: undefined };
+    const { config } = configRead;
+    if (configRead.error && action !== "doctor") throw configRead.error;
 
     // The first run of a session clears out the logs nothing has written to in
     // a while, before it adds its own.
     if (!state.logsPruned && (action === "build" || action === "launch" || action === "syslog")) {
       state.logsPruned = true;
       await pruneLogs(logDir(ctx), LOG_RETENTION_MS);
+      try { pruneRunHistory(logDir(ctx), LOG_RETENTION_MS); }
+      catch (error) { console.error("[xcodebug] could not prune run history:", error); }
     }
 
     if (action === "doctor") {
@@ -1915,17 +1405,17 @@ export default function xcodebug(pi: ExtensionAPI): void {
         runCommand("xcrun", ["devicectl", "--version"], { timeoutMs: 30_000 }),
         runCommand("idevicesyslog", ["--version"], { timeoutMs: 20_000 }),
       ]);
-      const configLine = configRead.error
-        ? configRead.error.message
-        : Object.keys(config).length > 0 ? join(projectRoot, ".xcodebug.json") : "(none)";
+      const configLine = configRead.error?.message ?? configRead.path ?? "(none)";
       const lines = [
+        `xcodebug: ${runtimeVersion.identity.version} (${runtimeVersion.identity.sourceDigest.slice(0, 8)})`,
+        `source: ${runtimeVersion.identity.sourcePath}${runtimeVersion.identity.revision ? ` · ${runtimeVersion.identity.revision}` : ""}`,
         `xcodebuild: ${checks[0].code === 0 ? checks[0].stdout.split("\n")[0] : "missing"}`,
         `devicectl: ${checks[1].code === 0 ? (checks[1].stdout || checks[1].stderr).trim().split("\n")[0] : "missing"}`,
         `idevicesyslog: ${checks[2].code === 0 ? (checks[2].stdout || checks[2].stderr).trim().split("\n")[0] : "missing (optional, syslog action only)"}`,
         `config: ${configLine}`,
         `log dir: ${logDir(ctx)}`,
       ];
-      return { content: [{ type: "text", text: lines.join("\n") }], details: {} };
+      return { content: [{ type: "text", text: lines.join("\n") }], details: { runtime: runtimeVersion.identity } };
     }
 
     if (action === "changes") {
@@ -1935,7 +1425,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       try {
         const target = await withContainer(projectRoot, config, params);
         containerPath = target.workspace ?? target.project;
-        buildKey = buildKeyOf(target, await resolveDeviceParam(params.device, projectRoot));
+        buildKey = buildKeyOf(target, await resolveDeviceParam(params.device ?? config.device), projectRoot);
       } catch (error) {
         unresolved = (error as Error).message;
         const detected = await detectContainer(projectRoot);
@@ -1971,9 +1461,9 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // Painting from the first line means the run is visible while the scheme
       // is still being resolved, which itself takes a few seconds.
       setRunPhase("resolving the project…");
-      const device = await resolveDeviceParam(params.device, projectRoot);
+      const device = await resolveDeviceParam(params.device ?? config.device);
       const target = await withContainer(projectRoot, config, params);
-      const buildKey = buildKeyOf(target, device);
+      const buildKey = buildKeyOf(target, device, projectRoot);
       const containerPath = target.workspace ?? target.project;
       const gate = await prepareRun(ctx, {
         root: projectRoot,
@@ -2017,7 +1507,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       clearRunPhase();
       let notRemembered: string | undefined;
       if (outcome.ok) {
-        notRemembered = await rememberBuild(buildKey, gate.report.fingerprint, projectRoot, containerPath, outcome);
+        notRemembered = await rememberBuild(buildKey, gate.report, projectRoot, containerPath, outcome);
         await clearArchiveBeforeNewRun(ctx);
       }
       const prefix = gate.podInstall ? `${gate.podInstall}\n` : "";
@@ -2029,8 +1519,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
     }
 
     if (action === "install") {
-      const device = await resolveDeviceParam(params.device, projectRoot);
-      const appPath = params.appPath;
+      const device = await resolveDeviceParam(params.device ?? config.device);
+      const appPath = params.appPath && resolve(projectRoot, params.appPath);
       if (!appPath) throw new Error("install requires appPath (or use action=build first).");
       setRunPhase(`installing on ${device.name}`);
       const outcome = await installApp(device, appPath, { timeoutMs: (params.timeoutSeconds ?? 180) * 1000, signal });
@@ -2066,10 +1556,11 @@ export default function xcodebug(pi: ExtensionAPI): void {
         environment: params.environment ?? last.environment,
         device: params.device ?? last.device,
         scheme: params.scheme ?? last.scheme,
-        workspace: params.workspace ?? last.workspace,
-        project: params.project ?? last.project,
+        workspace: params.workspace ?? (params.project === undefined ? last.workspace : undefined),
+        project: params.project ?? (params.workspace === undefined ? last.project : undefined),
         configuration: params.configuration ?? last.configuration,
         derivedDataPath: params.derivedDataPath ?? last.derivedDataPath,
+        xcodebuildArgs: params.xcodebuildArgs ?? params.extraArgs ?? last.xcodebuildArgs,
         push: params.push ?? last.push,
         match: params.match ?? last.match,
         dualChannel: params.dualChannel ?? last.dualChannel,
@@ -2099,8 +1590,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
 
     if (action === "launch") {
       setRunPhase("resolving the project…");
-      const device = await resolveDeviceParam(params.device, projectRoot);
-      let appPath = params.appPath;
+      const device = await resolveDeviceParam(params.device ?? config.device);
+      let appPath = params.appPath && resolve(projectRoot, params.appPath);
       let bundleId = params.bundleId ?? config.bundleId;
       let executable: string | undefined;
 
@@ -2113,7 +1604,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // Resolve the container up front: the Podfile that governs this run lives
       // beside it, so the pod gate must not search from an arbitrary cwd.
       const launchTarget = explicitApp && !wantsBuild ? undefined : await withContainer(projectRoot, config, params);
-      const buildKey = launchTarget ? buildKeyOf(launchTarget, device) : undefined;
+      const buildKey = launchTarget ? buildKeyOf(launchTarget, device, projectRoot) : undefined;
       const containerPath = launchTarget ? (launchTarget.workspace ?? launchTarget.project) : undefined;
       const gate = await prepareRun(ctx, {
         root: projectRoot,
@@ -2141,6 +1632,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // `needsBuild` false means the gate found this target's build still good.
       const reused = buildKey === undefined || gate.needsBuild || wantsBuild ? undefined : state.builds.get(buildKey);
       const mustBuild = launchTarget !== undefined && buildKey !== undefined && reused === undefined;
+      let buildLog = reused?.logFile;
       if (mustBuild) {
         setRunPhase(`building ${launchTarget.scheme} for ${device.name}`);
         // Forgotten before the build, for the reason `build` gives.
@@ -2160,7 +1652,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
             isError: true,
           };
         }
-        const notRemembered = await rememberBuild(buildKey, gate.report.fingerprint, projectRoot, containerPath, build);
+        buildLog = build.logFile;
+        const notRemembered = await rememberBuild(buildKey, gate.report, projectRoot, containerPath, build);
         const cleared = await clearArchiveBeforeNewRun(ctx);
         if (cleared) notes.push(cleared);
         appPath = build.appPath;
@@ -2177,6 +1670,18 @@ export default function xcodebug(pi: ExtensionAPI): void {
       }
 
       if (!appPath) throw new Error("launch requires appPath, or a scheme to build.");
+      const { repoRoot, gitHead, fingerprint } = gate.report;
+      const runIdentity: RunIdentity = {
+        projectRoot: repoRoot, gitHead, fingerprint, udid: device.udid,
+        build: {
+          source: mustBuild ? "built" : reused ? "reused" : "prebuilt",
+          appPath, scheme: launchTarget?.scheme, workspace: launchTarget?.workspace, project: launchTarget?.project,
+          configuration: launchTarget?.configuration, logFile: buildLog,
+          product: buildKey ? state.builds.get(buildKey)?.product : undefined,
+          gitHead: mustBuild ? gitHead : reused?.gitHead,
+          fingerprint: mustBuild ? fingerprint : reused?.fingerprint,
+        },
+      };
       executable ??= params.processName ?? (await readBundleExecutable(appPath));
 
       // The instance this launch is about to replace, read before the install
@@ -2233,7 +1738,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
           environment: { ...(config.environment ?? {}), ...(params.environment ?? {}) },
         }),
       });
-      await startCapture(capture, signal);
+      await startCapture(capture, signal, runIdentity);
       state.captures.set(capture.id, capture);
       state.activeCaptureId = capture.id;
       watchExit(capture, device);
@@ -2252,11 +1757,12 @@ export default function xcodebug(pi: ExtensionAPI): void {
         args: params.args ?? config.args,
         environment: { ...(config.environment ?? {}), ...(params.environment ?? {}) },
         device: params.device ?? config.device,
-        scheme: params.scheme ?? config.scheme,
-        workspace: params.workspace ?? config.workspace,
-        project: params.project ?? config.project,
-        configuration: params.configuration ?? config.configuration,
-        derivedDataPath: params.derivedDataPath ?? config.derivedDataPath,
+        scheme: launchTarget?.scheme ?? params.scheme ?? config.scheme,
+        workspace: launchTarget?.workspace ?? params.workspace ?? (params.project === undefined ? config.workspace : undefined),
+        project: launchTarget?.project ?? params.project ?? (params.workspace === undefined ? config.project : undefined),
+        configuration: launchTarget?.configuration ?? params.configuration ?? config.configuration,
+        derivedDataPath: launchTarget?.derivedDataPath ?? params.derivedDataPath ?? config.derivedDataPath,
+        xcodebuildArgs: launchTarget?.extraArgs ?? params.xcodebuildArgs ?? params.extraArgs ?? config.xcodebuildArgs ?? config.extraArgs,
         push: params.push,
         match: params.match,
         dualChannel: params.dualChannel,
@@ -2291,13 +1797,15 @@ export default function xcodebug(pi: ExtensionAPI): void {
           args: ["-u", device.udid ?? device.id, "-p", executable, "--no-colors"],
         });
         try {
-          await startCapture(syslogCapture, signal);
+          await startCapture(syslogCapture, signal, { ...runIdentity, primaryCaptureId: capture.id });
           if (capture.stoppedByUser) {
+            history.stop(syslogCapture, "primary capture stopped");
             syslogCapture.stop(false);
             await syslogCapture.waitForExit(3_000);
           } else {
             state.captures.set(syslogCapture.id, syslogCapture);
             state.companions.set(capture.id, syslogCapture.id);
+            history.update(capture, { companionCaptureId: syslogCapture.id });
             watchExit(syslogCapture, device);
             notes.push(`syslog channel: ${syslogCapture.id}`);
           }
@@ -2322,7 +1830,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     }
 
     if (action === "syslog") {
-      const device = await resolveDeviceParam(params.device, projectRoot);
+      const device = await resolveDeviceParam(params.device ?? config.device);
       const processName = params.processName ?? config.scheme;
       if (!processName) throw new Error("syslog requires processName (the app's executable/process name).");
       // Same ordering as `launch`: retire the previous bridge for this app before
@@ -2340,7 +1848,9 @@ export default function xcodebug(pi: ExtensionAPI): void {
         command: "idevicesyslog",
         args,
       });
-      await startCapture(capture, signal);
+      const checkout = await runCommand("git", ["rev-parse", "--show-toplevel", "HEAD"], { cwd: projectRoot, timeoutMs: 2_000, signal });
+      const [repoRoot, gitHead] = checkout.code === 0 ? checkout.stdout.trim().split("\n") : [];
+      await startCapture(capture, signal, { projectRoot: repoRoot ?? projectRoot, gitHead, udid: device.udid });
       state.captures.set(capture.id, capture);
       state.activeCaptureId = capture.id;
       watchExit(capture, device);
@@ -2367,17 +1877,19 @@ export default function xcodebug(pi: ExtensionAPI): void {
         since,
         limit: params.limit ?? 200,
         grep: toFilter(params.grep, params.regex),
+        context: params.context,
         times: params.times,
         signal,
       });
+      rememberCursor(capture, formatted.cursor);
       const companionId = state.companions.get(capture.id);
-      if (!capture.running && companionId) {
-        formatted.text += `\n\n[this channel has ended; system-level logs continue in ${companionId} - pass captureId=${companionId}]`;
-      }
-      // The lines that say so are in the log, but a filtered read leaves them out.
-      if (capture.endReason) formatted.text += `\n\n[this capture ended on its own · ${capture.endReason}]`;
-      if (capture.terminationReason) formatted.text += `\n[system termination: ${capture.terminationReason}]`;
-      if (capture.crashReport) formatted.text += `\n[crash report: ${capture.crashReport}]`;
+      const notes = [
+        !capture.running && companionId ? `[this channel has ended; system-level logs continue in ${companionId} - pass captureId=${companionId}]` : "",
+        capture.endReason ? `[this capture ended on its own · ${capture.endReason}]` : "",
+        capture.terminationReason ? `[system termination: ${capture.terminationReason}]` : "",
+        capture.crashReport ? `[crash report: ${capture.crashReport}]` : "",
+      ].filter(Boolean).join("\n");
+      if (notes) formatted.text = appendEvidenceNote(formatted.text, `\n${notes}`);
       return {
         content: [{ type: "text", text: formatted.text }],
         details: { captureId: capture.id, cursor: formatted.cursor, total: formatted.total, running: capture.running },
@@ -2388,112 +1900,30 @@ export default function xcodebug(pi: ExtensionAPI): void {
       const capture = requireCapture(params.captureId);
       const needle = toFilter(params.match, params.regex);
       if (!needle) throw new Error("wait requires match (a substring to wait for, or a pattern with regex=true).");
-      const shown = typeof needle === "string" ? `"${needle}"` : String(needle);
+      const since = params.since ?? queryCursors.get(capture) ?? 0;
       const timeoutMs = Math.min(Math.max(1, params.timeoutSeconds ?? 30), 600) * 1000;
-      const since = params.since ?? 0;
-
-      const matches: FoundLine[] = [];
-      const seen = new Set<number>();
-      let finished = false;
-      let cancelled = false;
-      let deadlineExpired = false;
-      // The backlog is read from disk too, which takes a moment. A line that
-      // arrives meanwhile must not settle the wait ahead of the earlier ones.
-      let backlogRead = false;
-      let note = "";
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let unsubscribeLine: () => void = () => {};
-      let unsubscribeExit: () => void = () => {};
-      let onAbort: (() => void) | undefined;
-      let resolveWait: (text: string) => void = () => {};
-
-      const settle = (timedOut: boolean): string => {
-        const cursor = capture.status().cursor;
-        if (matches.length === 0) {
-          // Abort also settles through `finish`, so say what happened instead of
-          // reporting a timeout that never elapsed.
-          if (cancelled) return `cancelled while waiting for ${shown} (cursor ${cursor})${note}`;
-          if (timedOut) return `timed out after ${timeoutMs / 1000}s waiting for ${shown} (cursor ${cursor})${note}`;
-          return `capture ended before ${shown} appeared (cursor ${cursor})${whyEnded(capture)}${note}`;
-        }
-        const body = matches
-          .sort((a, b) => a.index - b.index)
-          .slice(0, 200)
-          .map((line) => `${String(line.index).padStart(6, " ")} ${params.times ? clock(line.at) : ""}${line.text}`)
-          .join("\n");
-        return `matched ${matches.length} line(s) · cursor ${cursor}\n${body}${note}`;
-      };
-
-      const finish = (timedOut: boolean): void => {
-        if (finished) return;
-        finished = true;
-        deadlineExpired = timedOut;
-        if (timer) clearTimeout(timer);
-        unsubscribeLine();
-        unsubscribeExit();
-        // `once` only detaches when abort actually fires; a normal match or a
-        // timeout would leave the listener on the caller's signal for good.
-        if (onAbort) signal?.removeEventListener("abort", onAbort);
-        resolveWait(settle(timedOut));
-      };
-
-      const collect = (line: FoundLine): void => {
-        if (finished || line.index <= since || seen.has(line.index)) return;
-        if (!matchesFilter(line.text, needle)) return;
-        seen.add(line.index);
-        matches.push(line);
-      };
-
-      const waiting = new Promise<string>((resolve) => {
-        resolveWait = resolve;
-        // Subscribe first, then scan the backlog: the scan covers
-        // [since, cursor] and the listener covers everything after it, so no
-        // line can fall through the gap.
-        unsubscribeLine = capture.onLine((line) => {
-          collect(line);
-          // Let the rest of the same chunk land before settling.
-          if (backlogRead && matches.length > 0) setTimeout(() => finish(false), 50);
-        });
-        unsubscribeExit = capture.onExit(() => setTimeout(() => backlogRead && finish(false), 0));
-        onAbort = (): void => {
-          cancelled = true;
-          finish(true);
-        };
-        signal?.addEventListener("abort", onAbort, { once: true });
-      });
-
-      try {
-        const backlog = await capture.search({ since, limit: 500, grep: needle, signal });
-        for (const line of backlog.lines) collect(line);
-        note = evictedNote(backlog, capture.logFile);
-        backlogRead = true;
-      } catch (error) {
-        if (signal?.aborted) onAbort?.();
-        else {
-          finish(false);
-          throw error;
-        }
+      const waitStarted = Date.now();
+      const result = await waitForEvidence(capture, { since, match: needle, timeoutMs, absent: params.absent, times: params.times, signal });
+      let text = result.text;
+      if (result.ended && !result.cancelled && !result.timedOut && result.matched === 0) {
+        const remaining = Math.max(0, timeoutMs - (Date.now() - waitStarted));
+        const deadline = AbortSignal.timeout(remaining);
+        const crashSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+        await waitForCrashReport(capture, crashSignal);
+        text = signal?.aborted ? `cancelled while waiting (cursor ${result.cursor})` : appendEvidenceNote(text, whyEnded(capture));
       }
-      // The deadline bounds the wait for a line still to come, so it starts
-      // here: expiring while the lines already logged are being read back would
-      // report a timeout for a line that is sitting on disk.
-      if (!finished) timer = setTimeout(() => finish(true), timeoutMs);
-      // A pattern already present in the backlog must return immediately,
-      // not wait out the timeout.
-      if (matches.length > 0 || !capture.running) finish(false);
-      let text = await waiting;
-      if (!cancelled && !deadlineExpired && matches.length === 0 && !capture.running) {
-        await waitForCrashReport(capture, signal);
-        if (signal?.aborted) cancelled = true;
-        text = settle(cancelled);
-      }
-
+      if (!result.cancelled && !signal?.aborted && result.missing === 0) rememberCursor(capture, result.cursor);
       return {
         content: [{ type: "text", text }],
-        details: { captureId: capture.id, cursor: capture.status().cursor, matched: matches.length,
-          terminationReason: capture.terminationReason, crashReport: capture.crashReport },
-        isError: matches.length === 0,
+        details: { captureId: capture.id, since, cursor: result.cursor, matched: result.matched, missing: result.missing,
+          assertion: params.absent ? "absent" : "present", terminationReason: capture.terminationReason, crashReport: capture.crashReport },
+        isError: result.isError || signal?.aborted === true,
       };
+    }
+
+    if (action === "history") {
+      const { text, runs } = runHistoryResult(logDir(ctx), params);
+      return { content: [{ type: "text", text }], details: { runs } };
     }
 
     if (action === "status") {
@@ -2557,7 +1987,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     }
 
     if (action === "terminate") {
-      const device = await resolveDeviceParam(params.device, projectRoot);
+      const device = await resolveDeviceParam(params.device ?? config.device);
       const capture = state.activeCaptureId ? state.captures.get(state.activeCaptureId) : undefined;
       const bundleId = params.bundleId ?? capture?.bundleId ?? config.bundleId;
       if (!bundleId) throw new Error("terminate requires bundleId or an active capture.");
@@ -2638,7 +2068,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     label: "Xcode Device Debug",
     description:
       "Build/install/launch an iOS app on a physical device and stream its Xcode-console output into this session. " +
-      "Actions: devices, changes, build, install, launch, syslog, logs, wait, status, stop, terminate, doctor, restart, await. " +
+      "Actions: devices, changes, build, install, launch, syslog, logs, wait, history, status, stop, terminate, doctor, restart, await. " +
       "build and launch first check the working tree: any source change rebuilds, and a new file inside a pod runs " +
       "pod install first. An unchanged tree reuses this session's build (force=true overrides). " +
       "launch restarts the app and captures stdout/stderr + os_log (no jailbreak, no LLDB). " +
@@ -2659,60 +2089,15 @@ export default function xcodebug(pi: ExtensionAPI): void {
       "A capture also ends on its own when the app process exits, or when something else relaunched the app; status and logs then say why, and name the crash report if the device wrote one. Do not reconnect a run whose app the user deliberately closed.",
     ],
     executionMode: "sequential",
-    parameters: Type.Object({
-      action: Type.Union([
-        Type.Literal("devices"),
-        Type.Literal("build"),
-        Type.Literal("install"),
-        Type.Literal("launch"),
-        Type.Literal("syslog"),
-        Type.Literal("logs"),
-        Type.Literal("wait"),
-        Type.Literal("status"),
-        Type.Literal("stop"),
-        Type.Literal("terminate"),
-        Type.Literal("doctor"),
-        Type.Literal("changes"),
-        Type.Literal("restart"),
-        Type.Literal("await"),
-      ]),
-      device: Type.Optional(Type.String({ description: "Device name, UDID, ECID or CoreDevice uuid. Defaults to .xcodebug.json device, else the only connected physical device." })),
-      scheme: Type.Optional(Type.String()),
-      workspace: Type.Optional(Type.String()),
-      project: Type.Optional(Type.String()),
-      configuration: Type.Optional(Type.String({ description: "Defaults to Debug" })),
-      derivedDataPath: Type.Optional(Type.String()),
-      bundleId: Type.Optional(Type.String({ description: "App bundle id; defaults to the built product's CFBundleIdentifier" })),
-      appPath: Type.Optional(Type.String({ description: "Install this .app instead of building" })),
-      processName: Type.Optional(Type.String({ description: "Executable/process name for syslog filtering" })),
-      captureId: Type.Optional(Type.String()),
-      since: Type.Optional(Type.Number({ description: "Return lines with index > since; omit for all buffered lines" })),
-      limit: Type.Optional(Type.Number({ description: "Max lines to return (default 200)" })),
-      grep: Type.Optional(Type.String({ description: "Only return lines containing this text" })),
-      match: Type.Optional(Type.String({ description: "wait: substring to wait for; also filters pushed lines" })),
-      regex: Type.Optional(Type.Boolean({ description: "logs/wait: treat grep and match as regular expressions instead of substrings, e.g. match=\"sync (done|failed)\"." })),
-      times: Type.Optional(Type.Boolean({ description: "logs/wait: prefix each line with the host time it arrived (HH:MM:SS.mmm), to line it up with a test runner's output." })),
-      timeoutSeconds: Type.Optional(Type.Number({ description: "wait/build timeout in seconds; await: max run time (default 1800)" })),
-      command: Type.Optional(Type.String({ description: "await/launch/restart: shell command line to run to completion after the app is up, e.g. \"cd /repo && npm run test:xxx\". Only /bin/sh -lc runs it, so the cd into the repo that owns the runner is part of the line. Quoted in the slash command (command=\"...\"); restart re-runs the last launch's command unless this overrides it." })),
-      push: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("context"), Type.Literal("wake")], {
-        description: "How new lines reach the session. Defaults to context. off: pull only (opt out). context: append new lines for the next turn. wake: trigger a turn when new lines arrive.",
-      })),
-      force: Type.Optional(Type.Boolean({ description: "Rebuild even when the working tree has not changed since the last build in this session." })),
-      installPods: Type.Optional(Type.Boolean({ description: "Run pod install when new files belong to a pod (default true)." })),
-      dualChannel: Type.Optional(Type.Boolean({ description: "launch: also capture idevicesyslog in parallel so a dropped console bridge leaves no gap (default true)." })),
-      changes: Type.Optional(Type.Boolean({ description: "Only report local changes and what they require (no build)." })),
-      terminateExisting: Type.Optional(Type.Boolean({ description: "launch: kill an existing instance first (default true)" })),
-      keepApp: Type.Optional(Type.Boolean({ description: "stop: leave the app running (default true)" })),
-      build: Type.Optional(Type.Boolean({ description: "launch: build and install before launching" })),
-      args: Type.Optional(Type.Array(Type.String(), { description: "Launch arguments passed to the app" })),
-      environment: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Extra launch environment variables" })),
-    }),
+    parameters,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       // Whatever the action returns (including an early error), the transient
       // phase must not outlive it or the footer keeps advertising stale work.
       try {
-        const result = await runActionThenCommand(params, ctx, signal, onUpdate);
-        return { content: result.content, details: result.details, isError: result.isError };
+        const checked = validateParameters(params);
+        const result = await runActionThenCommand(checked, ctx, signal, onUpdate);
+        return { content: result.content.map(({ type, text }) => ({ type, text: replyText(text, checked.action) })),
+          details: result.details, isError: result.isError };
       } finally {
         clearRunPhase();
       }
@@ -2740,8 +2125,6 @@ export default function xcodebug(pi: ExtensionAPI): void {
     description: "Build, install and launch the current project on a device, then stream its console; command=\"<shell line>\" runs a test command to completion and stops the capture",
     ...commandExtras,
     handler: async (args, ctx) => {
-      const parsed = parseCommandArgs(args);
-      ctx.ui.notify(`xcodebug: ${parsed.action}${parsed.match ? ` (${parsed.match})` : ""}…`, "info");
 
       // A command handler has no caller to surface a throw to, so a failed
       // action - `/xcodebug stop` with nothing running, say - must be caught and
@@ -2749,7 +2132,10 @@ export default function xcodebug(pi: ExtensionAPI): void {
       let text: string;
       let isError = false;
       let ranCommand = false;
+      let parsed: ToolParams | undefined;
       try {
+        parsed = parseCommandArgs(args);
+        ctx.ui.notify(`xcodebug: ${parsed.action}${parsed.match ? ` (${parsed.match})` : ""}…`, "info");
         const result = await runActionThenCommand(
           parsed,
           ctx,
@@ -2767,7 +2153,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         ranCommand = result.ranCommand;
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        text = `xcodebug ${parsed.action} failed: ${reason}`;
+        text = `xcodebug${parsed ? ` ${parsed.action}` : ""} failed: ${reason}`;
         isError = true;
       } finally {
         clearRunPhase();
@@ -2778,7 +2164,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // because it reuses the run it is restarting. A `stop` or `status` must
       // not inherit that goal, or its output would claim a purpose it lacked.
       const goal =
-        parsed.goal ?? (parsed.action === "restart" ? state.lastLaunch?.goal : undefined);
+        parsed?.goal ?? (parsed?.action === "restart" ? state.lastLaunch?.goal : undefined);
+      text = replyText(text, parsed?.action);
       const withGoal = goal ? `goal: ${goal}\n${text}` : text;
       ctx.ui.notify(text, isError ? "error" : "info");
       // The command surface is how a verification run starts, so its outcome -
@@ -2790,7 +2177,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
             customType: CAPTURE_PREFIX,
             content: withGoal,
             display: true,
-            details: { action: parsed.action, goal, isError, command: parsed.command },
+            details: { action: parsed?.action, goal, isError, command: parsed?.command },
           },
           // A finished command run always steers: its whole point is that the
           // run is over and the log is ready to analyse, so waiting for the next
@@ -2828,6 +2215,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     for (const capture of captures) {
       stopPush(capture.id);
       stopWatchdog(capture.id);
+      history.stop(capture, "session shutdown");
       capture.stop(false);
     }
     state.captures.clear();
@@ -2838,6 +2226,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     ownedCaptures.clear();
     const warnings = retiredCleanupWarnings.splice(0);
     for (const [index, capture] of captures.entries()) {
+      if (settled[index]) history.update(capture, { state: "ended" });
       for (const error of capture.launchResultCleanupErrors ?? []) warnings.push(`${capture.id}: ${error}`);
       if (!settled[index]) warnings.push(`${capture.id}: ${capture.status().error}`);
     }

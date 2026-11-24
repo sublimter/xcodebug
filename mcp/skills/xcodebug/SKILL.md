@@ -36,7 +36,7 @@ Both explicit invocation and a matching natural-language request can use this sk
   parameters immediately. Do not replace execution with instructions for the user.
 - Accept `action [key=value ...]`, `action=... [key=value ...]`, or a JSON parameter
   object. Actions: `doctor`, `devices`, `changes`, `build`, `install`, `launch`,
-  `syslog`, `logs`, `wait`, `status`, `stop`, `terminate`, `restart`, `await`.
+  `syslog`, `logs`, `wait`, `history`, `status`, `stop`, `terminate`, `restart`, `await`.
 - Use the live tool schema for parameter names and types. Preserve quoted strings,
   numeric `since`/`limit`/`timeoutSeconds`, booleans, JSON `args` arrays and
   `environment` objects. Keep a supplied `command` shell line intact.
@@ -63,6 +63,7 @@ Both explicit invocation and a matching natural-language request can use this sk
 | `launch scheme=MyApp device="My iPhone"` | `{"action":"launch","scheme":"MyApp","device":"My iPhone"}` |
 | `logs captureId=console-123 since=42 limit=100 grep="Weather Sync"` | `{"action":"logs","captureId":"console-123","since":42,"limit":100,"grep":"Weather Sync"}` |
 | `wait match="sync complete" timeoutSeconds=30` | `{"action":"wait","match":"sync complete","timeoutSeconds":30}` |
+| `history limit=5` | `{"action":"history","limit":5}` |
 | `stop captureId=console-123 keepApp=true` | `{"action":"stop","captureId":"console-123","keepApp":true}` |
 | `restart` | `{"action":"restart"}` |
 
@@ -77,6 +78,12 @@ Both explicit invocation and a matching natural-language request can use this sk
   `logs` returns the newest matching lines up to `limit` and advances to the
   latest capture cursor, so omitted or evicted lines will not reappear merely
   by advancing `since`. Report omissions instead of claiming a lossless stream.
+- `wait` resumes from the last query cursor unless `since` is explicit. Use
+  `since=0` only to replay; an older match is not evidence of a new event.
+  `absent=true` asserts absence only over complete coverage. An incomplete
+  interval is inconclusive, not a pass. `logs grep=... context=2` includes neighbors.
+- Use `history` to find a previous capture's log paths and run identity; it
+  cannot restore that capture in the current session.
 - A filtered read (`logs grep=...`, `wait`) also searches the log files for lines
   memory has dropped, and a `note:` line in the reply says what it covered. If
   the note says some lines were not searched, say so instead of "not logged".

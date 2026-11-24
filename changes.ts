@@ -48,6 +48,7 @@ interface PodEntry {
 
 export interface ChangeReport {
   repoRoot: string;
+  gitHead?: string;
   /** True when git could not report (no repo, no git binary). */
   unavailable: boolean;
   reason?: string;
@@ -392,18 +393,20 @@ export async function detectChanges(cwd: string, containerPath?: string): Promis
   // checkout the working tree can be clean again while holding other code than
   // was last built. The tree rather than the commit, so that rewording a commit
   // or switching to a branch with the same content costs no rebuild.
-  const head = await runCommand("git", ["rev-parse", "HEAD^{tree}"], { cwd: repoRoot, timeoutMs: 30_000 });
+  const head = await runCommand("git", ["rev-parse", "HEAD", "HEAD^{tree}"], { cwd: repoRoot, timeoutMs: 30_000 });
+  const [gitHead, tree] = head.code === 0 ? head.stdout.trim().split("\n") : [];
   const signatures = await Promise.all(changed.map((file) => fileSignature(repoRoot, file)));
   const outside = containerPath ? await outsidePodDirs(containerPath, repoRoot, cwd) : [];
   const outsideSignatures = await Promise.all(
     outside.map(async (dir) => `${dir}:${(await directorySignature(dir, "source")) ?? "unreadable"}`),
   );
   const fingerprint = hashString(
-    [head.code === 0 ? head.stdout.trim() : "no commit", ...signatures.sort(), ...outsideSignatures].join("\n"),
+    [tree ?? "no commit", ...signatures.sort(), ...outsideSignatures].join("\n"),
   );
 
   return {
     repoRoot,
+    gitHead,
     unavailable: false,
     changed,
     newComponentFiles,

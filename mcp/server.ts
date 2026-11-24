@@ -18,10 +18,12 @@
  * the MCP handshake, tool calls, and the status-line resource methods; the official
  * SDK would add ~97 transitive packages to every install, including pi users.
  */
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { validateParameters } from "../parameters.ts";
+import { runtimeVersion } from "../version.ts";
 
 /** Only the fields index.ts reads off its context. */
 interface ExtensionContextLike {
@@ -62,12 +64,6 @@ interface StubPi {
 
 const AGENT_DIR = process.env.XCODEBUG_AGENT_DIR ?? join(homedir(), ".xcodebug");
 const PROTOCOL_VERSION = "2024-11-05";
-
-// Reported to clients on initialize; read from the package so a version bump does
-// not leave the handshake advertising the previous release.
-const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
-  version: string;
-};
 
 let registered: RegisteredTool | undefined;
 /** The extension's own teardown: it stops every capture the session started. */
@@ -217,13 +213,16 @@ function replyError(id: unknown, code: number, message: string): void {
 }
 
 async function callTool(
-  args: Record<string, unknown>,
+  input: unknown,
   signal: AbortSignal,
   progressToken: unknown,
 ): Promise<ToolResult> {
+  // Preserve invalid input for validation; spreading null or a number hides its type.
+  const args = input && typeof input === "object" && !Array.isArray(input)
+    ? input as Record<string, unknown> : validateParameters(input);
   // `defaultPushMode` defaults to "context", but this transport cannot deliver
   // pushed lines. Refusing an explicit request beats accepting it and going quiet.
-  if (args.push !== undefined && args.push !== "off") {
+  if (args.push === "context" || args.push === "wake") {
     return {
       content: [{ type: "text", text: 'MCP has no push channel; use push=off and read with action=logs.' }],
       isError: true,
@@ -231,7 +230,7 @@ async function callTool(
   }
   const progress = makeCtx(progressToken);
   try {
-    return await tool.execute("mcp", { ...args, push: "off" }, signal, undefined, progress.ctx);
+    return await tool.execute("mcp", { ...args, push: args.push === undefined ? "off" : args.push }, signal, undefined, progress.ctx);
   } finally {
     progress.close();
   }
@@ -248,7 +247,7 @@ async function handle(message: Record<string, unknown>, controller?: AbortContro
     reply(id, {
       protocolVersion: requested ?? PROTOCOL_VERSION,
       capabilities: { tools: {}, resources: {} },
-      serverInfo: { name: "xcodebug", version: pkg.version },
+      serverInfo: { name: "xcodebug", version: runtimeVersion.identity.version },
     });
     return;
   }
@@ -271,7 +270,7 @@ async function handle(message: Record<string, unknown>, controller?: AbortContro
   if (method === "tools/call") {
     const params = (message.params ?? {}) as {
       name?: string;
-      arguments?: Record<string, unknown>;
+      arguments?: unknown;
       _meta?: { progressToken?: unknown };
     };
     if (params.name !== "xcodebug") {
@@ -283,7 +282,7 @@ async function handle(message: Record<string, unknown>, controller?: AbortContro
         reply(id, { content: [{ type: "text", text: "Request cancelled" }], isError: true });
         return;
       }
-      reply(id, await callTool(params.arguments ?? {}, controller!.signal, params._meta?.progressToken));
+      reply(id, await callTool(params.arguments === undefined ? {} : params.arguments, controller!.signal, params._meta?.progressToken));
     } catch (error) {
       reply(id, { content: [{ type: "text", text: (error as Error).message }], isError: true });
     }
@@ -317,9 +316,7 @@ async function shutdown(code: number): Promise<void> {
     await queue;
     await endSession?.();
     if (!process.stdout.destroyed) {
-      const { promise, resolve } = Promise.withResolvers<void>();
-      process.stdout.write("", () => resolve());
-      await promise;
+      await new Promise<void>(resolve => process.stdout.write("", () => resolve()));
     }
   } finally {
     process.exit(code);

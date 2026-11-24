@@ -13,7 +13,7 @@ const MAX_STALE_READS = 5;
 // Actions that neither build nor start a capture, so they paint nothing new
 // unless they carry a `command`, which runs as a phase of its own.
 // Listed as exclusions so that an action added later shows by default.
-const QUIET_ACTIONS = new Set(['doctor', 'devices', 'changes', 'status', 'logs', 'wait', 'stop', 'terminate']);
+const QUIET_ACTIONS = new Set(['doctor', 'devices', 'changes', 'history', 'status', 'logs', 'wait', 'stop', 'terminate']);
 
 let rows = [];
 let polling = false;

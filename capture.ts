@@ -4,6 +4,7 @@
  * back through a cursor so the agent can fetch only what is new.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { appendFileSync, createReadStream, createWriteStream, statSync, type WriteStream } from "node:fs";
 import { lstat, mkdir, mkdtemp, readFile, readdir, rmdir, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -17,6 +18,8 @@ const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const MAX_LOG_FILES = 3;
 const MAX_DRAIN_MS = 2_000;
 
+export const MAX_READ_LINES = 5_000;
+
 export type CaptureMode = "console" | "syslog";
 
 export interface LogLine {
@@ -28,6 +31,16 @@ export interface LogLine {
 
 /** A line as a search returns it: one read back from disk has no stream. */
 export type FoundLine = Pick<LogLine, "index" | "at" | "text"> & Partial<Pick<LogLine, "stream">>;
+
+type LineRange = { first: number; last: number };
+
+export interface EvidenceSearch {
+  lines: FoundLine[];
+  cursor: number;
+  total: number;
+  evicted: number;
+  missing: number;
+}
 
 export interface CaptureInit {
   mode: CaptureMode;
@@ -81,12 +94,18 @@ function clean(text: string): string {
 }
 
 function clampLimit(limit: number | undefined): number {
-  return Math.trunc(Math.min(Math.max(1, limit ?? 200), 5_000));
+  return Math.trunc(Math.min(Math.max(1, limit ?? 200), MAX_READ_LINES));
 }
 
 /** A filter is a substring, or a pattern when the caller asked for one. */
 export function matchesFilter(text: string, filter: string | RegExp): boolean {
-  return typeof filter === "string" ? text.includes(filter) : filter.test(text);
+  if (typeof filter === "string") return text.includes(filter);
+  if (!filter.global && !filter.sticky) return filter.test(text);
+  const lastIndex = filter.lastIndex;
+  filter.lastIndex = 0;
+  const matched = filter.test(text);
+  filter.lastIndex = lastIndex;
+  return matched;
 }
 
 function sizeOnDisk(path: string): number {
@@ -189,6 +208,7 @@ export class Capture {
   private bufferBytes = 0;
   private droppedLines = 0;
   private cursor = 0;
+  private coverageStart = 0;
   private buffered: { out: string; err: string } = { out: "", err: "" };
   private exitCode: number | undefined;
   private exitSignal: string | undefined;
@@ -218,7 +238,7 @@ export class Capture {
   private readonly lineListeners = new Set<(line: LogLine) => void>();
 
   constructor(init: CaptureInit) {
-    this.id = `${init.mode}-${Date.now().toString(36)}`;
+    this.id = `${init.mode}-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
     this.mode = init.mode;
     this.deviceId = init.deviceId;
     this.deviceLabel = init.deviceLabel;
@@ -231,12 +251,17 @@ export class Capture {
     this.collectLaunchResult = init.mode === "console" && init.collectLaunchResult === true;
     this.spawnedArgs = this.launchArgs;
     this.logFile =
-      init.logFile ?? `${init.logDir}/${init.mode}-${init.bundleId}-${timestamp()}.log`;
+      init.logFile ?? `${init.logDir}/${init.mode}-${init.bundleId}-${timestamp()}-${this.id.slice(-8)}.log`;
   }
 
   /** Remain live until the pipes and file writes drain, or their deadline expires. */
   get running(): boolean {
     return this.child !== undefined;
+  }
+
+  /** A continuous bridge interval cannot start before this exclusive cursor. */
+  get coverageSince(): number {
+    return this.coverageStart;
   }
 
   get starting(): boolean {
@@ -372,6 +397,7 @@ export class Capture {
       this.openFile(true);
       this.spawnedArgs = args;
       child = spawn(this.command, args, { stdio: ["ignore", "pipe", "pipe"] });
+      this.coverageStart = this.cursor;
       this.child = child;
     } catch (error) {
       await collectResult();
@@ -658,7 +684,17 @@ export class Capture {
     });
   }
 
-  read(options: { since?: number; limit?: number; grep?: string | RegExp; streams?: Array<"out" | "err"> }): {
+  private after(index: number, first = 0): number {
+    let end = this.lineCount;
+    while (first < end) {
+      const middle = Math.floor((first + end) / 2);
+      if (this.lines[(this.head + middle) % MAX_BUFFER_LINES]!.index <= index) first = middle + 1;
+      else end = middle;
+    }
+    return first;
+  }
+
+  read(options: { since?: number; until?: number; limit?: number; grep?: string | RegExp; streams?: Array<"out" | "err"> }): {
     lines: LogLine[];
     cursor: number;
     total: number;
@@ -667,27 +703,21 @@ export class Capture {
   } {
     const since = Math.max(0, options.since ?? 0);
     const limit = clampLimit(options.limit);
-    const grep = typeof options.grep === "string" ? options.grep.trim() : options.grep;
-    const streams = options.streams;
-    // Locate the first eligible index without scanning or copying the buffer.
-    let first = 0;
-    let end = this.lineCount;
-    while (first < end) {
-      const middle = Math.floor((first + end) / 2);
-      if (this.lines[(this.head + middle) % MAX_BUFFER_LINES]!.index <= since) first = middle + 1;
-      else end = middle;
-    }
+    const { grep, streams } = options;
+    const cursor = Math.min(this.cursor, options.until ?? this.cursor);
+    const first = this.after(since);
+    const last = this.after(cursor, first);
     // Oversized lines can leave holes inside the ring, not just before it.
-    const evicted = Math.max(0, this.cursor - since - (this.lineCount - first));
+    const evicted = Math.max(0, cursor - since - (last - first));
     const lines: LogLine[] = [];
     if (!grep && (!streams || streams.length === 0)) {
-      for (let i = Math.max(first, this.lineCount - limit); i < this.lineCount; i++) {
+      for (let i = Math.max(first, last - limit); i < last; i++) {
         lines.push(this.lines[(this.head + i) % MAX_BUFFER_LINES]!);
       }
-      return { lines, cursor: this.cursor, total: this.lineCount - first, evicted };
+      return { lines, cursor, total: last - first, evicted };
     }
     let total = 0;
-    for (let i = this.lineCount - 1; i >= first; i--) {
+    for (let i = last - 1; i >= first; i--) {
       const line = this.lines[(this.head + i) % MAX_BUFFER_LINES]!;
       if (streams && streams.length > 0 && !streams.includes(line.stream)) continue;
       if (grep && !matchesFilter(line.text, grep)) continue;
@@ -695,7 +725,7 @@ export class Capture {
       if (lines.length < limit) lines.push(line);
     }
     lines.reverse();
-    return { lines, cursor: this.cursor, total, evicted };
+    return { lines, cursor, total, evicted };
   }
 
   /**
@@ -703,31 +733,49 @@ export class Capture {
    * oversized lines between retained entries. `missing` counts lines neither
    * memory nor any retained file holds any more.
    */
-  async search(options: { since?: number; limit?: number; grep: string | RegExp; signal?: AbortSignal }, retry = true): Promise<{
-    lines: FoundLine[];
-    cursor: number;
-    total: number;
-    evicted: number;
-    missing: number;
-  }> {
-    const signal = options.signal;
+  async search(options: {
+    since?: number; until?: number; limit?: number; grep?: string | RegExp; signal?: AbortSignal;
+    /** Sorted, disjoint inclusive windows, intersected with (since, until]. */
+    ranges?: readonly LineRange[];
+  }, retry = true): Promise<EvidenceSearch> {
+    const { grep, signal } = options;
     signal?.throwIfAborted();
-    const read = this.read(options);
-    if (read.evicted === 0) return { ...read, missing: 0 };
     const since = Math.max(0, options.since ?? 0);
-    const holes: Array<{ first: number; last: number }> = [];
-    let first = since + 1;
-    for (let i = 0; i < this.lineCount; i++) {
-      const index = this.lines[(this.head + i) % MAX_BUFFER_LINES]!.index;
-      if (index <= since) continue;
-      if (index > first) holes.push({ first, last: index - 1 });
-      first = index + 1;
-    }
-    if (first <= read.cursor) holes.push({ first, last: read.cursor });
-    const grep = typeof options.grep === "string" ? options.grep.trim() : options.grep;
+    const cursor = Math.min(this.cursor, options.until ?? this.cursor);
+    const ranges = options.ranges ?? [{ first: since + 1, last: cursor }];
     const limit = clampLimit(options.limit);
+    const lines: FoundLine[] = [];
+    const holes: LineRange[] = [];
+    let total = 0, evicted = 0;
+    const addHole = (first: number, last: number): void => {
+      holes.push({ first, last });
+      evicted += last - first + 1;
+    };
+    let i = this.after(cursor) - 1;
+    // Walk the windows and the ring together, keeping only the newest matches.
+    for (let window = ranges.length - 1; window >= 0; window--) {
+      const first = Math.max(since + 1, ranges[window].first);
+      let last = Math.min(cursor, ranges[window].last);
+      if (last < first) continue;
+      while (i >= 0) {
+        const line = this.lines[(this.head + i) % MAX_BUFFER_LINES]!;
+        if (line.index < first) break;
+        i--;
+        if (line.index > last) continue;
+        if (line.index < last) addHole(line.index + 1, last);
+        last = line.index - 1;
+        if (grep === undefined || matchesFilter(line.text, grep)) {
+          total++;
+          if (lines.length < limit) lines.push(line);
+        }
+      }
+      if (last >= first) addHole(first, last);
+    }
+    lines.reverse();
+    const read = { lines, cursor, total, evicted };
+    if (!evicted) return { ...read, missing: 0 };
+    holes.reverse();
     let older: FoundLine[] = [];
-    let total = read.total;
     let covered = 0;
     const runs = [...this.runs];
     const versions = new Map(runs.map((run) => [run.path, this.fileVersions.get(run.path) ?? 0]));
@@ -763,8 +811,11 @@ export class Capture {
     let hole = 0;
     for (const [position, run] of runs.entries()) {
       signal?.throwIfAborted();
-      if (run.index > read.cursor) break;
+      while (hole < holes.length && holes[hole].last < run.index) hole++;
+      if (hole === holes.length || run.index > holes.at(-1)!.last) break;
       const next = runs[position + 1];
+      if (next && next.index <= holes[hole].first) continue;
+      const end = Math.min(holes.at(-1)!.last, next ? next.index - 1 : cursor);
       let index = run.index;
       let pending = "";
       try {
@@ -779,13 +830,13 @@ export class Capture {
           const parts = (pending + chunk).split("\n");
           pending = parts.pop() ?? "";
           for (const raw of parts) {
-            if (index > read.cursor) break;
+            if (index > end) break;
             while (hole < holes.length && holes[hole].last < index) hole++;
             if (hole < holes.length && index >= holes[hole].first) {
               covered += 1;
               const space = raw.indexOf(" ");
               const text = raw.slice(space + 1);
-              if (matchesFilter(text, grep)) {
+              if (grep === undefined || matchesFilter(text, grep)) {
                 total += 1;
                 older.push({ index, at: Date.parse(raw.slice(0, space)), text });
                 if (older.length >= limit * 2 + 64) older = older.slice(-limit);
@@ -793,7 +844,7 @@ export class Capture {
             }
             index += 1;
           }
-          if (index > read.cursor || hole === holes.length) break;
+          if (index > end || hole === holes.length) break;
         }
       } catch {
         signal?.throwIfAborted();

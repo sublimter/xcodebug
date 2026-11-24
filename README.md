@@ -260,8 +260,8 @@ and [Codex skill documentation](https://learn.chatgpt.com/docs/build-skills).
 
 ### Use
 
-Start the client **in the project directory**. The server inherits its cwd, and
-that directory is the project root every action resolves against.
+Start the client **in the project directory or a source subdirectory**. The server
+inherits that working directory. See [project discovery](#one-shot-xcodebug-what-to-verify).
 
 ```bash
 cd ~/myapp          # holds the .xcworkspace or .xcodeproj
@@ -279,6 +279,7 @@ Enter these in the client's chat input, not in your shell, after installing the 
 | Build, install and launch | `/xcodebug launch scheme=MyApp` | `$xcodebug launch scheme=MyApp` |
 | Read filtered logs | `/xcodebug logs grep="Weather Sync" limit=100` | `$xcodebug logs grep="Weather Sync" limit=100` |
 | Wait for an event | `/xcodebug wait match="sync complete" timeoutSeconds=30` | `$xcodebug wait match="sync complete" timeoutSeconds=30` |
+| Inspect recorded runs | `/xcodebug history limit=5` | `$xcodebug history limit=5` |
 | Rebuild and rerun the last launch | `/xcodebug restart` | `$xcodebug restart` |
 | Stop capture, leave the app running | `/xcodebug stop` | `$xcodebug stop` |
 
@@ -315,10 +316,10 @@ skill is found but the MCP tool is missing, check `claude mcp list` or Codex's
 `/mcp`; installing the skill alone does not connect MCP. A `Called
 xcodebug.xcodebug` line is a tool-call record, not a command to type.
 
-Capture IDs, cursors and the last launch belong to one MCP server process.
-Claude Code and Codex each start their own server, so a capture created in one
-client cannot be read or stopped in the other. Stay in the same client session
-for `launch` → `logs`/`wait` → `restart`/`stop`.
+Live captures, cursors and the last launch belong to one server process. Stay
+in the same client session for `launch` → `logs`/`wait` → `restart`/`stop`.
+`history` can look up earlier runs stored under the same log directory, but it
+does not restore a live capture or cursor in another client.
 
 ### Claude Code live display
 
@@ -409,7 +410,7 @@ It refreshes every second, between turns too, from a build, install, launch,
 restart, syslog or await call until no operation or capture is running, then
 clears and stops reading. A session that starts or reloads the Mod reads once
 and resumes a capture already running. Calls that only read or end something
-(`doctor`, `devices`, `changes`, `status`, `logs`, `wait`, `stop`, `terminate`)
+(`doctor`, `devices`, `changes`, `history`, `status`, `logs`, `wait`, `stop`, `terminate`)
 do not start it unless they carry a `command`, and an idle session makes no
 reads. An empty band is normal in
 that idle state. Build
@@ -558,7 +559,8 @@ rather than writing logs to a guessed path.
 
 ## Configure (optional)
 
-`.xcodebug.json` in the project root:
+Optional `.xcodebug.json`: the nearest file from the invocation directory up to
+the Git worktree root wins. Outside Git, only the invocation directory is checked.
 
 ```json
 {
@@ -567,6 +569,8 @@ rather than writing logs to a guessed path.
   "configuration": "Debug",
   "bundleId": "com.example.myapp",
   "device": "My-iPhone",
+  "derivedDataPath": "build/DerivedData",
+  "xcodebuildArgs": [],
   "args": [],
   "environment": {}
 }
@@ -575,10 +579,17 @@ rather than writing logs to a guessed path.
 `device` may be a name, UDID, ECID or CoreDevice uuid. With one physical device
 connected it can be omitted.
 
-A file that is not valid JSON is an error, not an absent config: `doctor` reports
-it, and every action that would read it refuses to run rather than use the
-defaults the file was written to override. The actions that never read it -
-`devices`, `logs`, `wait`, `status`, `stop` and `await` - still work.
+Configured workspace, project and derived-data paths are relative to this file;
+explicit paths and relative `xcodebuildArgs` are resolved by the invocation
+directory and Xcode respectively. Arguments are ordered argv elements, not a
+shell string. Explicit options take precedence over configuration.
+
+Invalid JSON or invalid field types are errors, not absent config. `doctor`
+reports the selected path or error. `devices`, `logs`, `wait`, `history`,
+`status`, `stop` and `await` do not read the config and still work.
+`doctor` also reports the loaded package version, source path and source digest
+(and Git revision when available). If the installed source changes, replies
+tell you to restart the client even when the package version did not change.
 
 ## Change detection and pod install
 
@@ -646,19 +657,24 @@ run. Set `installPods=false` to skip it deliberately.
 /xcodebug verify adding a city in Weather
 ```
 
-Detects the workspace from the current directory (walking up, so a nested cwd
-works), rebuilds when the tree changed, installs, launches, and starts capturing.
+Finds the Xcode container, rebuilds when needed, installs, launches and starts
+capturing.
 Native pi/omp can push logs into the conversation; Claude Code and Codex use
 `logs`/`wait` pull reads through MCP. Both clients offer an optional live preview
 for the user. The phrase is a goal, not a log filter.
 
-- **CocoaPods vs plain project** is decided by `Podfile`/`Podfile.lock`: a
-  CocoaPods project uses its `.xcworkspace`, a plain project its `.xcodeproj`.
-- **The scheme** defaults to the container's own name (`MyApp.xcworkspace`
-  -> `MyApp`). That guess is checked once with `xcodebuild -list`; when it
-  does not exist, the scheme files are read for the one declaring
-  `BuildableName = "*.app"` (a workspace usually keeps its schemes in the
-  sibling `.xcodeproj`).
+- An explicit `workspace=` or `project=` replaces the configured container.
+  Otherwise use the nearest container at or above the invocation directory,
+  stopping at the Git worktree root. In a directory, workspaces outrank projects.
+  If none is found, search a bounded depth below that root, skipping dependency,
+  build and nested Git directories. Multiple candidates require explicit selection.
+- A scheme passed explicitly or configured wins. Otherwise inspect runnable app
+  schemes in the container and the workspace's referenced projects, then probe
+  a bounded list of Xcode schemes if needed. No name-based guess: pass `scheme=`
+  when the choice is ambiguous. A pure Swift package needs a host iOS app.
+- Scheme probes and builds receive the configured build arguments. Product
+  lookup uses the build's flags and destination and rejects ambiguous or
+  non-iOS app products. Build reuse keys include ordered flags and invocation cwd.
 - **The outcome reaches the session**, including a failed build or install - not
   just a UI toast.
 
@@ -671,7 +687,7 @@ forces the rebuild even though nothing about the invocation changed - the edited
 code is the whole point - and it retires the previous capture for that app
 through the same path as `launch`. The app identity parameters it remembers -
 goal, bundleId, processName, device, scheme/workspace/project, configuration,
-derivedDataPath, args, environment, push, match, dualChannel - are each
+derivedDataPath, xcodebuildArgs, args, environment, push, match, dualChannel - are each
 overridden by an explicit one (`/xcodebug restart device=My-iPhone`), so an
 override is never silently ignored. `installPods` and `timeoutSeconds` are
 per-invocation and always pass through. It remembers one launch - the most
@@ -941,10 +957,14 @@ xcodebug action=syslog processName=MyApp
 xcodebug action=logs limit=200
 xcodebug action=logs grep=MySDK
 xcodebug action=logs grep=MySDK times=true
+xcodebug action=logs grep=MySDK context=2
 xcodebug action=wait match="DataPacket" timeoutSeconds=30
 xcodebug action=wait match="sync (done|failed)" regex=true timeoutSeconds=30
+xcodebug action=wait match="unexpected error" since=0 absent=true timeoutSeconds=30
 
 xcodebug action=status
+xcodebug action=history limit=5
+xcodebug action=history captureId=<capture-id>
 xcodebug action=stop keepApp=true
 xcodebug action=terminate
 
@@ -999,6 +1019,27 @@ cover both outcomes of a step: `match="sync (done|failed)"`. `times=true`
 prefixes each returned line with the host time it arrived, for lining the log
 up with a test runner's own output.
 
+Filtered `logs` accepts `context=0..20` to include neighboring lines without
+counting them as matches. Evidence replies cap text at 48 KiB and indicate
+omissions; use the returned log paths for more. `wait` defaults to the most
+recent query cursor for that capture; `since=0` deliberately replays old
+evidence. A match from before the wait is labeled, not presented as a new event.
+
+`wait absent=true` succeeds only when the full interval was observed with no
+match and no known coverage gap. A match fails the assertion; missing data,
+cancellation, a disconnected bridge or an ended capture cannot prove absence.
+
+### Run history
+
+`history` reads private JSON records under `<agentDir>/logs/xcodebug/runs/`.
+Filter by exact `captureId`, `device` (name or ID), or `bundleId`; default limit
+is 20, maximum 100. Records link primary and companion captures to the log
+paths, device, Git HEAD, build fingerprint and build provenance when known.
+A bound command contributes a short label, SHA-256 and exit outcome, not the
+raw shell line, arguments or output. Finished records are retained for up to
+30 days and at most 100 ended runs. `history` does not reattach to a capture.
+
+
 ### `syslog`: attach without relaunching
 
 `launch` restarts the app because `devicectl --console` has to start it. When the
@@ -1030,7 +1071,7 @@ useful, e.g. `xcodebug action=launch match=MySDK push=wake`.
 ### Files
 
 Every capture writes timestamped logs under
-`<agentDir>/logs/xcodebug/<mode>-<bundleId>-<YYYY-MM-DD_HH-mm-ss-SSS>.log`.
+`<agentDir>/logs/xcodebug/<mode>-<bundleId>-<timestamp>-<random suffix>.log`.
 It rotates through that base path plus `.1` and `.2`, replacing the oldest
 segment after three segments. Each segment targets 50 MiB and keeps complete
 lines (a single larger line may exceed that size). Logging continues after

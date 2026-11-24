@@ -69,9 +69,8 @@ xcodebug action=launch scheme=MyApp
 xcodebug action=logs limit=200
 ```
 
-The 14 actions and their parameters are tabulated in
-[README.md § Usage](README.md#usage). Two of them differ from what the name
-suggests, so they are repeated here:
+Actions and examples are in [README.md § Usage](README.md#usage). Two actions
+with nonobvious behavior:
 
 - `stop` without `captureId` closes **every running capture**. With an ID, it
   stops that target; stopping a console primary also stops its syslog companion.
@@ -168,8 +167,8 @@ the command in `command`.
 
 What happens after `command`:
 
-1. `/bin/sh -lc` runs the whole line, with the project root as the working
-   directory (`pi.cwd` → `ctx.cwd` → process cwd).
+1. `/bin/sh -lc` runs the whole line from the invocation directory (`ctx.cwd`
+   → `pi.cwd` → process cwd).
 2. It waits for the process to exit.
 3. It stops **the capture it targeted** and cancels its queued reconnect — other
    apps' captures keep streaming.
@@ -203,7 +202,7 @@ not pass `command=` or `action=await`.
   app's capture keeps streaming.
 - It never kills the app (`stop keepApp=true` semantics), so the screen stays
   where the run left it.
-- It writes no capture state, so a later `launch`/`stop`/`logs` is unaffected.
+- It records the command label, hash and outcome in `history`, without saving the shell line.
 - No timer and no "quiet for N seconds means done" heuristic: process exit is the
   only automatic finish.
 - `timeoutSeconds` (default 1800) bounds the child process only; on timeout the
@@ -249,6 +248,8 @@ xcodebug action=logs limit=200
 xcodebug action=logs grep=MySDK
 xcodebug action=wait match="DataPacket" timeoutSeconds=30
 xcodebug action=wait match="sync (done|failed)" regex=true   # either outcome, one wait
+xcodebug action=wait match="unexpected error" absent=true timeoutSeconds=30
+xcodebug action=history limit=5
 
 # wrap up
 xcodebug action=status
@@ -262,7 +263,7 @@ xcodebug action=await command="cd /repo && npm run test:weather"
 ## Where files land
 
 Every capture is mirrored to
-`<agentDir>/logs/xcodebug/<mode>-<bundleId>-<YYYY-MM-DD_HH-mm-ss-SSS>.log`.
+`<agentDir>/logs/xcodebug/<mode>-<bundleId>-<timestamp>-<random suffix>.log`.
 
 In pi/omp, `agentDir` comes from the host (`ctx.agentDir`, else the parent of the
 session directory), so each brand writes under its own prefix (`.pi` / `.omp` /

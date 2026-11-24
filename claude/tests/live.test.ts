@@ -7,7 +7,7 @@ const BAND = {
 
 const TOOL = 'mcp__xcodebug__xcodebug'
 const LAUNCH = { tool: TOOL, action: 'launch' } as const
-const QUIET_ACTIONS = ['doctor', 'devices', 'changes', 'status', 'logs', 'wait', 'stop', 'terminate']
+const QUIET_ACTIONS = ['doctor', 'devices', 'changes', 'history', 'status', 'logs', 'wait', 'stop', 'terminate']
 const START = { surface: 'terminal', isInteractive: true, cwd: '/work' } as const
 
 const reply = (snapshot: unknown) => ({ value: { content: [{ type: 'text', text: JSON.stringify(snapshot) }] } })

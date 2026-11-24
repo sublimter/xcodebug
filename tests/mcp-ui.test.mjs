@@ -109,8 +109,19 @@ done
       await rm(root, { recursive: true, force: true });
     }
   });
-  await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ui-test", version: "1" } });
+  const { serverInfo } = await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ui-test", version: "1" } });
   const { tools } = await request("tools/list");
+  await t.test("MCP validates the advertised schema before dispatching", async () => {
+    const schema = tools.find(tool => tool.name === "xcodebug").inputSchema;
+    assert.equal(schema.additionalProperties, false);
+    assert.ok(schema.properties.absent && schema.properties.context && schema.properties.xcodebuildArgs);
+    for (const invalid of [[], null, 1, { action: "status", typo: true }]) {
+      const result = await action(invalid);
+      assert.equal(result.isError, true);
+      assert.ok(result.content[0].text.includes(serverInfo.version), result.content[0].text);
+      assert.match(result.content[0].text, invalid?.typo ? /unknown.*typo/i : /object/i);
+    }
+  });
   const [entry] = tools.find(tool => tool.name === "xcodebug_ui")._meta["openai/ui"].entrypoints;
   assert.equal(entry.type, "statusline");
   const statusline = async () => {
