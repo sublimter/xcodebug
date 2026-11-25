@@ -111,13 +111,13 @@ for analysis.
 See [Claude Code live display](README.md#claude-code-live-display) for version
 requirements, upgrade/disable steps and missing-display troubleshooting.
 
-For an optional footer in Codex CLI 0.171.0 or later, follow the
-[Codex live display setup](README.md#codex-live-display-experimental). The
-footer shows xcodebug's operation or running capture and its latest log line.
-After all operations and captures end, it restores the configured model/reasoning,
-directory, context-remaining, and fast-mode content from Codex's current snapshot.
-Select the provider once; no manual switching is needed per run. Other native
-items and styling are not mirrored. Use `logs` or `wait` for log evidence.
+For the optional footer, follow the
+[Codex live display setup](README.md#codex-live-display-experimental). When
+`quiet` advances but the count and latest line stay unchanged, the footer is
+still refreshing. Use `$xcodebug status` and `$xcodebug logs captureId=<id>` in
+the same Codex session to check the capture. A new session does not inherit it.
+When idle, the footer mirrors the supported fields from Codex's current
+snapshot without switching providers.
 
 ## Running a command alongside a capture
 

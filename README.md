@@ -155,6 +155,11 @@ for the stdio integration tests.
 
 ### Codex live display (experimental)
 
+MCP registration alone makes the tool available. The live footer also needs
+`features.tui_extensions_statusline` and the `tui.status_line_provider` selection.
+`tui.status_line` controls which supported fields are shown while idle; it does
+not select the provider.
+
 Both Codex CLI and the connected app server must be `0.171.0` or later. Setup
 enables the feature persistently and selects xcodebug for a missing or default
 provider. Alternatively start Codex with `codex --enable tui_extensions_statusline`.
@@ -185,17 +190,27 @@ See Codex's
 [provider configuration](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/app/status_line_settings.rs)
 and [discovery deadline](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/statusline_provider.rs).
 
-The footer shows xcodebug's operation or running capture and its latest log line,
-including between tool calls. When no operation or capture remains, it restores
-the configured `model-with-reasoning`, `current-dir`, `context-remaining`, and
-`fast-mode` content from Codex's current statusline snapshot, in the configured
-order. Unavailable context usage or tier information is omitted rather than
-shown as a guessed value.
-The provider stays selected; it does not rewrite global settings at each start
-or stop. Codex currently offers no delegation to its native default renderer, so
-other built-in items and their native styling are not mirrored. Clients that do
-not supply a statusline snapshot receive empty idle content. Use `action=logs`
-or `action=wait` for log evidence; the footer does not stream logs into the model.
+The footer shows xcodebug's operation or one running capture's line count and
+latest log line, including between tool calls. The count is per capture, not a
+total across channels. A new `launch` or `syslog` that replaces a capture for
+the same app starts a new count.
+
+If elapsed time and `quiet Ns` advance while the count and latest line stay
+unchanged, the footer is refreshing but that capture has no new lines to show.
+This does not distinguish app silence from a stalled bridge. In the **same
+Codex session**, use `action=status` to identify the running capture and
+`action=logs captureId=<id>` to inspect what it received. A new session does
+not inherit the live capture.
+
+When no operation or capture remains, the footer restores the configured
+`model-with-reasoning`, `current-dir`, `context-remaining`, and `fast-mode`
+content from Codex's current statusline snapshot, in order. Unavailable
+context usage or tier information is omitted rather than guessed.
+The provider stays selected; xcodebug does not rewrite global settings at each
+start or stop. Codex does not delegate to its native default renderer, so other
+built-in items and styling are not mirrored. Clients that do not supply a
+statusline snapshot receive empty idle content. The footer does not stream
+logs into the model; use `action=logs` or `action=wait` for log evidence.
 Long status text is shortened in the footer without changing the command or
 its output.
 
@@ -922,9 +937,12 @@ session.
   leaves that instance alone. Reattaching would terminate it. The session that
   did the relaunching is told as well: its `launch` reply notes that the app was
   already running and not started by it.
-- `idevicesyslog` can go silent with its process still alive; a 30s watchdog kills
-  it and the exit hook reattaches. Reattachment has exactly one owner, so the
-  watchdog and the exit hook can never both assume the other is handling it.
+- The 30s silence watchdog applies only to a syslog companion and only while
+  its primary console is still receiving logs. The watchdog stops the silent
+  bridge; the exit hook handles reattachment.
+- A standalone `action=syslog` still reconnects if its bridge exits, but does
+  not restart a live bridge on silence alone: an idle app and a stalled bridge
+  are indistinguishable without a console channel.
 - In native pi/omp push modes, after 60s with no new lines the run says so once
   and keeps capturing. MCP users use `logs`/`wait` to inspect quiet captures.
 - In pi/omp, a footer line and a widget above the editor show the live state,
