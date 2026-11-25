@@ -212,6 +212,28 @@ test("restart uses the original directory for config, build and the replayed com
   }
 });
 
+test("each workspace regenerates its Pods project for the same new source file", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const installs = join(s.root, "pod-installs");
+  await writeFile(join(s.root, "bin", "pod"), `#!/bin/sh\n/bin/pwd -P >> '${installs}'\n`, { mode: 0o755 });
+  await writeFile(join(s.repo, "Probe.podspec"), 's.name = "Probe"\ns.source_files = "Classes/**/*"\n');
+  await mkdir(join(s.repo, "Classes"));
+  await writeFile(join(s.repo, "Classes", "New.swift"), "// new source\n");
+
+  const workspaces = ["First", "Second"].map(name => join(s.repo, name));
+  for (const dir of workspaces) {
+    await mkdir(join(dir, "Pods"), { recursive: true });
+    await mkdir(join(dir, "Probe.xcworkspace"));
+    for (const name of ["Podfile", "Podfile.lock", "Pods/Manifest.lock"]) {
+      await writeFile(join(dir, name), "synced\n");
+    }
+  }
+  for (const dir of [...workspaces, workspaces[0]]) {
+    await s.ok({ action: "build", workspace: join(dir, "Probe.xcworkspace"), scheme: "Probe", device: "test-device" });
+  }
+  assert.deepEqual((await readFile(installs, "utf8")).trim().split("\n"), workspaces.map(dir => fs.realpathSync(dir)));
+});
+
 async function until(check, what, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {

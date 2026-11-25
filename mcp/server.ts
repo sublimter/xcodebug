@@ -19,9 +19,9 @@
  * SDK would add ~97 transitive packages to every install, including pi users.
  */
 import { mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { validateParameters } from "../parameters.ts";
 import { asRecord, asString } from "../exec.ts";
@@ -256,17 +256,28 @@ async function callTool(
   // Preserve invalid input for validation; spreading null or a number hides its type.
   const { cwd, ...args } = input && typeof input === "object" && !Array.isArray(input)
     ? input as Record<string, unknown> : { ...validateParameters(input), cwd: undefined };
+  let projectCwd: string | undefined;
   if (cwd !== undefined) {
     if (typeof cwd !== "string" || !isAbsolute(cwd)) {
       throw new Error("cwd must be an absolute project directory path.");
     }
-    const directory = await stat(cwd).catch((error: NodeJS.ErrnoException) => {
+    const statDirectory = (path: string) => stat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
       throw error;
     });
+    const directory = await statDirectory(cwd);
     if (!directory?.isDirectory()) {
       throw new Error(`cwd must be an existing directory: ${cwd}`);
     }
+    const normalized = resolve(cwd);
+    // Collapsing `..` before following a symlink can select a different directory.
+    if (cwd.split("/").includes("..")) {
+      const target = await statDirectory(normalized);
+      if (target?.dev !== directory.dev || target.ino !== directory.ino) {
+        throw new Error(`cwd is ambiguous: ${cwd}. Pass the resolved project directory.`);
+      }
+    }
+    projectCwd = await realpath(normalized);
   }
   if (process.env.XCODEBUG_REQUIRE_PROJECT_CWD === "1" && cwd === undefined && args.action !== "restart" &&
       (args.command !== undefined || !Object.hasOwn(CWD_FREE_ACTIONS, String(args.action)))) {
@@ -280,7 +291,7 @@ async function callTool(
       isError: true,
     };
   }
-  const progress = makeCtx(cwd ?? process.cwd(), progressToken);
+  const progress = makeCtx(projectCwd ?? process.cwd(), progressToken);
   try {
     return await tool.execute("mcp", { ...args, push: args.push === undefined ? "off" : args.push }, signal, undefined, progress.ctx);
   } finally {

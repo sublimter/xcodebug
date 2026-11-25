@@ -83,8 +83,8 @@ interface SessionState {
   builds: Map<string, { fingerprint: string; gitHead?: string; appPath: string; product: string; logFile: string; bundleId?: string; executable?: string }>;
   /** Old logs are cleared once per session, by its first run. */
   logsPruned?: boolean;
-  /** Key of the new-component-file set pod install has already handled. */
-  installedPodsFingerprint?: string;
+  /** Podfile directory -> key of the new-component-file set already installed. */
+  installedPodsFingerprints: Map<string, string>;
   /** console capture id -> parallel syslog capture id. */
   companions: Map<string, string>;
   /** capture id -> timestamp of the last line seen by the push loop. */
@@ -359,6 +359,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     pushTimers: new Map(),
     pushCursors: new Map(),
     builds: new Map(),
+    installedPodsFingerprints: new Map(),
     companions: new Map(),
     lastLineAt: new Map(),
     silenceNotified: new Set(),
@@ -1144,10 +1145,6 @@ export default function xcodebug(pi: ExtensionAPI): void {
         .sort()
         .join("|");
     const podKey = podKeyOf(report);
-    const newFilesNeedInstall =
-      options.installPods !== false &&
-      report.podsNeedingInstall.length > 0 &&
-      state.installedPodsFingerprint !== podKey;
 
     // A lock/manifest mismatch breaks every target's "Check Pods Manifest.lock"
     // phase with an error the user cannot act on from a build log, so it forces
@@ -1156,12 +1153,16 @@ export default function xcodebug(pi: ExtensionAPI): void {
       options.installPods === false || !options.containerPath
         ? undefined
         : await checkPodLockSync(resolve(options.root, options.containerPath));
+    const podfileDir = lockCheck?.podfileDir;
+    const newFilesNeedInstall =
+      options.installPods !== false &&
+      report.podsNeedingInstall.length > 0 &&
+      (podfileDir === undefined || state.installedPodsFingerprints.get(podfileDir) !== podKey);
     const lockNeedsInstall = lockCheck !== undefined && !lockCheck.synced;
 
     if (newFilesNeedInstall || lockNeedsInstall) {
       // pod install only runs in the directory that owns this container's
       // Podfile. Searching elsewhere risks reinstalling another project's pods.
-      const podfileDir = lockCheck?.podfileDir;
       if (options.preview && podfileDir) {
         return { report, needsBuild: true, podInstallNeeded: true, podInstallFailed: false, notes };
       }
@@ -1191,7 +1192,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         // Record the key derived from the post-install tree, not the one that
         // triggered this install: pod install can change the new-file set, and a
         // stale key would make the next run skip an install it still needs.
-        state.installedPodsFingerprint = podKeyOf(report);
+        state.installedPodsFingerprints.set(podfileDir, podKeyOf(report));
 
         // The install is only meaningful if the lock actually converged. Re-check
         // rather than trusting the pre-install verdict.

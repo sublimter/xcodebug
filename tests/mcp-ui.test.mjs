@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { access, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -26,6 +26,7 @@ esac
 printf '%s\\n' '${JSON.stringify({ result: { devices: [device] } })}'
 `, { mode: 0o755 });
   await writeFile(join(bin, "xcodebuild"), `#!/bin/sh
+if [ "$1" = "-version" ]; then echo 'Xcode fake'; exit 0; fi
 touch '${root}/build-started'
 printf 'CompileC UIProbe\\n'
 while [ ! -f '${root}/build-release' ]; do /bin/sleep 0.05; done
@@ -33,6 +34,7 @@ printf '** BUILD FAILED **\\n' >&2
 exit 65
 `, { mode: 0o755 });
   await writeFile(join(bin, "idevicesyslog"), `#!/bin/sh
+if [ "$1" = "--version" ]; then echo 'idevicesyslog fake'; exit 0; fi
 n=0
 while :; do
   n=$((n + 1))
@@ -134,6 +136,26 @@ done
     } finally {
       await rm(config);
     }
+  });
+  await t.test("MCP uses the same directory for config discovery and shell commands", async () => {
+    const project = await realpath(root);
+    const parent = join(project, "linked-project");
+    const actual = join(parent, "subdir");
+    const alias = join(project, "alias");
+    const config = join(parent, ".xcodebug.json");
+    await mkdir(actual, { recursive: true });
+    await writeFile(config, "{}");
+    await symlink(actual, alias);
+
+    const ambiguous = await action({ action: "await", cwd: `${alias}/..`, command: "/bin/pwd -P" });
+    assert.equal(ambiguous.isError, true, ambiguous.content[0].text);
+    assert.match(ambiguous.content[0].text, /cwd.*ambiguous/i);
+
+    const doctor = await action({ action: "doctor", cwd: alias });
+    assert.ok(doctor.content[0].text.split("\n").includes(`config: ${config}`), doctor.content[0].text);
+    const command = await action({ action: "await", cwd: alias, command: "/bin/pwd -P" });
+    assert.equal(command.details.exitCode, 0, command.content[0].text);
+    assert.ok(command.content[0].text.split("\n").includes(actual), command.content[0].text);
   });
   const [entry] = tools.find(tool => tool.name === "xcodebug_ui")._meta["openai/ui"].entrypoints;
   assert.equal(entry.type, "statusline");

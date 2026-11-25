@@ -94,6 +94,8 @@ The plugin sets a 4200-second tool timeout. The skill passes the project
 directory as MCP `cwd`; direct project tool calls need an absolute path to an
 existing directory, except for `restart`, which reuses the last launch
 directory. Do not run `xcodebug-setup-codex` for the plugin.
+MCP resolves an explicit `cwd` before discovering config or starting commands.
+If a symlink and `..` make the path ambiguous, pass the resolved project directory.
 
 For a local checkout, pass its absolute path instead of `sublimter/xcodebug`
 to either `plugin marketplace add` command.
@@ -761,8 +763,8 @@ rebuild needed: yes
 pod install needed: no
 ```
 
-`pod install` runs once per change set (tracked by fingerprint), not on every
-run. Set `installPods=false` to skip it deliberately.
+Automatic `pod install` for new files runs once per change set per Podfile
+directory, not on every run. Set `installPods=false` to skip it deliberately.
 
 ## One-shot: `/xcodebug <what to verify>`
 
