@@ -19,6 +19,7 @@
  * SDK would add ~97 transitive packages to every install, including pi users.
  */
 import { mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -235,7 +236,7 @@ function makeCtx(cwd: string, progressToken: unknown): { ctx: ExtensionContextLi
 // Typebox attaches symbol metadata; JSON round-tripping leaves a plain schema.
 const inputSchema = JSON.parse(JSON.stringify(tool.parameters)) as Record<string, unknown>;
 const { properties } = inputSchema as { properties: Record<string, unknown> };
-properties.cwd = { type: "string", description: "Absolute path to the current project directory. Required for project actions in the Codex Marketplace installation." };
+properties.cwd = { type: "string", description: "Absolute path to an existing project directory. Required for Codex Marketplace project actions except restart, which uses the last launch directory." };
 
 const CWD_FREE_ACTIONS = { devices: true, logs: true, wait: true, history: true, status: true, stop: true };
 
@@ -255,10 +256,19 @@ async function callTool(
   // Preserve invalid input for validation; spreading null or a number hides its type.
   const { cwd, ...args } = input && typeof input === "object" && !Array.isArray(input)
     ? input as Record<string, unknown> : { ...validateParameters(input), cwd: undefined };
-  if (cwd !== undefined && (typeof cwd !== "string" || !isAbsolute(cwd))) {
-    throw new Error("cwd must be an absolute project directory path.");
+  if (cwd !== undefined) {
+    if (typeof cwd !== "string" || !isAbsolute(cwd)) {
+      throw new Error("cwd must be an absolute project directory path.");
+    }
+    const directory = await stat(cwd).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
+      throw error;
+    });
+    if (!directory?.isDirectory()) {
+      throw new Error(`cwd must be an existing directory: ${cwd}`);
+    }
   }
-  if (process.env.XCODEBUG_REQUIRE_PROJECT_CWD === "1" && cwd === undefined &&
+  if (process.env.XCODEBUG_REQUIRE_PROJECT_CWD === "1" && cwd === undefined && args.action !== "restart" &&
       (args.command !== undefined || !Object.hasOwn(CWD_FREE_ACTIONS, String(args.action)))) {
     throw new Error("Pass cwd with the absolute path to your project directory.");
   }

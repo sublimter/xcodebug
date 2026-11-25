@@ -133,7 +133,7 @@ esac`);
     PRODUCT_TYPE: "com.apple.product-type.application", PLATFORM_NAME: "iphoneos",
     TARGET_BUILD_DIR: join(root, "out"), WRAPPER_NAME: "Probe.app", PRODUCT_BUNDLE_IDENTIFIER: "test.probe" } }])}' ;;
   *)
-    echo built >> "$root/builds"
+    /bin/pwd -P >> "$root/builds"
     if [ -f "$root/edit-during-build" ]; then
       /bin/rm "$root/edit-during-build"
       echo "// edited while the build ran" >> "$root/repo/A.swift"
@@ -185,7 +185,7 @@ exec /bin/sleep 120`);
     }
   });
   return {
-    root, repo, app, git, call, ok, notifications,
+    root, repo, app, git, call, ok, notifications, context,
     shutdown: () => hooks.get("session_shutdown")(),
     logs: join(agent, "logs", "xcodebug"),
     text: async args => (await ok(args)).content[0].text,
@@ -196,6 +196,21 @@ exec /bin/sleep 120`);
     prebuilt: { device: "test-device", appPath: app, bundleId: "test.probe" },
   };
 }
+
+test("restart uses the original directory for config, build and the replayed command", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const other = join(s.root, "other");
+  const commands = join(s.root, "command-cwds");
+  const original = fs.realpathSync(s.repo);
+  await mkdir(other);
+  await writeFile(join(other, ".xcodebug.json"), "invalid JSON");
+  await s.ok({ action: "launch", ...s.built, command: `/bin/pwd -P >> '${commands}'` });
+  s.context.cwd = other;
+  await s.ok({ action: "restart" });
+  for (const trace of [join(s.root, "builds"), commands]) {
+    assert.deepEqual((await readFile(trace, "utf8")).trim().split("\n"), [original, original]);
+  }
+});
 
 async function until(check, what, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;

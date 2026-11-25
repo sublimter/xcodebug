@@ -76,8 +76,8 @@ with nonobvious behavior:
   stops that target; stopping a console primary also stops its syslog companion.
   Other apps' captures are unaffected by a targeted stop. `keepApp=true` is the
   default and leaves the app running.
-- `restart` replays the last launch of this session — device, scheme, goal and
-  the `command=` it carried — and forces a rebuild.
+- `restart` replays the last launch of this session, rebuilding and rerunning
+  any saved `command=` from that launch's working directory.
 
 ## How logs reach the conversation
 

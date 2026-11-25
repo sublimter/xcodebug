@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "xcodebug": {
+    "xcodebug_marketplace": {
       "command": "bun",
       "args": ["mcp/server.ts"],
       "cwd": ".",

@@ -122,6 +122,19 @@ done
       assert.match(result.content[0].text, invalid?.typo ? /unknown.*typo/i : /object/i);
     }
   });
+  await t.test("MCP rejects missing and non-directory cwd before discovering parent config", async () => {
+    const config = join(root, ".xcodebug.json");
+    await writeFile(config, "{}");
+    try {
+      for (const cwd of [join(root, "missing"), config]) {
+        const result = await action({ action: "doctor", cwd });
+        assert.equal(result.isError, true, result.content[0].text);
+        assert.match(result.content[0].text, /cwd.*existing directory/i);
+      }
+    } finally {
+      await rm(config);
+    }
+  });
   const [entry] = tools.find(tool => tool.name === "xcodebug_ui")._meta["openai/ui"].entrypoints;
   assert.equal(entry.type, "statusline");
   const statusline = async state => {

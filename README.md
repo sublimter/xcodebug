@@ -88,11 +88,17 @@ codex plugin add xcodebug@sublimter-xcodebug
 ```
 
 Open a new Codex session in your project, select `xcodebug:xcodebug` in the `$`
-picker, and ask for `doctor`. The skill passes the project directory as MCP
-`cwd`; direct project tool calls need its absolute path. The plugin sets the
-4200-second tool timeout. For the optional footer, use the provider settings
-under [Codex live display](#codex-live-display-experimental). Do not run
-`xcodebug-setup-codex` or add a second MCP registration for this installation.
+picker, and ask for `doctor`. The plugin uses MCP server `xcodebug_marketplace`
+with a 4200-second tool timeout; `doctor` should report the plugin copy in `source:`.
+The skill passes the project directory as MCP `cwd`; direct project tool calls
+need an absolute path to an existing directory, except for `restart`, which
+reuses the last launch directory. An existing manual `xcodebug` registration can
+stay; it does not override the plugin. To retire it, finish its captures first, then
+run `codex mcp remove xcodebug` for a user registration or remove the matching
+project configuration. Do not run `xcodebug-setup-codex` for the plugin.
+For the optional footer, select the Marketplace provider below. If you set up
+the footer for an earlier Marketplace install, change its server from `xcodebug`
+to `xcodebug_marketplace`.
 
 For a local checkout, pass its absolute path instead of `sublimter/xcodebug`
 to either `plugin marketplace add` command.
@@ -202,18 +208,18 @@ service, finish active Codex tasks and captures before running
 `codex app-server daemon restart`. Opening a new TUI alone does not upgrade it.
 
 Start a new Codex session after setup or after updating the service or MCP
-server. If setup preserved another custom provider, open `/statusline`, enter
-**Choose a status line provider**, then select `xcodebug_ui`
-(`xcodebug / xcodebug_ui`). Codex 0.171.0 discovers providers from
-the user configuration. A project-level override of the same MCP server name
-can make the provider unavailable; remove the override or use a distinct name.
+server. To change providers, open `/statusline`, enter **Choose a status line
+provider**, then select `xcodebug_marketplace / xcodebug_ui` for Marketplace or
+`xcodebug / xcodebug_ui` for a manual installation. A project-level override of
+the same MCP server name can make the provider unavailable.
 
 Codex 0.171.0 has a five-second provider discovery deadline. If the global MCP
 inventory stalls, the picker can show only the default provider even though
 xcodebug itself is available. Specify the provider directly for one session:
 
 ```bash
-codex --enable tui_extensions_statusline -c 'tui.status_line_provider={server="xcodebug",tool="xcodebug_ui"}'
+# Marketplace (for manual installs, use server="xcodebug" instead)
+codex --enable tui_extensions_statusline -c 'tui.status_line_provider={server="xcodebug_marketplace",tool="xcodebug_ui"}'
 ```
 
 Setup persists the provider selection for missing/default user settings. To
@@ -315,8 +321,9 @@ and [Codex skill documentation](https://learn.chatgpt.com/docs/build-skills).
 
 ### Use
 
-Start the client **in the project directory or a source subdirectory**. The server
-inherits that working directory. See [project discovery](#one-shot-xcodebug-what-to-verify).
+Start the client **in the project directory or a source subdirectory**. The
+Codex Marketplace skill passes this directory as `cwd`; other installations
+use the inherited working directory by default. See [project discovery](#one-shot-xcodebug-what-to-verify).
 
 ```bash
 cd ~/myapp          # holds the .xcworkspace or .xcodeproj
@@ -751,6 +758,8 @@ The shell line a launch carried with `command=` is remembered too, and `restart`
 runs it again after the relaunch - that is what closes the edit → restart → test
 loop. Pass a new `command="..."` to override it, or `command=""` to clear it so
 the next restart only rebuilds and relaunches.
+Restart reads configuration, rebuilds, and reruns the command from the last
+launch's working directory. Use a new `launch` to switch directories.
 
 ## `command=`: run a shell line alongside a capture
 

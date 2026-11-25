@@ -109,6 +109,7 @@ interface SessionState {
    * `restart` always targets the app launched last.
    */
   lastLaunch?: {
+    cwd: string;
     bundleId: string;
     processName?: string;
     goal?: string;
@@ -1376,16 +1377,13 @@ export default function xcodebug(pi: ExtensionAPI): void {
   const runAction = async (
     params: ToolParams,
     ctx: ExtensionContext,
+    projectRoot: string,
     signal: AbortSignal | undefined,
     onUpdate: ((update: { content: Array<{ type: "text"; text: string }>; details: unknown }) => void) | undefined,
   ): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean }> => {
     state.uiCtx = ctx;
-    // Resolved once per action: `pi.cwd` is undefined under pi 1.4.0, and every
-    // lookup below (config, change detection, container discovery, the command's
-    // working directory) must agree on one root or they disagree about the project.
-    const projectRoot = resolveProjectRoot(pi, ctx);
     const action = params.action;
-    const configRead = (action === "doctor" || !CONFIG_FREE_ACTIONS.has(action))
+    const configRead = (action === "doctor" || (action !== "restart" && !CONFIG_FREE_ACTIONS.has(action)))
       ? await readConfigDetails(projectRoot).then(
         ({ config, path }) => ({ config, path, error: undefined }),
         (error: Error) => ({ config: {} as ProjectConfig, path: undefined, error }),
@@ -1578,7 +1576,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         build: true,
         force: true,
       };
-      const result = await runAction(replay, ctx, signal, onUpdate);
+      const result = await runAction(replay, ctx, projectRoot, signal, onUpdate);
       return {
         content: [{
           type: "text",
@@ -1754,6 +1752,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // for it after a code change. The device and the phrase are the parts a
       // user should not have to repeat.
       state.lastLaunch = {
+        cwd: projectRoot,
         bundleId: resolvedBundleId,
         processName: executable,
         goal: params.goal,
@@ -2047,14 +2046,15 @@ export default function xcodebug(pi: ExtensionAPI): void {
     // and that launch may have carried the shell line. Resolving it here is what
     // makes the edit → restart → test loop work; reading only `params.command`
     // would rebuild and relaunch while silently skipping the test.
-    const command =
-      params.command ?? (params.action === "restart" ? state.lastLaunch?.command : undefined);
-    const primary = await runAction(params, ctx, signal, onUpdate);
+    const last = params.action === "restart" ? state.lastLaunch : undefined;
+    const command = params.command ?? last?.command;
+    const projectRoot = last?.cwd ?? resolveProjectRoot(pi, ctx);
+    const primary = await runAction(params, ctx, projectRoot, signal, onUpdate);
     if (primary.isError === true || !command || params.action === "await") {
       return { ...primary, ranCommand: false };
     }
     setRunPhase(`command: ${command}`);
-    const outcome = await runCaseThenStop({ ...params, command }, signal, resolveProjectRoot(pi, ctx));
+    const outcome = await runCaseThenStop({ ...params, command }, signal, projectRoot);
     const head = primary.content[0]?.text ?? "";
     return {
       content: [{ type: "text", text: `${head}\n\n${outcome.text}` }],
