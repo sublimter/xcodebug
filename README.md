@@ -67,6 +67,7 @@ implementation. Claude Code can also load the optional native display below.
 ### Install from Marketplace
 
 With [Bun](https://bun.sh) on the client's `PATH`, choose one installation path per client.
+If you already have a manual setup, follow [the migration steps](#migrate-an-existing-manual-installation) after installing.
 
 **Claude Code** (2.1.331 verified):
 
@@ -76,9 +77,7 @@ claude plugin install xcodebug@sublimter-xcodebug --scope user
 ```
 
 Open a new Claude session in your project and run `/xcodebug:xcodebug doctor`.
-The plugin bundles the skill, MCP server, and live display Mod. If replacing a
-manual installation, disable the manually installed `xcodebug-live` Mod and
-remove the old MCP registration after its captures finish.
+The plugin bundles the skill, MCP server, and live display Mod.
 
 **Codex CLI** (0.172.0 verified):
 
@@ -87,21 +86,73 @@ codex plugin marketplace add sublimter/xcodebug
 codex plugin add xcodebug@sublimter-xcodebug
 ```
 
-Open a new Codex session in your project, select `xcodebug:xcodebug` in the `$`
-picker, and ask for `doctor`. The plugin uses MCP server `xcodebug_marketplace`
-with a 4200-second tool timeout; `doctor` should report the plugin copy in `source:`.
-The skill passes the project directory as MCP `cwd`; direct project tool calls
-need an absolute path to an existing directory, except for `restart`, which
-reuses the last launch directory. An existing manual `xcodebug` registration can
-stay; it does not override the plugin. To retire it, finish its captures first, then
-run `codex mcp remove xcodebug` for a user registration or remove the matching
-project configuration. Do not run `xcodebug-setup-codex` for the plugin.
-For the optional footer, select the Marketplace provider below. If you set up
-the footer for an earlier Marketplace install, change its server from `xcodebug`
-to `xcodebug_marketplace`.
+The plugin name is **xcodebug** (`xcodebug@sublimter-xcodebug`); its internal
+MCP server is `xcodebug_marketplace` so the old `xcodebug` registration cannot
+shadow it. In a new project session, select `xcodebug:xcodebug` in the `$`
+picker and ask for `doctor`. Its `source:` should point to the plugin copy.
+The plugin sets a 4200-second tool timeout. The skill passes the project
+directory as MCP `cwd`; direct project tool calls need an absolute path to an
+existing directory, except for `restart`, which reuses the last launch
+directory. Do not run `xcodebug-setup-codex` for the plugin.
 
 For a local checkout, pass its absolute path instead of `sublimter/xcodebug`
 to either `plugin marketplace add` command.
+
+### Migrate an existing manual installation
+
+Install the Marketplace plugin and verify it first. Finish or stop any old
+captures from the session that started them before removing the old registration;
+live captures do not transfer. Installation does not edit your manual settings.
+Save the old xcodebug entries before changing them. If a registration uses a
+custom command, environment, or timeout you still need, review the differences
+before removing it; the plugin does not import those settings.
+
+#### Codex migration
+
+1. In a new project session, run `doctor` through `xcodebug:xcodebug` and
+   confirm `source:` points to the installed plugin, not the old checkout or npm
+   install. Inspect the old registration with `codex mcp get xcodebug`.
+2. If `tui.status_line_provider` is `{ server = "xcodebug", tool = "xcodebug_ui" }`,
+   save it, then change only `server` to `xcodebug_marketplace`. Leave other
+   providers and the default footer unchanged. This also applies when upgrading
+   an earlier Marketplace install that used the old provider name.
+3. For a confirmed xcodebug registration in the user `config.toml` (under
+   `${CODEX_HOME:-$HOME/.codex}`), save its entry and run `codex mcp remove xcodebug`.
+   For a project `.codex/config.toml` registration, review it with the project
+   owner and remove only the matching entry if no one still uses it. Reopen
+   Codex and verify `doctor` again.
+
+**Rollback:** Run `codex plugin remove xcodebug@sublimter-xcodebug`, restore
+the saved MCP entry and any changed footer selection in their original config
+files, then open a new session.
+
+#### Claude Code migration
+
+1. In a new project session, run `/xcodebug:xcodebug doctor`. Confirm `/mcp`
+   lists the bundled `plugin:xcodebug:xcodebug` as connected. Use
+   `claude mcp get xcodebug` to inspect the old registration and its scope.
+   Claude Code [hides duplicate endpoints](https://code.claude.com/docs/en/mcp.md#scope-hierarchy-and-precedence):
+   if both registrations use the same `mcp/server.ts` path, install the
+   Marketplace plugin from a separate checkout to verify it before removing
+   the manual registration.
+2. If `claude plugin list` shows the enabled standalone Mod, run
+   `claude plugin disable xcodebug-live@skills-dir`. For a confirmed user-scope
+   xcodebug registration, save its entry and run
+   `claude mcp remove --scope user xcodebug`. For a local-scope registration,
+   run the same command with `--scope local` from its project. Review shared
+   `.mcp.json` entries with the project owner before changing them.
+3. Reopen Claude Code. Verify `/xcodebug:xcodebug doctor` still works and `/mcp`
+   no longer lists the retired manual server in the migrated scope.
+
+**Rollback:** Run `claude plugin disable xcodebug@sublimter-xcodebug --scope user`,
+restore the saved MCP entry in its original scope, and, if you disabled the
+standalone Mod for this migration, run `claude plugin enable xcodebug-live@skills-dir`.
+Open a new session.
+
+If you no longer use a manually linked skill, move the matching user symlink
+(`~/.agents/skills/xcodebug` for Codex or `~/.claude/skills/xcodebug` for Claude
+Code) out of the skills directory so only the bundled entry is offered. Keep
+links used by other clients or projects; move any retired link back on rollback.
 
 ### Set up manually (once per machine)
 

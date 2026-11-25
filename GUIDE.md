@@ -12,6 +12,9 @@ with `$` in Codex. For a manual MCP connection, install the
 A bare invocation builds as needed, installs, launches and starts capturing.
 Add `status` to inspect the current captures without launching.
 
+Switching from a manual setup? Follow [the migration steps](README.md#migrate-an-existing-manual-installation)
+to verify the plugin before retiring the old registration.
+
 For a manual installation only, run `xcodebug-setup-codex` once. It registers
 the server when missing, adds the 4200-second timeout only when no custom
 timeout exists, enables the statusline feature on Codex CLI 0.171.0+, and selects
