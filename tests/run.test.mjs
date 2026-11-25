@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { getEventListeners } from "node:events";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
@@ -45,8 +46,20 @@ async function session(t) {
   const script = (name, body) => writeFile(join(bin, name), `#!/bin/sh\nroot='${root}'\n${body}\n`, { mode: 0o755 });
   await script("xcrun", `case " $* " in
   *" --version "*) echo "fake devicectl" ;;
-  *" list devices "*) printf '%s\\n' '${JSON.stringify({ result: { devices: [DEVICE] } })}' ;;
-  *" device install app "*) exit 0 ;;
+  *" list devices "*)
+    echo queried >> "$root/device-queries"
+    if [ -f "$root/hold-devices" ]; then
+      echo $$ > "$root/device-query.pid"
+      exec /bin/sleep 120
+    fi
+    printf '%s\\n' '${JSON.stringify({ result: { devices: [DEVICE] } })}' ;;
+  *" device install app "*)
+    echo installed >> "$root/installs"
+    if [ -f "$root/hold-install" ]; then
+      echo $$ > "$root/install.pid"
+      exec /bin/sleep 120
+    fi
+    exit 0 ;;
   *" device info processes "*)
     if [ -f "$root/bad-table" ]; then echo invalid-json; exit 0; fi
     if [ -f "$root/stale-table" ] || { [ -f "$root/late-table" ] && [ -f "$root/launches" ]; }; then
@@ -112,6 +125,7 @@ async function session(t) {
     }
     printf 'Launched application with test.probe bundle identifier.\\n'
     printf 'instance %s logging\\n' "$n" >&2
+    trap '/bin/rm -f "$root/pid"; write_launch_result; exit 0' TERM
     while :; do
       if [ "$n" = 1 ] && [ -f "$root/drop" ]; then write_launch_result; exit 1; fi
       if [ -f "$root/die" ]; then
@@ -134,6 +148,11 @@ esac`);
     TARGET_BUILD_DIR: join(root, "out"), WRAPPER_NAME: "Probe.app", PRODUCT_BUNDLE_IDENTIFIER: "test.probe" } }])}' ;;
   *)
     /bin/pwd -P >> "$root/builds"
+    if [ -f "$root/hold-build" ]; then
+      echo $$ > "$root/build.pid"
+      printf "CompileC probe.o (in target 'Probe' from project 'Probe')\\n"
+      exec /bin/sleep 120
+    fi
     if [ -f "$root/edit-during-build" ]; then
       /bin/rm "$root/edit-during-build"
       echo "// edited while the build ran" >> "$root/repo/A.swift"
@@ -147,6 +166,7 @@ esac`);
     printf 'EARLY_MARKER the line the check waits for\\n'
     /usr/bin/awk 'BEGIN { for (i = 0; i < 30000; i++) print "filler line " i }' ;;
 esac
+echo $$ > "$root/syslog.pid"
 exec /bin/sleep 120`);
 
   const git = (...args) => execFileSync("git", [
@@ -161,12 +181,16 @@ exec /bin/sleep 120`);
   const oldPath = process.env.PATH;
   process.env.PATH = `${bin}:${oldPath}`;
   let tool;
+  let command;
   const hooks = new Map();
+  const messages = [];
   xcodebug({ cwd: repo, registerTool(value) { tool = value; }, on(name, fn) { hooks.set(name, fn); },
-    registerCommand() {}, sendMessage() {} });
+    registerCommand(_name, value) { command = value; }, sendMessage(message) { messages.push(message); } });
   const notifications = [];
+  const uiState = {};
   const context = { cwd: repo, agentDir: agent, hasUI: true, ui: {
-    setStatus() {}, setWidget() {}, notify(message, level) { notifications.push({ message, level }); },
+    setStatus(_name, value) { uiState.status = value; }, setWidget(_name, value) { uiState.widget = value; },
+    notify(message, level) { notifications.push({ message, level }); },
   } };
   const call = (args, signal) => tool.execute("test", { push: "off", dualChannel: false, ...args }, signal, undefined, context);
   const ok = async args => {
@@ -185,7 +209,8 @@ exec /bin/sleep 120`);
     }
   });
   return {
-    root, repo, app, git, call, ok, notifications, context,
+    root, repo, app, git, call, ok, notifications, messages, context, uiState, tool,
+    native: args => command.handler(args, context),
     shutdown: () => hooks.get("session_shutdown")(),
     logs: join(agent, "logs", "xcodebug"),
     text: async args => (await ok(args)).content[0].text,
@@ -234,6 +259,273 @@ test("each workspace regenerates its Pods project for the same new source file",
   assert.deepEqual((await readFile(installs, "utf8")).trim().split("\n"), workspaces.map(dir => fs.realpathSync(dir)));
 });
 
+test("stop cancels an executing command even when no capture exists", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const caller = new AbortController();
+  const pidFile = join(s.root, "stop-command.pid");
+  const running = s.call({ action: "await", command: `echo $$ > '${pidFile}'; exec /bin/sleep 120` }, caller.signal);
+  try {
+    const pid = await until(() => readFile(pidFile, "utf8").then(Number, () => undefined), "command to start");
+    assert.match(s.uiState.status, /command:/);
+    const stopped = await s.ok({ action: "stop" });
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, "stop must end the owned command before replying");
+    assert.equal((await running).isError, true);
+    assert.doesNotMatch(stopped.content[0].text, /nothing to stop/);
+    assert.equal(caller.signal.aborted, false, "stop must not abort its caller's controller");
+    assert.equal(getEventListeners(caller.signal, "abort").length, 0, "settlement removes caller cancellation listeners");
+    assert.equal(s.uiState.status, undefined);
+    assert.equal(s.uiState.widget, undefined);
+    await s.ok({ action: "await", command: ":" });
+  } finally {
+    caller.abort();
+    await running.catch(() => {});
+  }
+});
+
+test("stop cancels installation before launch or syslog startup", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  await s.flag("hold-install");
+  const launching = s.native(`launch device="${s.prebuilt.device}" appPath="${s.prebuilt.appPath}" bundleId="${s.prebuilt.bundleId}" dualChannel=true push=off`);
+  const pid = await until(() => readFile(join(s.root, "install.pid"), "utf8").then(Number, () => undefined), "installation to start");
+  const stopped = await s.ok({ action: "stop" });
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  await launching;
+  assert.match(stopped.content[0].text, /cancelled/);
+  assert.equal(await s.count("installs"), 1);
+  assert.equal(await s.count("launches"), 0);
+  assert.equal(await s.count("syslog.pid"), 0);
+  assert.equal(s.uiState.status, undefined);
+  assert.equal(s.uiState.widget, undefined);
+});
+
+test("native stop cancels a no-capture build and already-admitted tool and native work", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  await s.flag("hold-build");
+  const building = s.native(`build device="${s.built.device}" project="${s.built.project}" scheme="${s.built.scheme}"`);
+  const pid = await until(() => readFile(join(s.root, "build.pid"), "utf8").then(Number, () => undefined), "native build to start");
+  const queries = await s.count("device-queries");
+  const marker = join(s.root, "queued-command");
+  const queuedTool = s.call({ action: "status", command: `: > '${marker}'` });
+  const queuedNative = s.native("devices");
+  await Promise.all([s.native("stop"), s.ok({ action: "stop" })]);
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  assert.equal((await queuedTool).isError, true);
+  await Promise.all([building, queuedNative]);
+  assert.equal(await s.count("queued-command"), 0, "an admitted command must not start after stop");
+  assert.equal(await s.count("device-queries"), queries, "an admitted native discovery must not start after stop");
+  assert.equal(await s.count("builds"), 1);
+  const stop = s.messages.find(message => message.details?.action === "stop");
+  assert.match(stop.content, /cancelled \d+ operation/);
+  assert.doesNotMatch(stop.content, /nothing to stop/);
+  assert.equal(s.messages.find(message => message.details?.action === "devices").details.isError, true);
+  assert.equal(s.uiState.status, undefined);
+  assert.equal(s.uiState.widget, undefined);
+  await s.native("devices");
+  assert.equal(s.messages.at(-1).details.isError, false, "calls after the stop boundary remain usable");
+});
+
+test("registered stop cancels native discovery before any install or capture startup", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  await s.flag("hold-devices");
+  const launching = s.native(`launch device="${s.prebuilt.device}" appPath="${s.prebuilt.appPath}" bundleId="${s.prebuilt.bundleId}" dualChannel=true push=off`);
+  const pid = await until(() => readFile(join(s.root, "device-query.pid"), "utf8").then(Number, () => undefined), "device discovery to start");
+  assert.match(s.uiState.status, /resolving/);
+  const stopped = await s.ok({ action: "stop" });
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  await launching;
+  assert.doesNotMatch(stopped.content[0].text, /nothing to stop/);
+  assert.equal(await s.count("installs"), 0);
+  assert.equal(await s.count("launches"), 0);
+  assert.equal(await s.count("syslog.pid"), 0);
+  assert.equal(s.uiState.status, undefined);
+  assert.equal(s.uiState.widget, undefined);
+  await rm(join(s.root, "hold-devices"));
+  await s.ok({ action: "devices" });
+});
+
+test("native stop cancels a pod install without starting the build or appended command", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const pidFile = join(s.root, "pod.pid");
+  await writeFile(join(s.root, "bin", "pod"), `#!/bin/sh\necho $$ > '${pidFile}'\nexec /bin/sleep 120\n`, { mode: 0o755 });
+  await writeFile(join(s.repo, "Probe.podspec"), 's.name = "Probe"\ns.source_files = "Classes/**/*"\n');
+  await mkdir(join(s.repo, "Classes"));
+  await writeFile(join(s.repo, "Classes", "New.swift"), "// new source\n");
+  await mkdir(join(s.repo, "Pods"));
+  await mkdir(join(s.repo, "Probe.xcworkspace"));
+  for (const name of ["Podfile", "Podfile.lock", "Pods/Manifest.lock"]) await writeFile(join(s.repo, name), "synced\n");
+  const building = s.call({ action: "build", workspace: join(s.repo, "Probe.xcworkspace"), scheme: "Probe",
+    device: "test-device", command: `: > '${join(s.root, "after-pods")}'` });
+  const pid = await until(() => readFile(pidFile, "utf8").then(Number, () => undefined), "pod install to start");
+  await s.native("stop");
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  assert.equal((await building).isError, true);
+  assert.equal(await s.count("builds"), 0);
+  assert.equal(await s.count("after-pods"), 0);
+  assert.equal(s.uiState.status, undefined);
+  assert.equal(s.uiState.widget, undefined);
+});
+
+test("scoped stop and invalid controls preserve an unrelated build and its UI owner", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const id = (await s.ok({ action: "syslog", device: "test-device", processName: "Other" })).details.capture.id;
+  await s.flag("hold-build");
+  let settled = false;
+  const building = s.native(`build device="${s.built.device}" project="${s.built.project}" scheme="${s.built.scheme}"`).then(() => { settled = true; });
+  const pid = await until(() => readFile(join(s.root, "build.pid"), "utf8").then(Number, () => undefined), "unrelated build to start");
+  const controlCtx = { ...s.context, ui: { setStatus() {}, setWidget() {}, notify() {} } };
+  const control = params => s.tool.execute("control", params, undefined, undefined, controlCtx);
+  await control({ action: "status" });
+  await assert.rejects(control({ action: "stop", keepApp: "invalid" }), /keepApp/);
+  await assert.rejects(control({ action: "stop", captureId: "" }), /capture/i);
+  await s.native("stop keepApp=invalid");
+  assert.equal(s.messages.at(-1).details.isError, true);
+  assert.match(s.uiState.status, /^🔨 xcodebug/);
+  assert.ok(s.uiState.widget);
+  const stopped = await control({ action: "stop", captureId: id });
+  assert.ok(!stopped.isError, stopped.content[0].text);
+  assert.doesNotThrow(() => process.kill(pid, 0), "capture selection must not cancel an unrelated execution");
+  assert.equal(settled, false);
+  assert.match(s.uiState.status, /^🔨 xcodebug/);
+  assert.ok(s.uiState.widget);
+  const appendedMarker = join(s.root, "scoped-stop-command");
+  const appended = s.call({ action: "stop", captureId: id, command: `: > '${appendedMarker}'` });
+  await delay(20);
+  assert.equal(fs.existsSync(appendedMarker), false, "a scoped stop's command must remain behind the unrelated build");
+  assert.match(s.uiState.status, /^🔨 xcodebug/);
+  assert.ok(s.uiState.widget);
+  await control({ action: "stop" });
+  await building;
+  assert.equal((await appended).isError, true, "bare stop must cancel the scoped stop's preparing command");
+  assert.equal(fs.existsSync(appendedMarker), false);
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  assert.equal(s.uiState.status, undefined, "completion must clear the original build context, not the control context");
+  assert.equal(s.uiState.widget, undefined);
+});
+
+test("stop keepApp=false still terminates the app when cancelling a command", { timeout: 30_000 }, async t => {
+  for (const appended of [false, true]) await t.test(appended ? "appended" : "existing capture", async t => {
+    const s = await session(t);
+    const pidFile = join(s.root, "terminating-command.pid");
+    const command = `echo $$ > '${pidFile}'; exec /bin/sleep 120`;
+    const id = appended ? undefined : (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+    const running = appended ? s.call({ action: "launch", ...s.prebuilt, command }) : s.call({ action: "await", captureId: id, command });
+    const pid = await until(() => readFile(pidFile, "utf8").then(Number, () => undefined), "command to start before terminating");
+    await s.ok({ action: "stop", keepApp: false });
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+    assert.equal((await running).isError, true);
+    assert.equal(await s.count("pid"), 0, "cancellation must not downgrade requested app termination to a keep-app capture kill");
+  });
+});
+
+test("a later stop cancels a command appended to stop without deadlocking cleanup", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const pidFile = join(s.root, "stop-appended-command.pid");
+  const running = s.native(`stop command="echo $$ > '${pidFile}'; exec /bin/sleep 120"`);
+  const pid = await until(() => readFile(pidFile, "utf8").then(Number, () => undefined), "stop's appended command to start");
+  const stopped = await s.ok({ action: "stop" });
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  await running;
+  assert.match(stopped.content[0].text, /cancelled/);
+  assert.doesNotMatch(stopped.content[0].text, /nothing to stop/);
+  assert.equal(s.messages.at(-1).details.isError, true);
+  await s.ok({ action: "await", command: ":" });
+});
+
+test("stop suppresses a pending reconnect while an executing command is settling", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const id = (await s.ok({ action: "launch", ...s.prebuilt })).details.capture.id;
+  const pidFile = join(s.root, "slow-cancellation.pid");
+  const running = s.call({ action: "await", captureId: id,
+    command: `trap '' INT; echo $$ > '${pidFile}'; exec /bin/sleep 120` });
+  const pid = await until(() => readFile(pidFile, "utf8").then(Number, () => undefined), "SIGINT-resistant command to start");
+  await s.flag("drop");
+  await s.ok({ action: "stop" });
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  assert.equal((await running).isError, true);
+  await delay(1_200);
+  assert.equal(await s.count("launches"), 1, "the stop boundary must suppress reconnect startup, not merely kill its eventual bridge");
+  assert.equal(Number(await readFile(join(s.root, "pid"), "utf8")), 4001);
+});
+
+
+test("stop cancels appended and replayed commands while leaving the app running by default", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+  const pidFile = join(s.root, "appended-command.pid");
+  const launching = s.call({ action: "launch", ...s.prebuilt, ...s.built,
+    command: `echo $$ > '${pidFile}'; exec /bin/sleep 120` });
+  let pid = await until(() => readFile(pidFile, "utf8").then(Number, () => undefined), "appended command to start");
+  await s.native("stop");
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  assert.equal((await launching).isError, true);
+  assert.equal(Number(await readFile(join(s.root, "pid"), "utf8")), 4001, "keepApp defaults to true");
+  assert.equal((await s.ok({ action: "status" })).details.captures.some(capture => capture.running), false);
+  await rm(pidFile);
+  const replaying = s.native("restart push=off dualChannel=false");
+  pid = await until(() => readFile(pidFile, "utf8").then(Number, () => undefined), "replayed command to start");
+  await s.ok({ action: "stop" });
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  await replaying;
+  assert.equal(s.messages.at(-1).details.isError, true);
+  assert.equal(Number(await readFile(join(s.root, "pid"), "utf8")), 4002);
+  assert.equal(s.uiState.status, undefined);
+  assert.equal(s.uiState.widget, undefined);
+  await s.ok({ action: "await", command: ":" });
+});
+
+test("scoped stop does not cancel another capture's wait but bare stop does", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const first = (await s.ok({ action: "syslog", device: "test-device", processName: "First" })).details.capture.id;
+  const second = (await s.ok({ action: "syslog", device: "test-device", processName: "Second" })).details.capture.id;
+  let settled = false;
+  const waiting = s.call({ action: "wait", captureId: first, match: "NEVER_LOGGED", timeoutSeconds: 120 });
+  void waiting.then(() => { settled = true; }, () => { settled = true; });
+  await delay(0);
+  await s.ok({ action: "stop", captureId: second });
+  assert.equal(settled, false);
+  assert.equal((await s.ok({ action: "status" })).details.captures.find(capture => capture.id === first).running, true);
+  await s.native("stop");
+  const result = await waiting;
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /cancelled/);
+  assert.equal(s.uiState.status, undefined);
+  assert.equal(s.uiState.widget, undefined);
+});
+
+test("caller cancellation reaches discovery and releases its forwarding listener", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const caller = new AbortController();
+  await s.flag("hold-devices");
+  const discovering = s.call({ action: "devices" }, caller.signal);
+  const pid = await until(() => readFile(join(s.root, "device-query.pid"), "utf8").then(Number, () => undefined), "cancellable discovery to start");
+  caller.abort();
+  assert.equal((await discovering).isError, true);
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  assert.equal(getEventListeners(caller.signal, "abort").length, 0);
+  await rm(join(s.root, "hold-devices"));
+  await s.ok({ action: "devices" });
+});
+
+test("session teardown cancels active and queued execution without late startup", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const pidFile = join(s.root, "shutdown-command.pid");
+  const outcome = promise => promise.then(value => ({ value }), error => ({ error }));
+  const running = outcome(s.call({ action: "await", command: `echo $$ > '${pidFile}'; exec /bin/sleep 120` }));
+  const pid = await until(() => readFile(pidFile, "utf8").then(Number, () => undefined), "command owned by the session to start");
+  const queuedTool = outcome(s.call({ action: "build", ...s.built }));
+  const queuedNative = s.native("syslog device=test-device processName=Late push=off");
+  await s.shutdown();
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  assert.match((await running).error?.message ?? "", /session is shutting down/);
+  assert.match((await queuedTool).error?.message ?? "", /session is shutting down/);
+  await queuedNative;
+  assert.equal(await s.count("builds"), 0);
+  assert.equal(await s.count("launches"), 0);
+  assert.equal(await s.count("syslog.pid"), 0);
+  assert.equal(s.uiState.status, undefined);
+  assert.equal(s.uiState.widget, undefined);
+  await assert.rejects(s.call({ action: "build", ...s.built }), /session is shutting down/);
+});
+
 async function until(check, what, timeoutMs = 10_000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -264,6 +556,153 @@ function holdLaunchResult(root) {
     syncBuiltinESMExports();
   } };
 }
+function holdCaptureStartup(logs, method) {
+  const original = fs.promises[method];
+  let entered = false;
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  fs.promises[method] = async (path, ...args) => {
+    const result = await original(path, ...args);
+    const owned = method === "mkdir" ? String(path) === logs
+      : method === "mkdtemp" ? String(path).startsWith(join(logs, ".xcodebug-launch-"))
+        : String(path).startsWith(join(logs, ".xcodebug-launch-")) && String(path).endsWith("/owner.json");
+    if (owned && !entered) {
+      entered = true;
+      await pending;
+    }
+    return result;
+  };
+  syncBuiltinESMExports();
+  return { entered: () => entered, release, restore() {
+    release();
+    fs.promises[method] = original;
+    syncBuiltinESMExports();
+  } };
+}
+
+for (const method of ["mkdir", "mkdtemp", "writeFile"]) {
+  test(`stop bounds held capture startup ${method} and keeps later work ordered`, { timeout: 25_000 }, async t => {
+    const s = await session(t);
+    const runningId = (await s.ok({ action: "syslog", device: "test-device", processName: "Other" })).details.capture.id;
+    const bridgePid = await until(() => readFile(join(s.root, "syslog.pid"), "utf8").then(Number, () => undefined), "the existing syslog bridge to start");
+    const startup = holdCaptureStartup(s.logs, method);
+    const launching = s.native(`launch device="${s.prebuilt.device}" appPath="${s.prebuilt.appPath}" bundleId="${s.prebuilt.bundleId}" push=off dualChannel=false command=": > '${join(s.root, "late-launch-command")}'"`);
+    const marker = join(s.root, "late-stop-command");
+    let queued;
+    let later;
+    try {
+      await until(startup.entered, "startup filesystem operation to be held");
+      queued = s.call({ action: "status", command: `: > '${join(s.root, "queued-before-stop")}'` });
+      const startedAt = Date.now();
+      const stopping = s.call({ action: "stop", command: `: > '${marker}'` });
+      await until(() => {
+        try { process.kill(bridgePid, 0); return false; } catch (error) { return error.code === "ESRCH"; }
+      }, "an unrelated running capture to stop before the startup join", 1_500);
+      const stopped = await Promise.race([stopping, delay(6_500).then(() => { assert.fail("stop exceeded its cleanup budget"); })]);
+      assert.ok(Date.now() - startedAt < 6_500);
+      assert.equal(stopped.isError, true);
+      assert.equal(stopped.details.cleanupPending, true);
+      assert.match(stopped.content[0].text, /cleanup.*pending|cleanup incomplete/i);
+      assert.doesNotMatch(stopped.content[0].text, /nothing to stop/);
+      assert.match(s.uiState.status, /stopping|cleanup.*pending/i);
+      assert.ok(s.uiState.widget);
+      assert.equal((await s.ok({ action: "status" })).details.captures.find(capture => capture.id === runningId).running, false);
+      assert.equal(await s.count("late-stop-command"), 0);
+      let laterSettled = false;
+      later = s.call({ action: "status", command: `: > '${join(s.root, "after-stop")}'` });
+      void later.then(() => { laterSettled = true; });
+      await delay(20);
+      assert.equal(laterSettled, false, "ordinary work must stay behind unresolved startup resources");
+      const repeated = await Promise.race([s.call({ action: "stop" }), delay(6_500).then(() => { assert.fail("a subsequent stop hung on pending cleanup"); })]);
+      assert.equal(repeated.details.cleanupPending, true);
+      assert.equal(repeated.isError, true);
+      startup.release();
+      await launching;
+      assert.equal((await queued).isError, true);
+      assert.equal((await later).isError, true, "the subsequent stop cancels the preparing ordinary request");
+      assert.equal(await s.count("launches"), 0);
+      for (const name of ["late-launch-command", "late-stop-command", "queued-before-stop", "after-stop"]) assert.equal(await s.count(name), 0);
+      assert.deepEqual((await readdir(s.logs)).filter(name => name.startsWith(".xcodebug-launch-")), []);
+      await until(() => s.uiState.status === undefined, "final cleanup to clear the pending UI");
+      assert.equal(s.uiState.widget, undefined);
+      await s.ok({ action: "await", command: ":" });
+    } finally {
+      startup.restore();
+      await Promise.allSettled([launching, queued, later]);
+    }
+  });
+
+  test(`shutdown bounds held capture startup ${method} without a late bridge`, { timeout: 15_000 }, async t => {
+    const s = await session(t);
+    await s.ok({ action: "syslog", device: "test-device", processName: "Other" });
+    const bridgePid = await until(() => readFile(join(s.root, "syslog.pid"), "utf8").then(Number, () => undefined), "the existing syslog bridge to start before shutdown");
+    const startup = holdCaptureStartup(s.logs, method);
+    const launching = s.call({ action: "launch", ...s.prebuilt, command: `: > '${join(s.root, "shutdown-late-command")}'` }).then(value => ({ value }), error => ({ error }));
+    const stderr = [];
+    t.mock.method(console, "error", (...args) => { stderr.push(args.map(String).join(" ")); });
+    try {
+      await until(startup.entered, "startup filesystem operation to be held at shutdown");
+      const queued = s.native("devices");
+      const queries = await s.count("device-queries");
+      const startedAt = Date.now();
+      const closing = s.shutdown();
+      await until(() => {
+        try { process.kill(bridgePid, 0); return false; } catch (error) { return error.code === "ESRCH"; }
+      }, "a running capture to stop before the shutdown join", 1_500);
+      await Promise.race([closing, delay(4_500).then(() => { assert.fail("shutdown exceeded its cleanup budget"); })]);
+      assert.ok(Date.now() - startedAt < 4_500);
+      assert.ok(s.notifications.some(({ message, level }) => level === "warning" && /shutdown cleanup incomplete/.test(message)));
+      assert.ok(stderr.some(message => /shutdown cleanup incomplete/.test(message)));
+      assert.match(s.uiState.status, /stopping|cleanup.*pending/i);
+      assert.ok(s.uiState.widget);
+      startup.release();
+      assert.match((await launching).error?.message ?? "", /session is shutting down/);
+      await queued;
+      assert.equal(await s.count("device-queries"), queries);
+      assert.equal(await s.count("launches"), 0);
+      assert.equal(await s.count("shutdown-late-command"), 0);
+      assert.deepEqual((await readdir(s.logs)).filter(name => name.startsWith(".xcodebug-launch-")), []);
+      await until(() => s.uiState.status === undefined, "late shutdown cleanup to clear pending UI");
+      assert.equal(s.uiState.widget, undefined);
+    } finally {
+      startup.restore();
+      await launching;
+    }
+  });
+}
+
+test("native stop reports pending cleanup when another stop cancels its preparing command", { timeout: 20_000 }, async t => {
+  const s = await session(t);
+  const startup = holdCaptureStartup(s.logs, "mkdtemp");
+  const launching = s.call({ action: "launch", ...s.prebuilt });
+  let stopping;
+  try {
+    await until(startup.entered, "startup to remain held while native stop prepares");
+    stopping = s.native(`stop command=": > '${join(s.root, "cancelled-native-stop-command")}'"`);
+    await delay(20);
+    const repeated = s.call({ action: "stop" });
+    await Promise.race([stopping, delay(6_500).then(() => { assert.fail("native preparing stop exceeded its cleanup budget"); })]);
+    const message = s.messages.find(message => message.details?.action === "stop");
+    assert.equal(message.details.isError, true);
+    assert.equal(message.details.cleanupPending, true);
+    assert.match(message.content, /cleanup.*pending|cleanup incomplete/i);
+    const result = await repeated;
+    assert.equal(result.details.cleanupPending, true);
+    assert.match(result.content[0].text, /cancelled 1 operation/);
+    assert.match(s.uiState.status, /stopping|cleanup.*pending/i);
+    startup.release();
+    assert.equal((await launching).isError, true);
+    assert.equal(await s.count("cancelled-native-stop-command"), 0);
+    assert.equal(await s.count("launches"), 0);
+    assert.deepEqual((await readdir(s.logs)).filter(name => name.startsWith(".xcodebug-launch-")), []);
+    await until(() => s.uiState.status === undefined, "cancelled preparing stop cleanup to finish");
+  } finally {
+    startup.restore();
+    await Promise.allSettled([launching, stopping]);
+  }
+});
+
+
 
 test("unknown arguments and invalid types are rejected before any device work", async t => {
   const s = await session(t);

@@ -4,6 +4,7 @@
  * Every invocation is bounded by a timeout and a byte cap so a stuck
  * xcrun/devicectl call can never wedge a tool call or grow without limit.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 
 export interface CommandResult {
@@ -31,18 +32,44 @@ export interface CommandOptions {
   onChunk?: (stream: "stdout" | "stderr", chunk: string) => void;
 }
 
+const commandSignals = new AsyncLocalStorage<AbortSignal>();
+
+/** Include subprocesses started by nested discovery/config helpers in the action's cancellation. */
+export function withCommandSignal<T>(signal: AbortSignal, work: () => T): T {
+  return commandSignals.run(signal, work);
+}
+
+/** Bound the wait, not the work; rejection also means the underlying task has settled. */
+export function settlesWithin(work: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+    timer.unref?.();
+    const done = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    void work.then(done, done);
+  });
+}
+
 export function runCommand(
   command: string,
   args: string[],
   options: CommandOptions = {},
 ): Promise<CommandResult> {
-  const { cwd, timeoutMs = 120_000, maxBytes = 2_000_000, signal, onChunk } = options;
+  const { cwd, timeoutMs = 120_000, maxBytes = 2_000_000, signal: explicitSignal, onChunk } = options;
+  const inheritedSignal = commandSignals.getStore();
+  const signal = inheritedSignal && explicitSignal && inheritedSignal !== explicitSignal
+    ? AbortSignal.any([inheritedSignal, explicitSignal])
+    : explicitSignal ?? inheritedSignal;
+  signal?.throwIfAborted();
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
     let settled = false;
     let truncated = false;
+    let abortTimer: ReturnType<typeof setTimeout> | undefined;
 
     // `detached` puts the child in its own process group so the whole tree can
     // be signalled at once. `sh -lc "cd x && npm test"` runs the real work as a
@@ -51,18 +78,21 @@ export function runCommand(
     // still open - the promise would hang forever and the runner would outlive
     // the cancelled run.
     const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
-    const killTree = (): void => {
+    const killTree = (signal: NodeJS.Signals = "SIGKILL"): void => {
       const pid = child.pid;
       if (pid === undefined) return;
       try {
-        process.kill(-pid, "SIGKILL");
+        process.kill(-pid, signal);
       } catch {
         // No process group (already gone, or detached failed): fall back.
-        child.kill("SIGKILL");
+        child.kill(signal);
       }
     };
     const onAbort = (): void => {
-      killTree();
+      // Let xcodebuild cancel its build-service work before forcing down its process group.
+      killTree("SIGINT");
+      abortTimer = setTimeout(() => killTree(), 2_000);
+      abortTimer.unref?.();
     };
     if (signal) {
       if (signal.aborted) onAbort();
@@ -91,7 +121,10 @@ export function runCommand(
     const finish = (code: number): void => {
       if (settled) return;
       settled = true;
+      // The direct child can exit while an ignored-SIGINT descendant remains in its group.
+      if (signal?.aborted) killTree();
       if (timer) clearTimeout(timer);
+      clearTimeout(abortTimer);
       signal?.removeEventListener("abort", onAbort);
       resolve({ stdout, stderr, code, timedOut, truncated });
     };

@@ -17,7 +17,7 @@ export const parameters = Type.Object({
   bundleId: text("Defaults to the built product's CFBundleIdentifier"),
   appPath: text("Install this .app instead of building"),
   processName: text("Executable/process name for syslog filtering"),
-  captureId: text("Capture to query or control, or exact run to look up in history"),
+  captureId: text("Capture to query/control, or exact run for history. stop with an ID is scoped; without one it cancels executing/queued work and all captures."),
   since: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, description: "Exclusive capture line index. logs defaults to 0. wait resumes from the last logs/wait reply for this capture. Use 0 to replay." })),
   limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum log lines (default 200) or history records" })),
   grep: text("logs: return lines containing this text"),

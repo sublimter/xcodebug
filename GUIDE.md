@@ -65,6 +65,9 @@ model must answer — not a log filter.
 /xcodebug analyse weather command="cd /repo && npm run test:xxx"
 ```
 
+Native command text uses `action key=value ...`. JSON parameter objects are for
+structured tool/MCP calls, not stringified native slash-command text.
+
 **Tool call** (for the model)
 
 ```text
@@ -75,10 +78,16 @@ xcodebug action=logs limit=200
 Actions and examples are in [README.md § Usage](README.md#usage). Two actions
 with nonobvious behavior:
 
-- `stop` without `captureId` closes **every running capture**. With an ID, it
-  stops that target; stopping a console primary also stops its syslog companion.
-  Other apps' captures are unaffected by a targeted stop. `keepApp=true` is the
-  default and leaves the app running.
+- `stop` without `captureId` cancels running/queued xcodebug actions and closes
+  **every running capture**, even when only a build or command is running.
+  With an ID, it only stops that capture and its syslog companion, leaving
+  unrelated execution alone. `keepApp=true` is the default and leaves the app running.
+  Cancelling pod install does not roll back generated files; rerun it before building.
+  Stop waits up to five seconds for native cleanup; shutdown keeps its three-second
+  deadline. `cleanupPending=true` is an error: resources remain unfinished, pending
+  native cleanup retains its stopping display, and later work waits for settlement.
+  An appended command is skipped when cleanup is incomplete.
+  Do not restart cancelled work unless the user requests it.
 - `restart` replays the last launch of this session, rebuilding and rerunning
   any saved `command=` from that launch's working directory.
 
@@ -293,10 +302,10 @@ exceptions are documented under [disk files](README.md#files).
 
 ## Three rules of use
 
-1. **Stop once the log has answered the question.** A capture left running keeps
-   consuming capture resources; native push modes also keep sending log batches.
-2. **Do not stop while the user has not acted yet.** Silence there means "not
-   tried yet", not "finished" — say what to tap and keep listening.
+1. **Stop a completed goal's capture with `captureId`.** Do not stop unrelated
+   execution or other captures; do not leave the completed capture streaming.
+2. **Do not stop merely because the user has not acted yet.** Silence is not proof
+   of completion. Say what to tap and keep listening, unless the user asks to stop.
 3. **A console capture ends when the app process is confirmed gone.** Its syslog
    companion is stopped too, and `status` says why it ended and where the crash
    report is, if the device wrote one. A standalone `syslog` capture is not

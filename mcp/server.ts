@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { validateParameters } from "../parameters.ts";
-import { asRecord, asString } from "../exec.ts";
+import { asRecord, asString, settlesWithin } from "../exec.ts";
 import { runtimeVersion } from "../version.ts";
 
 /** Only the fields index.ts reads off its context. */
@@ -39,6 +39,7 @@ interface ExtensionContextLike {
 interface ToolResult {
   content: Array<{ type: "text"; text: string }>;
   isError?: boolean;
+  details?: unknown;
 }
 
 /** The slice of a pi-registered tool this server forwards to. */
@@ -248,14 +249,21 @@ function replyError(id: unknown, code: number, message: string): void {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`);
 }
 
+interface StopBoundary {
+  controllers: AbortController[];
+  settled: Promise<void>;
+}
+
 async function callTool(
   input: unknown,
   signal: AbortSignal,
   progressToken: unknown,
+  stopBoundary?: StopBoundary,
 ): Promise<ToolResult> {
   // Preserve invalid input for validation; spreading null or a number hides its type.
   const { cwd, ...args } = input && typeof input === "object" && !Array.isArray(input)
     ? input as Record<string, unknown> : { ...validateParameters(input), cwd: undefined };
+  if (stopBoundary) validateParameters(args);
   let projectCwd: string | undefined;
   if (cwd !== undefined) {
     if (typeof cwd !== "string" || !isAbsolute(cwd)) {
@@ -291,15 +299,67 @@ async function callTool(
       isError: true,
     };
   }
+  if (signal.aborted) throw new Error("Request cancelled");
+  let cancelled = 0;
+  const bareStop = stopBoundary && args.captureId === undefined;
+  const appendedCommand = bareStop && args.command ? args.command : undefined;
   const progress = makeCtx(projectCwd ?? process.cwd(), progressToken);
   try {
-    return await tool.execute("mcp", { ...args, push: args.push === undefined ? "off" : args.push }, signal, undefined, progress.ctx);
+    // Apply native termination intent before forwarded request aborts can stop consoles.
+    const backendArgs: Record<string, unknown> = { ...args, push: args.push === undefined ? "off" : args.push };
+    if (appendedCommand) delete backendArgs.command;
+    const execution = tool.execute("mcp", backendArgs, signal, undefined, progress.ctx);
+    if (bareStop) {
+      for (const controller of stopBoundary.controllers) {
+        if (pendingActions.has(controller) && !controller.signal.aborted) {
+          controller.abort();
+          cancelled++;
+        }
+      }
+    }
+    let result = await execution;
+    if (bareStop) {
+      const details = asRecord(result.details);
+      const primary = asRecord(details.primary ?? details);
+      const cleanupPending = primary.cleanupPending === true || !await settlesWithin(stopBoundary.settled, 3_000);
+      if (cleanupPending) {
+        const idleStopMessage = asString(primary.idleStopMessage);
+        const text = result.content[0]?.text ?? "";
+        const suffix = idleStopMessage && text.startsWith(idleStopMessage) ? text.slice(idleStopMessage.length) : text ? `\n${text}` : "";
+        result = {
+          ...result,
+          content: [{ type: "text", text: `Cleanup is still pending for admitted requests.${suffix}` }, ...result.content.slice(1)],
+          details: details.primary ? { ...details, primary: { ...primary, cleanupPending: true } } : { ...details, cleanupPending: true },
+          isError: true,
+        };
+      } else if (appendedCommand && !result.isError) {
+        signal.throwIfAborted();
+        const command = await tool.execute("mcp", { ...args, action: "await", push: args.push === undefined ? "off" : args.push }, signal, undefined, progress.ctx);
+        result = {
+          content: [{ type: "text", text: `${result.content[0]?.text ?? ""}\n\n${command.content[0]?.text ?? ""}` }],
+          details: { primary: result.details, command: command.details },
+          isError: command.isError,
+        };
+      }
+    }
+    if (cancelled > 0) {
+      const details = asRecord(result.details);
+      const primary = asRecord(details.primary ?? details);
+      const idleStopMessage = asString(primary.idleStopMessage);
+      const text = result.content[0]?.text ?? "";
+      // Replace only an idle primary header; an appended command's output is opaque.
+      const suffix = idleStopMessage && text.startsWith(idleStopMessage)
+        ? text.slice(idleStopMessage.length)
+        : text ? `\n${text}` : "";
+      return { ...result, content: [{ type: "text", text: `Cancelled ${cancelled} admitted request(s).${suffix}` }, ...result.content.slice(1)] };
+    }
+    return result;
   } finally {
     progress.close();
   }
 }
 
-async function handle(message: Record<string, unknown>, controller?: AbortController): Promise<void> {
+async function handle(message: Record<string, unknown>, controller?: AbortController, stopBoundary?: StopBoundary): Promise<void> {
   const id = message.id;
   const method = message.method;
   // Notifications carry no id and must never be answered.
@@ -345,7 +405,7 @@ async function handle(message: Record<string, unknown>, controller?: AbortContro
         reply(id, { content: [{ type: "text", text: "Request cancelled" }], isError: true });
         return;
       }
-      reply(id, await callTool(params.arguments === undefined ? {} : params.arguments, controller!.signal, params._meta?.progressToken));
+      reply(id, await callTool(params.arguments === undefined ? {} : params.arguments, controller!.signal, params._meta?.progressToken, stopBoundary));
     } catch (error) {
       reply(id, { content: [{ type: "text", text: (error as Error).message }], isError: true });
     }
@@ -354,11 +414,12 @@ async function handle(message: Record<string, unknown>, controller?: AbortContro
   replyError(id, -32601, `Unknown method "${String(method)}"`);
 }
 
-// Requests are serialized: a capture's state is a plain map, and two overlapping
-// calls (launch + stop) would interleave mutations on it.
+// Ordinary requests are serialized. Stops bypass execution but join the queue's
+// settlement barrier so later calls cannot start until the stop has finished.
 let queue: Promise<void> = Promise.resolve();
 /** Admitted calls, including queued calls, so cancellation cannot miss one. */
 const inflight = new Map<unknown, AbortController>();
+const pendingActions = new Set<AbortController>();
 
 /**
  * Stop what the client's calls started, then exit.
@@ -373,11 +434,9 @@ async function shutdown(code: number): Promise<void> {
   exiting = true;
   for (const controller of inflight.values()) controller.abort();
   try {
-    // Aborting is not settlement: an operation may still be rolling back a
-    // partially started capture. Teardown must run after that rollback, never
-    // concurrently with it, and queued work must not start after this barrier.
-    await queue;
-    await endSession?.();
+    // Native cleanup has its own deadline; do not hide it behind held adapter I/O.
+    const cleanup = endSession?.();
+    await Promise.all([cleanup, settlesWithin(queue, 3_000)]);
     if (!process.stdout.destroyed) {
       await new Promise<void>(resolve => process.stdout.write("", () => resolve()));
     }
@@ -452,13 +511,27 @@ input.on("line", (line) => {
   const controller = message.method === "tools/call" && message.id !== undefined
     ? new AbortController() : undefined;
   if (controller) inflight.set(message.id, controller);
-  queue = queue.then(async () => {
+  const params = asRecord(message.params);
+  const stop = controller && params?.name === "xcodebug" && asRecord(params.arguments)?.action === "stop";
+  const stopBoundary = stop ? { controllers: [...pendingActions], settled: queue } : undefined;
+  if (controller && params.name === "xcodebug" && (!stop || asRecord(params.arguments).command !== undefined)) {
+    pendingActions.add(controller);
+  }
+  const run = async () => {
     try {
-      if (!exiting) await handle(message, controller);
+      await handle(message, controller, stopBoundary);
     } finally {
-      if (controller && inflight.get(message.id) === controller) inflight.delete(message.id);
+      if (controller) {
+        pendingActions.delete(controller);
+        if (inflight.get(message.id) === controller) inflight.delete(message.id);
+      }
     }
-  }).catch((error: unknown) => {
-    console.error("xcodebug-mcp:", error);
-  });
+  };
+  const reportError = (error: unknown) => { console.error("xcodebug-mcp:", error); };
+  if (stop) {
+    const stopping = run().catch(reportError);
+    queue = Promise.all([queue, stopping]).then(() => undefined);
+  } else {
+    queue = queue.then(run).catch(reportError);
+  }
 });

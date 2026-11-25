@@ -22,7 +22,7 @@ import { waitForEvidence } from "./log-wait.ts";
 import { runtimeVersion } from "./version.ts";
 import { commandIdentity, pruneRunHistory, RunHistory, runHistoryResult, type RunIdentity } from "./history.ts";
 import { describeDevices, findProcessPid, listDevices, lookupProcess, pullCrashReport, resolveDevice, type DeviceInfo } from "./devices.ts";
-import { asRecord, lastLines, runCommand, timestamp } from "./exec.ts";
+import { asRecord, lastLines, runCommand, settlesWithin, timestamp, withCommandSignal } from "./exec.ts";
 import { buildForDevice, consoleLaunchArgs, installApp, terminateApp, type BuildOutcome, type BuildTarget } from "./xcode.ts";
 import { checkPodLockSync, describeChanges, detectChanges, directorySignature, runPodInstall, type ChangeReport } from "./changes.ts";
 import { clearArchives, pruneLogs } from "./archive.ts";
@@ -369,12 +369,33 @@ export default function xcodebug(pi: ExtensionAPI): void {
 
   // History can evict an ended capture before its launch-result cleanup finishes.
   const ownedCaptures = new Set<Capture>();
+  const captureStarts = new Map<Promise<void>, Capture>();
+  const stoppingCleanups = new Set<Promise<void>>();
   const retiredCleanupWarnings: string[] = [];
   let shuttingDown = false;
+  type OwnedOperation = {
+    controller: AbortController;
+    captures: Set<Capture>;
+    terminateCaptures: boolean;
+    settled: Promise<void>;
+  };
+  type ActionResult = {
+    content: Array<{ type: "text"; text: string }>;
+    details: unknown;
+    isError?: boolean;
+  };
+  type ActionUpdate = (update: ActionResult) => void;
+  type OperationResult = ActionResult & { ranCommand: boolean };
+  const operations = new Set<OwnedOperation>();
+  let activeOperation: OwnedOperation | undefined;
+  let executionTail = Promise.resolve();
+  let stopTail = Promise.resolve();
   const startCapture = async (capture: Capture, signal?: AbortSignal, identity?: RunIdentity): Promise<void> => {
     if (shuttingDown) throw new Error("xcodebug session is shutting down");
+    signal?.throwIfAborted();
     if (identity) history.begin(capture, dirname(capture.logFile), identity);
     ownedCaptures.add(capture);
+    if (activeOperation && signal === activeOperation.controller.signal) activeOperation.captures.add(capture);
     const release = (): void => {
       const result = capture.launchResult;
       void capture.waitForLaunchResults().then(() => {
@@ -386,15 +407,20 @@ export default function xcodebug(pi: ExtensionAPI): void {
       });
     };
     const unsubscribe = capture.onExit(() => { unsubscribe(); release(); });
+    const startup = capture.start(signal);
+    const settled = startup.then(() => {}, () => {});
+    captureStarts.set(settled, capture);
     try {
-      await capture.start(signal);
+      await startup;
       if (shuttingDown) throw new Error("xcodebug session is shutting down");
+      signal?.throwIfAborted();
       if (!capture.stoppedByUser && !capture.processExited) history.update(capture, { state: "running" });
     } catch (error) {
       history.update(capture, { state: capture.stoppedByUser || identity ? "ended" : "reconnecting",
         endReason: identity && !capture.stoppedByUser ? "capture failed to start" : undefined });
       throw error;
     } finally {
+      captureStarts.delete(settled);
       if (!capture.running) {
         unsubscribe();
         release();
@@ -410,6 +436,11 @@ export default function xcodebug(pi: ExtensionAPI): void {
   const refreshStatus = (): void => {
     const ctx = state.uiCtx;
     if (!ctx?.hasUI) return;
+    if (stoppingCleanups.size > 0 && (!activeOperation || activeOperation.controller.signal.aborted)) {
+      ctx.ui.setStatus("xcodebug", "xcodebug · stopping · resource cleanup pending");
+      ctx.ui.setWidget("xcodebug", ["Xcodebug · stopping", "  Resource cleanup remains pending"], { placement: "aboveEditor" });
+      return;
+    }
     const phase = state.runPhase;
     if (phase) {
       const secs = Math.round((Date.now() - phase.startedAt) / 1000);
@@ -528,7 +559,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       state.captures.delete(oldest);
     }
     if (state.activeCaptureId === capture.id) state.activeCaptureId = undefined;
-    if (![...state.captures.values()].some((c) => c.running)) stopStatusTicker();
+    if (!state.runPhase && ![...state.captures.values()].some((c) => c.running)) stopStatusTicker();
     refreshStatus();
   };
 
@@ -584,12 +615,24 @@ export default function xcodebug(pi: ExtensionAPI): void {
     state.lastLineAt.delete(capture.id);
     state.silenceNotified.delete(capture.id);
     state.pushCursors.delete(capture.id);
-    if (![...state.captures.values()].some((c) => c !== capture && c.running)) stopStatusTicker();
+    if (!state.runPhase && ![...state.captures.values()].some((c) => c !== capture && c.running)) stopStatusTicker();
     refreshStatus();
     history.stop(capture, terminateApp ? "terminated" : "capture stopped");
     capture.stop(terminateApp);
     if (!capture.running) releaseCapture(capture);
     if (state.activeCaptureId === capture.id) state.activeCaptureId = undefined;
+  };
+  const joinCaptureExits = (captures: Capture[]): Promise<void>[] => captures.map(capture => {
+    if (!capture.running) return Promise.resolve();
+    return new Promise<void>(resolve => {
+      const unsubscribe = capture.onExit(() => { unsubscribe(); resolve(); });
+    });
+  });
+
+  const trackStoppingCleanup = (cleanup: Promise<void>): void => {
+    stoppingCleanups.add(cleanup);
+    refreshStatus();
+    void cleanup.then(() => { stoppingCleanups.delete(cleanup); refreshStatus(); });
   };
 
 
@@ -1067,19 +1110,16 @@ export default function xcodebug(pi: ExtensionAPI): void {
   const requireCapture = (captureId?: string): Capture => {
     // A capture that exited (app quit or crashed) clears activeCaptureId but stays
     // in the map so its log file is still reachable. With one candidate left, an
-    // explicit id is unnecessary — without this, `stop`/`logs` report a puzzling
+    // explicit id is unnecessary — without this, `logs`/`wait` report a puzzling
     // `Unknown capture ""` even though the capture is right there.
     //
-    // A launch also records two captures (console + its syslog companion) and the
-    // command phase clears activeCaptureId when it stops the pair, so the plain
-    // `stop` a user types next hits the same empty-id case with four entries in
-    // the map. Falling back to the one running primary keeps that working: the
-    // companion is excluded because stopping it alone would leave the console
-    // bridge streaming, which is the opposite of what `stop` means.
+    // A launch records a console primary and a syslog companion. If activeCaptureId
+    // has been cleared, implicit reads/waits still prefer the running primary
+    // rather than selecting the companion's duplicate stream.
     const running = [...state.captures.values()].filter((c) => c.running);
     const runningPrimaries = running.filter((c) => !isCompanion(c));
     const fallback =
-      !captureId && !state.activeCaptureId
+      captureId === undefined && !state.activeCaptureId
         ? (state.captures.size === 1
             ? state.captures.values().next().value
             : runningPrimaries.length === 1
@@ -1087,7 +1127,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
               : undefined)
         : undefined;
     const id = captureId ?? state.activeCaptureId ?? fallback?.id;
-    const capture = id ? state.captures.get(id) : undefined;
+    const capture = id !== undefined ? state.captures.get(id) : undefined;
     if (!capture) {
       const known = [...state.captures.values()].map(
         (item) => `${item.id} (${item.mode}${item.running ? ", running" : ", ended"})`,
@@ -1096,7 +1136,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // one, and an empty selector in the message reads like a bug in the tool.
       throw new Error(
         known.length > 0
-          ? `${captureId ? `Unknown capture "${captureId}"` : "Several captures exist and none is active"} ` +
+          ? `${captureId !== undefined ? `Unknown capture "${captureId}"` : "Several captures exist and none is active"} ` +
             `- pass captureId. Known: ${known.join(", ")}`
           : "No active capture. Run xcodebug with action=launch (or action=syslog) first.",
       );
@@ -1271,7 +1311,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     const startedAt = Date.now();
     // The capture is optional on purpose: a case run with nothing being
     // captured still reports its exit code instead of failing.
-    const target = params.captureId
+    const target = params.captureId !== undefined
       ? state.captures.get(params.captureId)
       : state.activeCaptureId
         ? state.captures.get(state.activeCaptureId)
@@ -1312,8 +1352,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
     const elapsedS = Math.round((Date.now() - startedAt) / 1000);
 
     // Stopping is scoped to the targeted capture: a second app under debug
-    // keeps streaming. The app itself is left running (keepApp semantics), so
-    // the screen stays where the case left it.
+    // keeps streaming. Completion leaves the app running unless a concurrent
+    // bare stop explicitly requested termination with keepApp=false.
     let captureNote = "no capture was running; nothing to stop";
     if (target) {
       // A bridge that is already down went down by itself, and the reply has to
@@ -1322,7 +1362,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // which would relaunch the app now that the case is over.
       const wasRunning = target.running && !target.processExited;
       const wasUserStopped = target.stoppedByUser && !target.endReason;
-      stopCapture(target, false);
+      stopCapture(target, activeOperation?.controller.signal === signal && activeOperation?.terminateCaptures === true);
       // Report collection is independent; stop a queued reattach before awaiting it.
       if (!wasRunning && !wasUserStopped) await waitForCrashReport(target, signal);
       await target.waitForExit(5_000);
@@ -1340,9 +1380,11 @@ export default function xcodebug(pi: ExtensionAPI): void {
       }
     }
 
-    const verdict = result.timedOut
-      ? `timed out after ${timeoutMs / 1000}s (process killed)`
-      : `exit ${result.code}`;
+    const verdict = signal?.aborted
+      ? "cancelled"
+      : result.timedOut
+        ? `timed out after ${timeoutMs / 1000}s (process killed)`
+        : `exit ${result.code}`;
     const tail = lastLines(`${result.stdout}\n${result.stderr}`, 40);
     const text = [
       `awaited ${label} · ${verdict} · ${elapsedS}s`,
@@ -1357,6 +1399,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
         command: params.command,
         exitCode: result.code,
         timedOut: result.timedOut,
+        cancelled: signal?.aborted === true,
         elapsedSeconds: elapsedS,
         captureId: target?.id,
         cursor: since,
@@ -1365,7 +1408,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       },
       // A non-zero exit is a failed case, and the caller must see it as such
       // rather than as a successful "run finished".
-      isError: result.timedOut || result.code !== 0,
+      isError: signal?.aborted === true || result.timedOut || result.code !== 0,
     };
   };
 
@@ -1380,10 +1423,12 @@ export default function xcodebug(pi: ExtensionAPI): void {
     ctx: ExtensionContext,
     projectRoot: string,
     signal: AbortSignal | undefined,
-    onUpdate: ((update: { content: Array<{ type: "text"; text: string }>; details: unknown }) => void) | undefined,
-  ): Promise<{ content: Array<{ type: "text"; text: string }>; details: unknown; isError?: boolean }> => {
-    state.uiCtx = ctx;
+    onUpdate: ActionUpdate | undefined,
+    stopContext?: { targets: Capture[]; cancelledOperations: number; cleanupPending: boolean },
+  ): Promise<ActionResult> => {
     const action = params.action;
+    const control = action === "stop" || (action === "status" && params.command === undefined);
+    if (!control || !activeOperation) state.uiCtx = ctx;
     const configRead = (action === "doctor" || (action !== "restart" && !CONFIG_FREE_ACTIONS.has(action)))
       ? await readConfigDetails(projectRoot).then(
         ({ config, path }) => ({ config, path, error: undefined }),
@@ -1506,7 +1551,6 @@ export default function xcodebug(pi: ExtensionAPI): void {
         timeoutMs: (params.timeoutSeconds ?? 900) * 1000,
         signal,
       });
-      clearRunPhase();
       let notRemembered: string | undefined;
       if (outcome.ok) {
         notRemembered = await rememberBuild(buildKey, gate.report, projectRoot, containerPath, outcome);
@@ -1646,7 +1690,6 @@ export default function xcodebug(pi: ExtensionAPI): void {
           timeoutMs: (params.timeoutSeconds ?? 900) * 1000,
           signal,
         });
-        clearRunPhase();
         if (!build.ok) {
           return {
             content: [{ type: "text", text: `${notes.join("\n")}\n${build.summary}\nlog: ${build.logFile}` }],
@@ -1779,7 +1822,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // instead uses the identity from this launch's own command result.
       if (!before.queryFailed) await discoverAppPid(capture, device, before.pid, signal);
       if (signal?.aborted) {
-        stopCapture(capture, false);
+        stopCapture(capture, activeOperation?.controller.signal === signal && activeOperation?.terminateCaptures === true);
         await capture.waitForExit(3_000);
         signal.throwIfAborted();
       }
@@ -1957,23 +2000,27 @@ export default function xcodebug(pi: ExtensionAPI): void {
       // nothing left to close. That is the state the caller asked for, so it
       // reports success; only an explicitly named capture that never existed is
       // an error (requireCapture throws for that).
-      const targets = params.captureId
+      const cancelledOperations = stopContext?.cancelledOperations ?? 0;
+      const cleanupPending = stopContext?.cleanupPending === true;
+      const cancellation = cancelledOperations > 0 ? `cancelled ${cancelledOperations} operation(s)` : "";
+      const targets = stopContext?.targets ?? (params.captureId !== undefined
         ? [requireCapture(params.captureId)]
-        : [...state.captures.values()].filter((c) => !state.endedCaptures.has(c.id));
-      if (targets.length === 0) {
+        : [...state.captures.values()].filter((c) => !state.endedCaptures.has(c.id)));
+      if (targets.length === 0 && !cleanupPending) {
         const known = [...state.captures.values()].map((c) => `${c.id} (${c.mode}, ended)`);
+        const idleStopMessage = known.length > 0
+          ? `nothing to stop - every capture has already ended: ${known.join(", ")}`
+          : "nothing to stop - no capture has been started in this session";
         return {
-          content: [{
-            type: "text",
-            text: known.length > 0
-              ? `nothing to stop - every capture has already ended: ${known.join(", ")}`
-              : "nothing to stop - no capture has been started in this session",
-          }],
-          details: { captures: [...state.captures.values()].map((capture) => capture.status()) },
+          content: [{ type: "text", text: cancellation || idleStopMessage }],
+          details: { captures: [...state.captures.values()].map((capture) => capture.status()), cancelledOperations,
+            ...(cancelledOperations === 0 ? { idleStopMessage } : {}) },
         };
       }
-      for (const capture of targets) stopCapture(capture, !keepApp);
-      for (const capture of targets) await capture.waitForExit(5_000);
+      if (!stopContext) {
+        for (const capture of targets) stopCapture(capture, !keepApp);
+        await Promise.all(targets.map(capture => capture.waitForExit(5_000)));
+      }
       const lines = targets.map((capture) => {
         const status = capture.status();
         return `${status.id} (${status.mode}) ${status.running ? "still shutting down" : "exited"} · ${status.lineCount} lines · ${status.logFile}`;
@@ -1981,9 +2028,10 @@ export default function xcodebug(pi: ExtensionAPI): void {
       return {
         content: [{
           type: "text",
-          text: `stopped ${targets.length} capture(s)\n${lines.join("\n")}`,
+          text: `${cleanupPending ? "stop cleanup incomplete; resource cleanup remains pending" : `stopped ${targets.length} capture(s)`}${cancellation ? `\n${cancellation}` : ""}\n${lines.join("\n")}`,
         }],
-        details: { captures: targets.map((capture) => capture.status()) },
+        details: { captures: targets.map((capture) => capture.status()), cancelledOperations, ...(cleanupPending ? { cleanupPending: true } : {}) },
+        isError: cleanupPending,
       };
     }
 
@@ -2011,6 +2059,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     }
 
     if (action === "await") {
+      if (params.command) setRunPhase(`command: ${params.command}`);
       const outcome = await runCaseThenStop(params, signal, projectRoot);
       return {
         content: [{ type: "text", text: outcome.text }],
@@ -2036,13 +2085,9 @@ export default function xcodebug(pi: ExtensionAPI): void {
     params: ToolParams,
     ctx: ExtensionContext,
     signal: AbortSignal | undefined,
-    onUpdate: ((update: { content: Array<{ type: "text"; text: string }>; details: unknown }) => void) | undefined,
-  ): Promise<{
-    content: Array<{ type: "text"; text: string }>;
-    details: unknown;
-    isError?: boolean;
-    ranCommand: boolean;
-  }> => {
+    onUpdate: ActionUpdate | undefined,
+    completedAction?: ActionResult,
+  ): Promise<OperationResult> => {
     // `restart` names no command of its own: it replays the remembered launch,
     // and that launch may have carried the shell line. Resolving it here is what
     // makes the edit → restart → test loop work; reading only `params.command`
@@ -2050,10 +2095,12 @@ export default function xcodebug(pi: ExtensionAPI): void {
     const last = params.action === "restart" ? state.lastLaunch : undefined;
     const command = params.command ?? last?.command;
     const projectRoot = last?.cwd ?? resolveProjectRoot(pi, ctx);
-    const primary = await runAction(params, ctx, projectRoot, signal, onUpdate);
+    const primary = completedAction ?? await runAction(params, ctx, projectRoot, signal, onUpdate);
     if (primary.isError === true || !command || params.action === "await") {
       return { ...primary, ranCommand: false };
     }
+    signal?.throwIfAborted();
+    state.uiCtx = ctx;
     setRunPhase(`command: ${command}`);
     const outcome = await runCaseThenStop({ ...params, command }, signal, projectRoot);
     const head = primary.content[0]?.text ?? "";
@@ -2063,6 +2110,114 @@ export default function xcodebug(pi: ExtensionAPI): void {
       isError: outcome.isError,
       ranCommand: true,
     };
+  };
+
+  const admitOperation = (
+    work: (signal: AbortSignal) => Promise<OperationResult>,
+    callerSignal?: AbortSignal,
+    stopCleanup?: Promise<ActionResult>,
+  ): Promise<OperationResult> => {
+    const operation: OwnedOperation = {
+      controller: new AbortController(), captures: new Set(), terminateCaptures: false, settled: executionTail,
+    };
+    const { signal } = operation.controller;
+    const forwardCancellation = (): void => operation.controller.abort(callerSignal?.reason);
+    const stopOwnedCaptures = (): void => {
+      for (const capture of operation.captures) stopCapture(capture, operation.terminateCaptures);
+    };
+    const previousTail = executionTail;
+    const scheduled = (stopCleanup ?? previousTail).then(async primary => {
+      let started = false;
+      try {
+        if (primary && primary.isError) return { ...primary, ranCommand: false };
+        if (stopCleanup) await previousTail;
+        if (shuttingDown) throw new Error("xcodebug session is shutting down");
+        signal.throwIfAborted();
+        activeOperation = operation;
+        started = true;
+        const result = await withCommandSignal(signal, () => work(signal));
+        if (shuttingDown) throw new Error("xcodebug session is shutting down");
+        return signal.aborted ? { ...result, isError: true } : result;
+      } catch (error) {
+        if (shuttingDown) throw new Error("xcodebug session is shutting down");
+        if (!signal.aborted) throw error;
+        return { content: [{ type: "text" as const, text: "cancelled xcodebug operation" }],
+          details: { cancelled: true }, isError: true, ranCommand: false };
+      } finally {
+        if (started) {
+          try {
+            if (signal.aborted) {
+              stopOwnedCaptures();
+              await Promise.all([...operation.captures].map(capture => capture.waitForExit(5_000)));
+            }
+          } finally {
+            activeOperation = undefined;
+            clearRunPhase();
+          }
+        }
+      }
+    });
+    const result = scheduled.finally(() => {
+      callerSignal?.removeEventListener("abort", forwardCancellation);
+      signal.removeEventListener("abort", stopOwnedCaptures);
+      operations.delete(operation);
+    });
+    operation.settled = result.then(() => {}, () => {});
+    executionTail = stopCleanup ? Promise.all([previousTail, operation.settled]).then(() => {}) : operation.settled;
+    operations.add(operation);
+    signal.addEventListener("abort", stopOwnedCaptures, { once: true });
+    if (callerSignal?.aborted) forwardCancellation();
+    else callerSignal?.addEventListener("abort", forwardCancellation, { once: true });
+    return result;
+  };
+
+  const executeOperation = (
+    params: ToolParams,
+    ctx: ExtensionContext,
+    callerSignal: AbortSignal | undefined,
+    onUpdate: ActionUpdate | undefined,
+  ): Promise<OperationResult> => {
+    if (params.action === "logs" || params.action === "wait") requireCapture(params.captureId);
+    if (params.action === "status" && params.command === undefined) {
+      callerSignal?.throwIfAborted();
+      return runActionThenCommand(params, ctx, callerSignal, onUpdate);
+    }
+    if (params.action !== "stop") {
+      return admitOperation(signal => runActionThenCommand(params, ctx, signal, onUpdate), callerSignal);
+    }
+
+    const targets = params.captureId !== undefined
+      ? [requireCapture(params.captureId)]
+      : [...state.captures.values()].filter(capture => !state.endedCaptures.has(capture.id));
+    callerSignal?.throwIfAborted();
+    const cancelled = params.captureId === undefined ? [...operations] : [];
+    let cancelledOperations = 0;
+    const cancellationReason = cancelled.length > 0 ? new Error("xcodebug operation cancelled by stop") : undefined;
+    for (const operation of cancelled) {
+      if (!operation.controller.signal.aborted) cancelledOperations += 1;
+      for (const capture of operation.captures) {
+        if ((capture.running || capture.starting) && !targets.includes(capture)) targets.push(capture);
+      }
+      if (params.keepApp === false) operation.terminateCaptures = true;
+      operation.controller.abort(cancellationReason);
+    }
+    // Signal every bridge now, before joining unabortable startup I/O or older stops.
+    for (const capture of targets) stopCapture(capture, params.keepApp === false);
+    const resources = Promise.all([
+      stopTail, ...cancelled.map(operation => operation.settled),
+      ...[...captureStarts].filter(([, capture]) => targets.includes(capture)).map(([settled]) => settled),
+      ...joinCaptureExits(targets),
+    ]).then(() => {});
+    trackStoppingCleanup(resources);
+    stopTail = resources;
+    executionTail = Promise.all([executionTail, resources]).then(() => {});
+    const cleanup = settlesWithin(resources, 5_000).then(cleaned =>
+      runAction(params, ctx, resolveProjectRoot(pi, ctx), undefined, onUpdate,
+        { targets, cancelledOperations, cleanupPending: !cleaned }));
+    if (!params.command) return cleanup.then(result => ({ ...result, ranCommand: false }));
+    // Admit the preparing request now so another stop can cancel it, but a timed-out
+    // cleanup returns without acquiring the UI owner or ever starting its command.
+    return admitOperation(async signal => runActionThenCommand(params, ctx, signal, onUpdate, await cleanup), callerSignal, cleanup);
   };
 
   pi.registerTool({
@@ -2075,6 +2230,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
       "pod install first. An unchanged tree reuses this session's build (force=true overrides). " +
       "launch restarts the app and captures stdout/stderr + os_log (no jailbreak, no LLDB). " +
       "syslog attaches to an already-running app without restarting it. " +
+      "stop cancels this session's executing and queued operations, then stops captures, even with no capture yet. " +
+      "Use captureId to stop only that capture; keepApp=true leaves the app running. " +
       "restart rebuilds, reinstalls and relaunches the last app in this session, for a mid-run code edit; a command= that launch carried runs again afterwards, so restart alone closes the edit→restart→test loop. " +
       "await runs a shell command (command=\"...\") to completion, then stops the capture it was watching and reports the exit code, so an automated run and its app-side log arrive together. Passing command= to launch runs it after the app is already up, which is the one-command linkage run.",
     promptSnippet: "Build/launch an iOS app on a real device and read its console logs",
@@ -2086,23 +2243,20 @@ export default function xcodebug(pi: ExtensionAPI): void {
       "After editing code mid-run, use xcodebug action=restart instead of a full launch: it replays the last launch's app, device, scheme, goal and command, and forces the rebuild.",
       "For an automated run, pass command=\"cd /repo && npm run test:xxx\" to launch: it builds, installs, launches, runs the command to completion, then stops the capture and returns the exit code plus the app-side cursor. Never poll the log for silence to decide a run is done.",
       "The command's runner must not restart the app itself (disable any auto-launch option in the test config), or the launch that xcodebug is capturing dies and the log stops at the restart.",
-      "Verification is a loop: run, read the log, stop, edit the code, run again. Once the log has answered the question, call action=stop and report the conclusion - keeping the capture alive only floods the session.",
-      "The one case where you must NOT stop: the user has not touched the app yet, so the log is silent because nothing happened. Wait, tell them what to do on the phone, and keep capturing.",
+      "Once the log has answered the question, stop that capture with captureId and report the conclusion; do not stop unrelated work.",
+      "When the user asks to stop xcodebug, bare action=stop cancels executing/queued work and active captures, even before capture starts.",
+      "A stop-requested cancellation is intentional; do not restart that work unless the user asks.",
+      "Do not stop merely because the user has not acted and logs are quiet; say what to do on the phone and keep capturing. Always honor an explicit stop request.",
       "A capture also ends on its own when the app process exits, or when something else relaunched the app; status and logs then say why, and name the crash report if the device wrote one. Do not reconnect a run whose app the user deliberately closed.",
     ],
-    executionMode: "sequential",
+    // Own the ordinary queue so the host can admit stop while a tool call executes.
+    executionMode: "parallel",
     parameters,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      // Whatever the action returns (including an early error), the transient
-      // phase must not outlive it or the footer keeps advertising stale work.
-      try {
-        const checked = validateParameters(params);
-        const result = await runActionThenCommand(checked, ctx, signal, onUpdate);
-        return { content: result.content.map(({ type, text }) => ({ type, text: replyText(text, checked.action) })),
-          details: result.details, isError: result.isError };
-      } finally {
-        clearRunPhase();
-      }
+      const checked = validateParameters(params);
+      const result = await executeOperation(checked, ctx, signal, onUpdate);
+      return { content: result.content.map(({ type, text }) => ({ type, text: replyText(text, checked.action) })),
+        details: result.details, isError: result.isError };
     },
   });
 
@@ -2124,21 +2278,22 @@ export default function xcodebug(pi: ExtensionAPI): void {
   };
 
   pi.registerCommand("xcodebug", {
-    description: "Build, install and launch the current project on a device, then stream its console; command=\"<shell line>\" runs a test command to completion and stops the capture",
+    description: "Build, install and launch on a device, then stream its console; stop cancels executing work and captures. " +
+      "command=\"<shell line>\" runs a test command to completion and stops its capture",
     ...commandExtras,
     handler: async (args, ctx) => {
 
-      // A command handler has no caller to surface a throw to, so a failed
-      // action - `/xcodebug stop` with nothing running, say - must be caught and
-      // reported like any other failure instead of escaping as a raw error.
+      // Native commands have no caller to surface a throw to: malformed arguments
+      // or an invalid capture selector must be reported, not escape as a raw error.
       let text: string;
       let isError = false;
+      let cleanupPending = false;
       let ranCommand = false;
       let parsed: ToolParams | undefined;
       try {
         parsed = parseCommandArgs(args);
         ctx.ui.notify(`xcodebug: ${parsed.action}${parsed.match ? ` (${parsed.match})` : ""}…`, "info");
-        const result = await runActionThenCommand(
+        const result = await executeOperation(
           parsed,
           ctx,
           undefined,
@@ -2153,12 +2308,11 @@ export default function xcodebug(pi: ExtensionAPI): void {
         text = result.content[0]?.text ?? (result.isError ? "xcodebug failed" : "xcodebug done");
         isError = result.isError === true;
         ranCommand = result.ranCommand;
+        cleanupPending = asRecord(result.details)?.cleanupPending === true || asRecord(asRecord(result.details)?.primary)?.cleanupPending === true;
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         text = `xcodebug${parsed ? ` ${parsed.action}` : ""} failed: ${reason}`;
         isError = true;
-      } finally {
-        clearRunPhase();
       }
       // The phrase the user typed is what the run is for; without it the model
       // sees build output and logs but not the thing being verified. Only
@@ -2179,7 +2333,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
             customType: CAPTURE_PREFIX,
             content: withGoal,
             display: true,
-            details: { action: parsed?.action, goal, isError, command: parsed?.command },
+            details: { action: parsed?.action, goal, isError, command: parsed?.command, ...(cleanupPending ? { cleanupPending: true } : {}) },
           },
           // A finished command run always steers: its whole point is that the
           // run is over and the log is ready to analyse, so waiting for the next
@@ -2209,29 +2363,40 @@ export default function xcodebug(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", async () => {
     shuttingDown = true;
+    const cancelled = [...operations];
+    const reason = cancelled.length > 0 ? new Error("xcodebug session is shutting down") : undefined;
+    for (const operation of cancelled) operation.controller.abort(reason);
     crashSearchAbort.abort();
     stopStatusTicker();
-    state.uiCtx?.ui.setStatus("xcodebug", undefined);
-    state.uiCtx?.ui.setWidget("xcodebug", undefined);
     const captures = [...new Set([...ownedCaptures, ...state.captures.values()])];
-    for (const capture of captures) {
+    const shutdowns = captures.map(capture => {
       stopPush(capture.id);
       stopWatchdog(capture.id);
       history.stop(capture, "session shutdown");
-      capture.stop(false);
-    }
-    state.captures.clear();
-    state.endedCaptures.clear();
-    state.activeCaptureId = undefined;
-    // Include pending starts and old result reads, not only the visible capture history.
-    const settled = await Promise.all(captures.map((capture) => capture.shutdown(3_000)));
-    ownedCaptures.clear();
+      // Start the existing bounded capture cleanup before joining operations.
+      return capture.shutdown(3_000);
+    });
+    const resources = Promise.all([
+      stopTail, ...cancelled.map(operation => operation.settled), ...captureStarts.keys(),
+      ...captures.map(capture => capture.waitForLaunchResults()), ...joinCaptureExits(captures),
+    ]).then(() => {});
+    trackStoppingCleanup(resources);
+    const finish = (): void => {
+      state.captures.clear();
+      state.endedCaptures.clear();
+      state.activeCaptureId = undefined;
+      ownedCaptures.clear();
+      for (const capture of captures) history.update(capture, { state: "ended" });
+      refreshStatus();
+    };
+    void resources.then(finish);
+    const [settled, cleaned] = await Promise.all([Promise.all(shutdowns), settlesWithin(resources, 3_000)]);
     const warnings = retiredCleanupWarnings.splice(0);
     for (const [index, capture] of captures.entries()) {
-      if (settled[index]) history.update(capture, { state: "ended" });
       for (const error of capture.launchResultCleanupErrors ?? []) warnings.push(`${capture.id}: ${error}`);
       if (!settled[index]) warnings.push(`${capture.id}: ${capture.status().error}`);
     }
+    if (!cleaned) warnings.push("operation or resource cleanup remains pending after 3000ms");
     if (warnings.length > 0) {
       const message = `xcodebug shutdown cleanup incomplete: ${warnings.join("; ")}`;
       state.uiCtx?.ui.notify(message, "warning");

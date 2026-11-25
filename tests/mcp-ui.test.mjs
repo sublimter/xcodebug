@@ -476,3 +476,410 @@ for (const [how, end, code] of [
     await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
   });
 }
+
+const stopFixture = async (t, hold) => {
+  const root = await mkdtemp(join(tmpdir(), "xcodebug-mcp-stop-"));
+  const bin = join(root, "bin");
+  await mkdir(bin);
+  const device = { identifier: "test-device", properties: {
+    hardware: { udid: "test-udid", reality: "physical" },
+    connection: { state: "connected", transportType: "wired" }, state: { name: "Test" },
+  } };
+  await mkdir(join(root, "Probe.app"));
+  await mkdir(join(root, "held-project"));
+  await writeFile(join(root, "Probe.app", "Info.plist"), '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>Probe</string><key>CFBundleIdentifier</key><string>test.probe</string></dict></plist>');
+  await writeFile(join(bin, "xcrun"), `#!/bin/sh
+case " $* " in
+  *" list devices "*) printf '%s\\n' '${JSON.stringify({ result: { devices: [device] } })}' ;;
+  *" device install app "*) exit 0 ;;
+  *" device info processes "*)
+    if [ -f '${root}/app-running' ]; then printf '%s\\n' '{"result":{"runningProcesses":[{"executable":"/Probe.app/Probe","processIdentifier":1234}]}}'
+    else printf '%s\\n' '{"result":{"runningProcesses":[]}}'; fi ;;
+  *" device process launch "*)
+    result_file=''
+    while [ $# -gt 1 ]; do
+      [ "$1" = "--json-output" ] && result_file="$2"
+      shift
+    done
+    printf '%s' "$$" > '${root}/console.pid'
+    touch '${root}/app-running'
+    trap 'touch "${root}/app-terminated"; rm -f "${root}/app-running"; printf "%s\\n" "{\\"result\\":{\\"process\\":{\\"processIdentifier\\":1234}}}" > "$result_file"; exit 0' TERM
+    printf 'console ready\\n'
+    while :; do /bin/sleep 0.05; done ;;
+  *) exit 1 ;;
+esac
+`, { mode: 0o755 });
+  await writeFile(join(bin, "idevicesyslog"), `#!/bin/sh\nprintf '%s' "$$" > '${root}/capture.pid'\nexec /bin/sleep 120\n`, { mode: 0o755 });
+  for (const [name, marker] of [["long-command", "command"], ["xcodebuild", "build"]]) {
+    await writeFile(join(bin, name), `#!/bin/sh
+if [ "$1" = "-version" ]; then echo 'Xcode fake'; exit 0; fi
+printf '%s' "$$" > '${root}/${marker}.pid'
+/bin/sh -c 'while [ ! -f "$1" ]; do /bin/sleep 0.05; done' fixture '${root}/release' &
+printf '%s' "$!" > '${root}/${marker}-child.pid'
+wait
+printf '${marker}-completed\\n'
+`, { mode: 0o755 });
+  }
+  await writeFile(join(bin, "queued-command"), `#!/bin/sh\nprintf '%s' "$$" > '${root}/queued.pid'\nprintf 'queued-completed\\n'\n`, { mode: 0o755 });
+  const preload = join(root, "preload.mjs");
+  await writeFile(preload, `
+import fs from "node:fs";
+import { ChildProcess } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { setTimeout as delay } from "node:timers/promises";
+const root = ${JSON.stringify(root)};
+const originalKill = ChildProcess.prototype.kill;
+ChildProcess.prototype.kill = function(signal) {
+  if (this.spawnargs?.join(" ").includes("device process launch")) {
+    fs.appendFileSync(root + "/console-signals", String(signal) + "\\n");
+  }
+  return originalKill.call(this, signal);
+};
+const hold = ${JSON.stringify(hold ?? "")};
+if (hold) {
+  const operation = hold === "preparation" ? "stat" : "writeFile";
+  const original = fs.promises[operation];
+  let held = false;
+  fs.promises[operation] = async (path, ...args) => {
+    const result = await original(path, ...args);
+    if (!held && (hold === "preparation" ? String(path) === root + "/held-project" : String(path).endsWith("/owner.json"))) {
+      held = true;
+      fs.writeFileSync(root + "/io.pid", String(process.pid));
+      while (!fs.existsSync(root + "/release-io")) await delay(10);
+    }
+    return result;
+  };
+  syncBuiltinESMExports();
+}
+`);
+  const child = spawn("bun", ["--preload", preload, new URL("../mcp/server.ts", import.meta.url).pathname], {
+    cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, XCODEBUG_AGENT_DIR: root },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const replies = [];
+  const pending = new Map();
+  let id = 0;
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  createInterface({ input: child.stdout }).on("line", line => {
+    const message = JSON.parse(line);
+    if (message.id === undefined) return;
+    replies.push(message);
+    const entry = pending.get(message.id);
+    if (!entry) return;
+    pending.delete(message.id);
+    clearTimeout(entry.timer);
+    if (message.error) entry.reject(new Error(JSON.stringify(message.error)));
+    else entry.resolve(message.result);
+  });
+  const exited = new Promise(resolve => child.once("close", resolve));
+  const request = (method, params) => new Promise((resolve, reject) => {
+    const requestId = ++id;
+    const timer = setTimeout(() => {
+      pending.delete(requestId);
+      reject(new Error(`timed out: ${method}; ${stderr}`));
+    }, 20_000);
+    pending.set(requestId, { resolve, reject, timer });
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params })}\n`);
+  });
+  const action = args => request("tools/call", { name: "xcodebug", arguments: args });
+  const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const assertStopped = async pids => {
+    const deadline = Date.now() + 3_000;
+    while (pids.some(alive) && Date.now() < deadline) await delay(25);
+    assert.deepEqual(pids.filter(alive), [], "stop must settle every owned child, not just clear the UI");
+  };
+  t.after(async () => {
+    child.kill("SIGKILL");
+    for (const entry of pending.values()) clearTimeout(entry.timer);
+    for (const marker of ["capture", "console", "command", "command-child", "build", "build-child", "queued"]) {
+      try {
+        const pid = Number((await readFile(join(root, `${marker}.pid`), "utf8")).trim());
+        if (Number.isSafeInteger(pid) && pid > 1) {
+          try { process.kill(pid, "SIGKILL"); } catch { /* fixture already exited */ }
+        }
+      } catch (error) { if (error.code !== "ENOENT") throw error; }
+    }
+    await exited;
+    await rm(root, { recursive: true, force: true });
+  });
+  await request("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "stop-test", version: "1" } });
+  return { root, bin, child, replies, exited, request, action, alive, assertStopped };
+};
+
+for (const operation of ["command", "build"]) {
+  test(`bare stop interrupts a no-capture ${operation} and cancels admitted queued work`, { timeout: 30_000 }, async t => {
+    const { root, bin, action, request, replies, assertStopped } = await stopFixture(t);
+    const running = action(operation === "command"
+      ? { action: "await", command: `'${join(bin, "long-command")}'` }
+      : { action: "build", device: "test-device", project: join(root, "Probe.xcodeproj"), scheme: "Probe", force: true });
+    const pids = await Promise.all([fixturePid(root, operation), fixturePid(root, `${operation}-child`)]);
+    const queued = action({ action: "await", command: `'${join(bin, "queued-command")}'` });
+    await request("tools/call", { name: "xcodebug_ui", arguments: {} });
+    const stopped = await action({ action: "stop" });
+    assert.ok(!stopped.isError, stopped.content[0].text);
+    assert.match(stopped.content[0].text, /cancel/i);
+    assert.doesNotMatch(stopped.content[0].text, /nothing to stop/i);
+    assert.equal((await running).isError, true);
+    const cancelled = await queued;
+    assert.equal(cancelled.isError, true);
+    assert.match(cancelled.content[0].text, /cancel/i);
+    await assertStopped(pids);
+    await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
+    const reusable = await action({ action: "await", command: "printf 'usable-again\\n'" });
+    assert.ok(!reusable.isError, reusable.content[0].text);
+    assert.match(reusable.content[0].text, /usable-again/);
+    assert.ok(replies.every(reply => replies.filter(other => other.id === reply.id).length === 1), "each request must receive exactly one reply");
+  });
+}
+
+test("invalid stop arguments have no cancellation side effects", { timeout: 30_000 }, async t => {
+  const { root, bin, action, request, alive } = await stopFixture(t);
+  const running = action({ action: "await", command: `'${join(bin, "long-command")}'` });
+  const pids = await Promise.all([fixturePid(root, "command"), fixturePid(root, "command-child")]);
+  const queued = action({ action: "await", command: `'${join(bin, "queued-command")}'` });
+  await request("tools/call", { name: "xcodebug_ui", arguments: {} });
+  for (const invalid of [
+    { keepApp: "yes" }, { captureId: 1 }, { typo: true }, { absent: true }, { context: 1 },
+    { cwd: "relative" }, { cwd: 1 }, { cwd: join(root, "missing") }, { cwd: join(bin, "long-command") },
+    { push: "context" }, { push: "wake" }, { push: "invalid" },
+  ]) {
+    const result = await action({ action: "stop", command: "printf forbidden > invalid-appended", ...invalid });
+    assert.equal(result.isError, true, JSON.stringify(invalid));
+    assert.ok(pids.every(alive), `invalid stop interrupted owned children: ${JSON.stringify(invalid)}`);
+    await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
+    await assert.rejects(access(join(root, "invalid-appended")), { code: "ENOENT" });
+  }
+  await writeFile(join(root, "release"), "");
+  const completed = await running;
+  assert.ok(!completed.isError, completed.content[0].text);
+  assert.match(completed.content[0].text, /command-completed/);
+  const following = await queued;
+  assert.ok(!following.isError, following.content[0].text);
+  assert.match(following.content[0].text, /queued-completed/);
+  await fixturePid(root, "queued");
+});
+
+test("scoped capture stop does not cancel unrelated execution or queued work", { timeout: 30_000 }, async t => {
+  const { root, bin, action, request, alive, assertStopped } = await stopFixture(t);
+  const capture = await action({ action: "syslog", device: "test-device", processName: "Quiet" });
+  assert.ok(!capture.isError, capture.content[0].text);
+  const capturePid = await fixturePid(root, "capture");
+  const captureId = capture.details.capture.id;
+  assert.equal(typeof captureId, "string");
+  const running = action({ action: "await", command: `'${join(bin, "long-command")}'` });
+  const pids = await Promise.all([fixturePid(root, "command"), fixturePid(root, "command-child")]);
+  const queued = action({ action: "await", command: `'${join(bin, "queued-command")}'` });
+  await request("tools/call", { name: "xcodebug_ui", arguments: {} });
+  // Even an empty selector is scoped: it must not silently become a bare stop.
+  const missing = await action({ action: "stop", captureId: "" });
+  assert.equal(missing.isError, true, missing.content[0].text);
+  assert.ok(pids.every(alive));
+  assert.ok(alive(capturePid));
+  const stopped = await action({ action: "stop", captureId });
+  assert.ok(!stopped.isError, stopped.content[0].text);
+  await assertStopped([capturePid]);
+  assert.ok(pids.every(alive), "scoped stop must leave the command running");
+  await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
+  await writeFile(join(root, "release"), "");
+  const completed = await running;
+  assert.ok(!completed.isError, completed.content[0].text);
+  assert.match(completed.content[0].text, /command-completed/);
+  const following = await queued;
+  assert.ok(!following.isError, following.content[0].text);
+  assert.match(following.content[0].text, /queued-completed/);
+});
+
+test("accepted stop plus stdin EOF settles children and flushes every reply", { timeout: 30_000 }, async t => {
+  const { root, bin, child, action, request, replies, exited, assertStopped } = await stopFixture(t);
+  const running = action({ action: "await", command: `'${join(bin, "long-command")}'` });
+  const pids = await Promise.all([fixturePid(root, "command"), fixturePid(root, "command-child")]);
+  const queued = action({ action: "await", command: `'${join(bin, "queued-command")}'` });
+  await request("tools/call", { name: "xcodebug_ui", arguments: {} });
+  const stopping = action({ action: "stop", cwd: root });
+  child.stdin.end();
+  const [activeReply, queuedReply, stopReply] = await Promise.all([running, queued, stopping]);
+  assert.equal(activeReply.isError, true);
+  assert.equal(queuedReply.isError, true);
+  assert.match(queuedReply.content[0].text, /cancel/i);
+  assert.ok(!stopReply.isError, stopReply.content[0].text);
+  assert.equal(await Promise.race([exited, delay(10_000, "still running")]), 0);
+  assert.deepEqual(replies.map(reply => reply.id).sort((a, b) => a - b), [1, 2, 3, 4, 5], "EOF must flush exactly one reply for each admitted request");
+  await assertStopped(pids);
+  await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
+});
+
+test("concurrent stops cancel queued-only work without aborting each other or later calls", { timeout: 30_000 }, async t => {
+  const { root, bin, child, action, replies } = await stopFixture(t);
+  // One input chunk admits all four requests before the action queue can run.
+  child.stdin.cork();
+  const queued = action({ action: "await", command: `'${join(bin, "queued-command")}'` });
+  const first = action({ action: "stop" });
+  const second = action({ action: "stop" });
+  const later = action({ action: "await", command: "printf 'after-stop-boundary\\n'" });
+  child.stdin.uncork();
+  const [cancelled, firstStop, secondStop, afterStop] = await Promise.all([queued, first, second, later]);
+  assert.equal(cancelled.isError, true);
+  assert.match(cancelled.content[0].text, /cancel/i);
+  assert.ok(!firstStop.isError, firstStop.content[0].text);
+  assert.match(firstStop.content[0].text, /cancel/i);
+  assert.doesNotMatch(firstStop.content[0].text, /nothing to stop/i);
+  assert.ok(!secondStop.isError, secondStop.content[0].text);
+  assert.doesNotMatch(secondStop.content[0].text, /request cancelled/i);
+  assert.ok(!afterStop.isError, afterStop.content[0].text);
+  assert.match(afterStop.content[0].text, /after-stop-boundary/);
+  await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
+  assert.deepEqual(replies.map(reply => reply.id).sort((a, b) => a - b), [1, 2, 3, 4, 5]);
+});
+
+test("a bare stop cancels an earlier command-bearing stop still validating cwd in the same chunk", { timeout: 30_000 }, async t => {
+  const { root, bin, child, action, replies } = await stopFixture(t);
+  child.stdin.cork();
+  const earlier = action({ action: "stop", cwd: root, command: `'${join(bin, "queued-command")}'` });
+  const later = action({ action: "stop" });
+  const reusable = action({ action: "await", command: "printf 'after-preparing-stop\\n'" });
+  child.stdin.uncork();
+  const [cancelled, stopped, reused] = await Promise.all([earlier, later, reusable]);
+  assert.equal(cancelled.isError, true, cancelled.content[0].text);
+  assert.match(cancelled.content[0].text, /cancel/i);
+  assert.ok(!stopped.isError, stopped.content[0].text);
+  assert.doesNotMatch(stopped.content[0].text, /nothing to stop/i);
+  assert.ok(!reused.isError, reused.content[0].text);
+  assert.match(reused.content[0].text, /after-preparing-stop/);
+  await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
+  assert.deepEqual(replies.map(reply => reply.id).sort((a, b) => a - b), [1, 2, 3, 4]);
+});
+
+test("stop preserves appended command output when it cancels queued work", { timeout: 30_000 }, async t => {
+  const { root, bin, child, action } = await stopFixture(t);
+  child.stdin.cork();
+  const queued = action({ action: "await", command: `'${join(bin, "queued-command")}'` });
+  const stopping = action({ action: "stop", command: "printf 'nothing to stop\\n'" });
+  child.stdin.uncork();
+  assert.equal((await queued).isError, true);
+  const result = await stopping;
+  assert.ok(!result.isError, result.content[0].text);
+  assert.match(result.content[0].text, /(?:^|\n)nothing to stop(?:\n|$)/, "cancellation status must not rewrite command stdout");
+  await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
+});
+
+test("signal shutdown drains an accepted stop and its appended command", { timeout: 30_000 }, async t => {
+  const { root, bin, child, action, request, replies, exited, assertStopped } = await stopFixture(t);
+  const stopping = action({ action: "stop", command: `'${join(bin, "long-command")}'` });
+  const pids = await Promise.all([fixturePid(root, "command"), fixturePid(root, "command-child")]);
+  const queued = action({ action: "await", command: `'${join(bin, "queued-command")}'` });
+  await request("tools/call", { name: "xcodebug_ui", arguments: {} });
+  child.kill("SIGINT");
+  const [stopReply, queuedReply] = await Promise.all([stopping, queued]);
+  assert.equal(stopReply.isError, true, stopReply.content[0].text);
+  assert.equal(queuedReply.isError, true, queuedReply.content[0].text);
+  assert.match(queuedReply.content[0].text, /cancel/i);
+  assert.equal(await Promise.race([exited, delay(10_000, "still running")]), 130);
+  assert.deepEqual(replies.map(reply => reply.id).sort((a, b) => a - b), [1, 2, 3, 4]);
+  await assertStopped(pids);
+  await assert.rejects(access(join(root, "queued.pid")), { code: "ENOENT" });
+});
+
+test("MCP keepApp=false sets console termination intent before aborting an active launch command", { timeout: 30_000 }, async t => {
+  const { root, bin, action, replies, assertStopped } = await stopFixture(t);
+  const launching = action({ action: "launch", build: false, appPath: join(root, "Probe.app"),
+    device: "test-device", bundleId: "test.probe", processName: "Probe", command: `'${join(bin, "long-command")}'` });
+  const pids = await Promise.all(["console", "capture", "command", "command-child"].map(name => fixturePid(root, name)));
+  const result = await action({ action: "stop", keepApp: false });
+  assert.ok(!result.isError, result.content[0].text);
+  assert.equal((await readFile(join(root, "console-signals"), "utf8")).split("\n")[0], "SIGTERM",
+    "the adapter must not forward a default keepApp=true abort before backend stop applies keepApp=false");
+  await access(join(root, "app-terminated"));
+  await assert.rejects(access(join(root, "app-running")), { code: "ENOENT" });
+  assert.equal((await launching).isError, true);
+  await assertStopped(pids);
+  assert.ok(replies.every(reply => replies.filter(other => other.id === reply.id).length === 1));
+});
+
+for (const hold of ["preparation", "startup"]) {
+  test(`stop replies honestly with pending ${hold} I/O and retains ordering until it settles`, { timeout: 30_000 }, async t => {
+    const { root, bin, child, action, request, replies, exited } = await stopFixture(t, hold);
+    const running = action(hold === "preparation"
+      ? { action: "await", cwd: join(root, "held-project"), command: `'${join(bin, "queued-command")}'` }
+      : { action: "launch", build: false, appPath: join(root, "Probe.app"), device: "test-device",
+        bundleId: "test.probe", processName: "Probe", command: `'${join(bin, "queued-command")}'` });
+    await fixturePid(root, "io");
+    const queued = action({ action: "await", command: "printf forbidden > queued-started" });
+    await request("tools/call", { name: "xcodebug_ui", arguments: {} });
+    const stopped = await action({ action: "stop", command: "printf forbidden > appended-started" });
+    assert.equal(stopped.isError, true, stopped.content[0].text);
+    assert.equal(stopped.details.cleanupPending ?? stopped.details.primary?.cleanupPending, true);
+    assert.match(stopped.content[0].text, /pending/i);
+    assert.doesNotMatch(stopped.content[0].text, /nothing to stop/i);
+    const repeated = await action({ action: "stop" });
+    assert.equal(repeated.isError, true, repeated.content[0].text);
+    assert.equal(repeated.details.cleanupPending ?? repeated.details.primary?.cleanupPending, true);
+    let laterSettled = false;
+    const later = action({ action: "await", command: `'${join(bin, "queued-command")}'` }).then(result => {
+      laterSettled = true;
+      return result;
+    });
+    const snapshot = JSON.parse((await request("tools/call", { name: "xcodebug_ui", arguments: {} })).content[0].text);
+    assert.equal(laterSettled, false, "ordinary work must remain behind the unresolved resource/request barrier");
+    if (hold === "startup") assert.ok(snapshot.status || snapshot.rows.length > 0, "pending capture startup must retain its UI");
+    for (const name of ["queued.pid", "queued-started", "appended-started", "console.pid"]) {
+      await assert.rejects(access(join(root, name)), { code: "ENOENT" });
+    }
+    child.stdin.end();
+    await writeFile(join(root, "release-io"), "");
+    assert.equal((await running).isError, true);
+    assert.equal((await queued).isError, true);
+    const reused = await later;
+    assert.ok(!reused.isError, reused.content[0].text);
+    assert.match(reused.content[0].text, /queued-completed/);
+    assert.equal(await Promise.race([exited, delay(10_000, "still running")]), 0, "EOF must drain later work only after held I/O settles");
+    for (const name of ["queued-started", "appended-started", "console.pid"]) {
+      await assert.rejects(access(join(root, name)), { code: "ENOENT" });
+    }
+    assert.ok(replies.every(reply => replies.filter(other => other.id === reply.id).length === 1));
+  });
+}
+
+for (const hold of ["preparation", "startup"]) {
+  test(`SIGINT reaches backend cleanup despite held ${hold} I/O`, { timeout: 15_000 }, async t => {
+    const { root, child, action, exited } = await stopFixture(t, hold);
+    // The intentionally unreturning request is interrupted by transport teardown.
+    void action(hold === "preparation"
+      ? { action: "await", cwd: join(root, "held-project"), command: "sleep 120" }
+      : { action: "launch", build: false, appPath: join(root, "Probe.app"), device: "test-device",
+        bundleId: "test.probe", processName: "Probe" }).catch(() => {});
+    await fixturePid(root, "io");
+    child.kill("SIGINT");
+    assert.equal(await Promise.race([exited, delay(8_000, "still running")]), 130);
+    await assert.rejects(access(join(root, "console.pid")), { code: "ENOENT" });
+  });
+}
+
+test("stdin EOF alone drains ordinary work without cancelling it", { timeout: 30_000 }, async t => {
+  const { root, bin, child, action, exited, replies } = await stopFixture(t);
+  const running = action({ action: "await", command: `'${join(bin, "long-command")}'` });
+  await fixturePid(root, "command-child");
+  child.stdin.end();
+  await writeFile(join(root, "release"), "");
+  const result = await running;
+  assert.ok(!result.isError, result.content[0].text);
+  assert.match(result.content[0].text, /command-completed/);
+  assert.equal(await Promise.race([exited, delay(10_000, "still running")]), 0);
+  assert.deepEqual(replies.map(reply => reply.id).sort((a, b) => a - b), [1, 2]);
+});
+
+for (const hold of ["preparation", "startup"]) {
+  test(`stdout loss reaches backend cleanup despite held ${hold} I/O`, { timeout: 15_000 }, async t => {
+    const { root, child, action, exited } = await stopFixture(t, hold);
+    void action(hold === "preparation"
+      ? { action: "await", cwd: join(root, "held-project"), command: "sleep 120" }
+      : { action: "launch", build: false, appPath: join(root, "Probe.app"), device: "test-device",
+        bundleId: "test.probe", processName: "Probe" }).catch(() => {});
+    await fixturePid(root, "io");
+    child.stdout.destroy();
+    // A bypass reply exposes EPIPE without joining the held action queue.
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 100, method: "tools/call", params: { name: "xcodebug_ui", arguments: {} } })}\n`);
+    assert.equal(await Promise.race([exited, delay(8_000, "still running")]), 0);
+    await assert.rejects(access(join(root, "console.pid")), { code: "ENOENT" });
+  });
+}

@@ -41,6 +41,8 @@ Both explicit invocation and a matching natural-language request can use this sk
 - Accept `action [key=value ...]`, `action=... [key=value ...]`, or a JSON parameter
   object. Actions: `doctor`, `devices`, `changes`, `build`, `install`, `launch`,
   `syslog`, `logs`, `wait`, `history`, `status`, `stop`, `terminate`, `restart`, `await`.
+  Native registered command text uses action/key=value syntax; pass JSON objects
+  as structured tool/MCP arguments, not stringified native command text.
 - Use the live tool schema for parameter names and types. Preserve quoted strings,
   numeric `since`/`limit`/`timeoutSeconds`, booleans, JSON `args` arrays and
   `environment` objects. Keep a supplied `command` shell line intact.
@@ -78,7 +80,9 @@ Both explicit invocation and a matching natural-language request can use this sk
 ## Follow a capture
 
 - `launch` restarts the app and captures stdout/stderr plus os_log. `syslog`
-  attaches without restarting. `stop` leaves the app running by default;
+  attaches without restarting. Bare `stop` cancels executing and queued actions
+  in this session/server and stops its captures, even during a build, pod install,
+  command, or wait with no capture yet. It leaves the app running by default;
   `terminate` explicitly terminates it. `restart` reuses this server's last launch
   and forces a rebuild; a saved `command` runs again.
 - Track `captureId` and the returned cursor **per capture**. Pass that cursor as
@@ -113,8 +117,13 @@ Both explicit invocation and a matching natural-language request can use this sk
   Report these with the result; the log then does not describe one
   uninterrupted run.
 - When a verification goal is answered, stop the capture started for that goal.
-  Include its `captureId` so other captures are not stopped. An explicit `stop`
-  without an ID intentionally stops all running captures in the selected tool.
+  Include its `captureId` so unrelated execution and other captures are not stopped.
+  Bare `stop` intentionally cancels running/queued actions and stops all captures.
+  `cleanupPending=true` means the stop did not fully finish: report the error and
+  pending resources, not successful verification. Do not run its appended command
+  or restart cancelled work after incomplete cleanup. Cancellation does not roll
+  back pod install; later ordinary work waits for owned resources to settle.
+  Do not restart stopped or cancelled work unless the user requests it.
 - Report the operation's result, relevant log evidence, capture ID/cursor or log
   path when returned, and whether capture remains active. Do not invent device
   activity, successful builds, or test outcomes.

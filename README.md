@@ -242,6 +242,22 @@ then cleans up captures. Closing only stdin lets admitted requests finish and
 sends their replies; a silent lost reader cannot be distinguished from this
 until stdout closes or a write fails.
 
+Bare `stop` cancels running and queued xcodebug actions in this session/server,
+then stops its active captures. It can interrupt a build, pod install, command,
+or wait even before any capture starts; MCP handles it outside the action queue.
+The `running` display can represent a build or command, not only capture.
+Stop requests cancellation first and waits for cleanup. Native stop waits up to
+five seconds; native session shutdown keeps its three-second cleanup deadline.
+MCP also bounds its preceding-request wait. If work cannot settle in time, the
+reply is an error with `cleanupPending=true`, not proof of a successful stop or
+verification. Pending native cleanup retains its stopping display until tracked
+resources settle; later ordinary work stays behind that resource barrier. A stopped request's
+appended command does not start after incomplete cleanup. Do not automatically
+restart stopped work.
+`stop captureId=...` only stops that capture and its companion. `keepApp=true`
+still leaves the app running. Cancellation is not a rollback: an interrupted
+pod install may leave generated files incomplete; rerun it before building.
+
 To run `npm test` from a checkout, use Node.js 22.18 or later and put Bun on PATH
 for the stdio integration tests.
 
@@ -396,7 +412,7 @@ Enter these in the client's chat input, not in your shell, after installing the 
 | Wait for an event | `/xcodebug wait match="sync complete" timeoutSeconds=30` | `$xcodebug wait match="sync complete" timeoutSeconds=30` |
 | Inspect recorded runs | `/xcodebug history limit=5` | `$xcodebug history limit=5` |
 | Rebuild and rerun the last launch | `/xcodebug restart` | `$xcodebug restart` |
-| Stop capture, leave the app running | `/xcodebug stop` | `$xcodebug stop` |
+| Cancel running work and stop captures, leave the app running | `/xcodebug stop` | `$xcodebug stop` |
 
 A bare skill invocation calls `{"action":"launch"}`: it builds as needed, installs,
 launches and starts capturing using the server's project/device defaults. Use
@@ -405,6 +421,9 @@ to MCP arguments: `logs grep="Weather Sync" limit=100`
 becomes `{"action":"logs","grep":"Weather Sync","limit":100}`. The skill keeps
 quoted strings, numeric and boolean parameters, and JSON arrays/objects in their
 tool-schema types. Add `captureId=...` to read or stop a specific capture.
+Native registered slash-command text uses `action key=value ...` syntax.
+JSON parameter objects belong to structured tool/MCP calls, not stringified
+native command text.
 
 The skill is a model instruction, not a direct RPC command: the model makes the
 tool call and the client's permission rules still apply. It should execute the
@@ -423,7 +442,7 @@ action=logs since=0             incremental read - the cursor is per capture
 action=logs grep=Weather        narrow to one subsystem
 action=wait match="..."         block until a line appears
 action=status                   captures, line counts, log paths
-action=stop                     close every running capture
+action=stop                     cancel executing/queued actions and stop captures
 ```
 
 If the entry point is missing, check the symlink and restart the client. If the
@@ -587,10 +606,11 @@ remain available without the display.
   `action=wait`; these pull reads are separate from both clients' live displays.
   Cursor reads exclude earlier indices, but a limited read can omit
   lines; see [Reading logs from a cursor](#reading-logs-from-a-cursor).
-- **Captures end with the client.** The server is a child of Codex/Claude. When
-  the client closes the connection, the server finishes the call in progress,
-  stops its captures and exits. On SIGINT or SIGTERM it stops at once, a build
-  still running included. Relaunch next session.
+- **Captures end with the server.** The server is a child of Codex/Claude.
+  Stdin EOF drains admitted calls and their replies before cleanup; it does not
+  cancel ordinary work. SIGINT, SIGTERM or detected stdout loss cancels admitted
+  work and starts bounded backend cleanup without waiting indefinitely on the
+  request queue. Unabortable I/O can remain unfinished and is reported honestly.
 
 Logs land in `~/.xcodebug/logs/xcodebug/`, or under `XCODEBUG_AGENT_DIR` when set.
 Every response also reports the exact path, so the model can read the file once a
@@ -982,11 +1002,11 @@ app **before** the new bridge starts, avoiding duplicate capture streams for tha
 app; other apps' captures are preserved, so several apps can be debugged in one
 session.
 
-- **Stop once the log has answered the question.** Keeping a capture alive consumes
-  resources; with native push enabled, it also keeps sending log batches.
-- **Do not stop while the user has not acted yet.** Silence there means nothing
-  has been tried, not that the run is over: say what to do on the phone and keep
-  listening.
+- **Stop a completed goal's capture with `captureId`.** Keeping it alive consumes
+  resources; native push also keeps sending log batches. Do not stop unrelated work.
+- **Do not stop merely because the user has not acted yet.** Silence is not proof
+  that the run is over: say what to do on the phone and keep listening, unless the
+  user explicitly asks to stop.
 - When the initial process-table query succeeds, a dual-channel launch runs
   console app-PID discovery before connecting the syslog companion. An explicit
   stop during that step does not leave a new companion running.
@@ -1048,10 +1068,10 @@ session.
 - Native pushed log batches are **hidden from the transcript** (`display: false`)
   but delivered to the model, subject to the per-batch limit. MCP does not push
   batches; neither MCP live display adds logs to model context.
-- `/xcodebug stop` (or `action=stop`) without `captureId` closes **every running
-  capture**. An ID scopes the stop to that target; a console primary's syslog
-  companion is stopped too. Other apps' captures are unaffected by a targeted
-  stop. `keepApp=false` also terminates the app.
+- `/xcodebug stop` (or `action=stop`) without `captureId` cancels executing/queued
+  work and closes **every running capture**, including during a build or command
+  with no capture yet. An ID scopes the stop to that capture and its companion,
+  leaving unrelated work alone. `keepApp=false` also terminates the app.
 
 ## Usage
 
