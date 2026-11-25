@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "xcodebug": {
+      "command": "bun",
+      "args": ["mcp/server.ts"],
+      "cwd": ".",
+      "env": { "XCODEBUG_REQUIRE_PROJECT_CWD": "1" },
+      "tool_timeout_sec": 4200
+    }
+  }
+}

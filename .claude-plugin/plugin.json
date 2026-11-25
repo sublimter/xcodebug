@@ -1,0 +1,13 @@
+{
+  "name": "xcodebug",
+  "description": "Build, launch, and capture live logs from iOS devices",
+  "author": { "name": "sublimter" },
+  "skills": "./mcp/skills/",
+  "hooks": "./claude/hooks/marketplace.json",
+  "mcpServers": {
+    "xcodebug": {
+      "command": "bun",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/server.ts"]
+    }
+  }
+}

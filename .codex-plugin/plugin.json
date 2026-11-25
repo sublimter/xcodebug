@@ -1,0 +1,6 @@
+{
+  "name": "xcodebug",
+  "description": "Build, launch, and capture logs from physical iOS devices",
+  "skills": "./mcp/skills/",
+  "mcpServers": "./mcp/codex.json"
+}

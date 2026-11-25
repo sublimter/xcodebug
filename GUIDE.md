@@ -4,15 +4,15 @@ Task-oriented walkthrough. [README.md](README.md) is the authoritative reference
 for every parameter, the change-detection rules and the capture internals; this
 file only shows the flows you will actually type.
 
-The `/xcodebug` examples use the native pi/omp command or the installed Claude
-Code skill. In Codex, replace `/xcodebug` with `$xcodebug`. Claude Code and Codex
-need both the MCP connection and the shared skill; follow
-[README.md § Install the manual entry point](README.md#install-the-manual-entry-point).
-Enter these commands in the client's chat input. A bare `/xcodebug` (`$xcodebug`
-in Codex) builds as needed, installs, launches and starts capturing with defaults.
-Use `/xcodebug status` (`$xcodebug status` in Codex) to inspect current captures.
+The `/xcodebug` examples use the native pi/omp command or the manually installed
+Claude Code skill. With the [Marketplace plugin](README.md#install-from-marketplace),
+use `/xcodebug:xcodebug` in Claude Code or select the plugin's xcodebug skill
+with `$` in Codex. For a manual MCP connection, install the
+[shared skill](README.md#install-the-manual-entry-point) separately.
+A bare invocation builds as needed, installs, launches and starts capturing.
+Add `status` to inspect the current captures without launching.
 
-After installing the MCP server, run `xcodebug-setup-codex` once. It registers
+For a manual installation only, run `xcodebug-setup-codex` once. It registers
 the server when missing, adds the 4200-second timeout only when no custom
 timeout exists, enables the statusline feature on Codex CLI 0.171.0+, and selects
 the xcodebug provider when the user selection is missing or `default`. Other
@@ -91,14 +91,11 @@ Claude Code and Codex use pull reads through MCP: `logs` for an incremental read
 or `wait` for an expected line. `push=context` and `push=wake` are refused there;
 installing the skill does not add background log delivery.
 
-For a live display in Claude Code, install the **separate** `xcodebug-live` Mod
-using [the one-time installation recipe](README.md#install-once-for-ordinary-claude-sessions).
-It then loads with ordinary `claude` startup. The MCP connection and shared
-skill alone do not load it. Confirm `xcodebug-live@skills-dir` in
-`claude plugin list`, then restart Claude and check `/plugin` and `/mcp`.
-
-Keep the `xcodebug` MCP server pointed at the same updated checkout or installed
-package as the Mod.
+Claude Code's Marketplace plugin includes the live display Mod. For a manual
+installation, add the separate `xcodebug-live` Mod with
+[the one-time installation recipe](README.md#install-once-for-ordinary-claude-sessions).
+Keep the MCP server and Mod on the same release. In a new session, check
+`/plugin` for the enabled plugin and `/mcp` for the connected server.
 
 The band shows build/install/launch phases, including the rebuild within
 `restart`, even when a capture is already running. Capture continues in the

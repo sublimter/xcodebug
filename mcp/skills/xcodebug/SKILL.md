@@ -1,6 +1,6 @@
 ---
 name: xcodebug
-description: "Builds, launches, and captures console logs from physical iOS devices using the registered native xcodebug tool or an explicitly configured xcodebug MCP connection. Use when the user invokes xcodebug, requests its doctor/devices/status/logs/wait/stop/restart actions, or wants to verify an iOS app on a real device using its console."
+description: "Builds, launches, and captures console logs from physical iOS devices using the registered native xcodebug tool or a connected xcodebug MCP server. Use when the user invokes xcodebug, requests its doctor/devices/status/logs/wait/stop/restart actions, or wants to verify an iOS app on a real device using its console."
 ---
 
 # xcodebug
@@ -13,9 +13,11 @@ Select the execution tool by exposed capability, not by client name:
   JSON to that URI. Reading a schema or this skill does not execute an action.
 - If the user explicitly requests the native extension but it is not exposed,
   report that it must be loaded. Do not substitute MCP or a shell command.
-- Otherwise, use only an existing configured xcodebug MCP tool, commonly named
-  `mcp__xcodebug__xcodebug` or `xcodebug.xcodebug`. If it is absent, report the
-  missing connection; do not start another server.
+- Otherwise, use the connected xcodebug MCP tool. Prefer the bundled server when
+  invoking this skill from a Marketplace plugin. The tool may be namespaced,
+  such as `mcp__plugin_xcodebug_xcodebug__xcodebug` in Claude Code; a manually
+  registered tool is commonly `mcp__xcodebug__xcodebug` or `xcodebug.xcodebug`.
+  If the connection is missing, report it; do not start another server.
 - Captures and restart settings belong to the selected tool's process. Do not
   switch backends or substitute another operation.
 
@@ -25,7 +27,8 @@ user-level skills directory; these instructions do not disable that discovery.
 
 ## Dispatch the request
 
-Read the request following `/xcodebug` in Claude Code or `$xcodebug` in Codex.
+Read the request following the skill name: `/xcodebug` or `/xcodebug:xcodebug`
+in Claude Code, or the xcodebug skill selected through `$` in Codex.
 Both explicit invocation and a matching natural-language request can use this skill.
 
 - With no arguments, call `{"action":"launch"}` once to build as needed, install,
@@ -41,6 +44,9 @@ Both explicit invocation and a matching natural-language request can use this sk
   numeric `since`/`limit`/`timeoutSeconds`, booleans, JSON `args` arrays and
   `environment` objects. Keep a supplied `command` shell line intact.
 - Omit unspecified parameters so the selected tool can apply its project configuration.
+  For Codex Marketplace, pass the session's absolute project working directory
+  as MCP `cwd` (unless the user supplied it). Codex starts the bundled server
+  in the plugin directory, not the project. Do not send `cwd` to the native tool.
 - Only on MCP, use pull reads: omit `push` or use `push="off"`; `context` and
   `wake` are unsupported. Explain an unsupported explicit value instead of changing it silently.
   Native tools retain their live schema's push modes.

@@ -64,7 +64,40 @@ The shared actions reach both clients through MCP. `mcp/server.ts` loads
 same actions and arguments as the pi extension rather than a parallel
 implementation. Claude Code can also load the optional native display below.
 
-### Set up (once per machine)
+### Install from Marketplace
+
+With [Bun](https://bun.sh) on the client's `PATH`, choose one installation path per client.
+
+**Claude Code** (2.1.331 verified):
+
+```bash
+claude plugin marketplace add sublimter/xcodebug
+claude plugin install xcodebug@sublimter-xcodebug --scope user
+```
+
+Open a new Claude session in your project and run `/xcodebug:xcodebug doctor`.
+The plugin bundles the skill, MCP server, and live display Mod. If replacing a
+manual installation, disable the manually installed `xcodebug-live` Mod and
+remove the old MCP registration after its captures finish.
+
+**Codex CLI** (0.172.0 verified):
+
+```bash
+codex plugin marketplace add sublimter/xcodebug
+codex plugin add xcodebug@sublimter-xcodebug
+```
+
+Open a new Codex session in your project, select `xcodebug:xcodebug` in the `$`
+picker, and ask for `doctor`. The skill passes the project directory as MCP
+`cwd`; direct project tool calls need its absolute path. The plugin sets the
+4200-second tool timeout. For the optional footer, use the provider settings
+under [Codex live display](#codex-live-display-experimental). Do not run
+`xcodebug-setup-codex` or add a second MCP registration for this installation.
+
+For a local checkout, pass its absolute path instead of `sublimter/xcodebug`
+to either `plugin marketplace add` command.
+
+### Set up manually (once per machine)
 
 ```bash
 npm i -g xcodebug@latest   # installs the latest published release
@@ -180,7 +213,7 @@ inventory stalls, the picker can show only the default provider even though
 xcodebug itself is available. Specify the provider directly for one session:
 
 ```bash
-codex -c 'tui.status_line_provider={server="xcodebug",tool="xcodebug_ui"}'
+codex --enable tui_extensions_statusline -c 'tui.status_line_provider={server="xcodebug",tool="xcodebug_ui"}'
 ```
 
 Setup persists the provider selection for missing/default user settings. To
@@ -345,10 +378,10 @@ does not restore a live capture or cursor in another client.
 
 ### Claude Code live display
 
-The live band needs three separate components: the `xcodebug` MCP server runs
-the actions, the [shared skill](#install-the-manual-entry-point) provides
-`/xcodebug`, and the `xcodebug-live` Mod draws above the prompt. Connecting MCP
-or installing the skill alone does **not** load the Mod.
+The [Marketplace plugin](#install-from-marketplace) includes the live band. For
+manual installations only, add the `xcodebug-live` Mod to the existing MCP
+connection and [shared skill](#install-the-manual-entry-point). Connecting MCP
+or installing the skill alone does not load the Mod.
 
 #### Prerequisites
 
@@ -367,7 +400,7 @@ test -f "$XCODEBUG_DIR/mcp/server.ts"
 If either file check fails, use a checkout containing the Mod and its updated
 MCP adapter. Keep the MCP registration named `xcodebug` and point it at
 `mcp/server.ts` from this same
-root, using Bun. Follow [Set up](#set-up-once-per-machine) to register it, or
+root, using Bun. Follow [manual setup](#set-up-manually-once-per-machine) to register it, or
 inspect an existing registration with `claude mcp get xcodebug`.
 
 #### Install once for ordinary Claude sessions

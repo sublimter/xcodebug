@@ -27,8 +27,8 @@ let stale = 0;
 // A tool call runs the session's tool hooks, so only the first read of an
 // activity asks the server; it names the file the server keeps the same
 // snapshot in, and the reads after that come from there.
-async function readServer($) {
-  const result = await $.mcp.call(SERVER, UI_TOOL, {});
+async function readServer($, server) {
+  const result = await $.mcp.call(server, UI_TOOL, {});
   if (result.isError) throw new Error(result.content.find(c => c.type === 'text')?.text ?? 'UI read failed');
   const snapshot = JSON.parse(result.content.find(c => c.type === 'text')?.text ?? '{}');
   // A server from before the file existed names none, and is asked every time.
@@ -54,12 +54,12 @@ async function readFile($) {
 
 // The timer lives only while there is something to show: it ends once the
 // server empties its snapshot (no build, no capture) or keeps failing.
-function watch($) {
+export function watch($, server) {
   timer ??= $.clock.every(POLL_MS, async () => {
     if (polling) return;
     polling = true;
     try {
-      const snapshot = await readFile($) ?? await readServer($);
+      const snapshot = await readFile($) ?? await readServer($, server);
       rows = snapshot.rows?.length ? snapshot.rows : snapshot.status ? [snapshot.status] : [];
       failures = 0;
     } catch (error) {
@@ -81,33 +81,34 @@ function watch($) {
   });
 }
 
+export async function trackTool($, e, next, server) {
+  if (QUIET_ACTIONS.has(e.action) && !e.command) return next(e);
+  // An older server may have exited without removing its snapshot file.
+  file = undefined;
+  watch($, server);
+  calls += 1;
+  try {
+    return await next(e);
+  } finally {
+    calls -= 1;
+  }
+}
+
+export async function render($, e, next) {
+  if (rows.length === 0) return next(e);
+  const { Box, Text } = $.ui.resolve(e);
+  return Box({
+    flexDirection: 'column',
+    children: rows.map(text => Text({ children: [text] })),
+  });
+}
+
 export function register(on) {
   // A capture outlives the module: a reload or a resumed session finds it here.
   on('session.start', async ($, e, next) => {
-    watch($);
+    watch($, SERVER);
     return next(e);
   });
-
-  on('tool.call', { tool: ACTION_TOOL }, async ($, e, next) => {
-    if (QUIET_ACTIONS.has(e.action) && !e.command) return next(e);
-    // The server may have been replaced since the file was named; one killed
-    // while it showed something leaves that file behind, still naming it.
-    file = undefined;
-    watch($);
-    calls += 1;
-    try {
-      return await next(e);
-    } finally {
-      calls -= 1;
-    }
-  });
-
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (rows.length === 0) return next(e);
-    const { Box, Text } = $.ui.resolve(e);
-    return Box({
-      flexDirection: 'column',
-      children: rows.map(text => Text({ children: [text] })),
-    });
-  });
+  on('tool.call', { tool: ACTION_TOOL }, ($, e, next) => trackTool($, e, next, SERVER));
+  on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => render($, e, next));
 }

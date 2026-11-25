@@ -1,0 +1,6 @@
+{
+  "name": "sublimter-xcodebug",
+  "description": "Xcode debugging tools for physical iOS devices",
+  "owner": { "name": "sublimter" },
+  "plugins": [{ "name": "xcodebug", "source": "./" }]
+}

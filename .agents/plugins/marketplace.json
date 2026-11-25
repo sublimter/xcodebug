@@ -1,0 +1,12 @@
+{
+  "name": "sublimter-xcodebug",
+  "interface": { "displayName": "xcodebug" },
+  "plugins": [
+    {
+      "name": "xcodebug",
+      "source": { "source": "local", "path": "./" },
+      "policy": { "installation": "AVAILABLE" },
+      "category": "Developer Tools"
+    }
+  ]
+}

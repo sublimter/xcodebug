@@ -20,7 +20,7 @@
  */
 import { mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { createInterface } from "node:readline";
 import { validateParameters } from "../parameters.ts";
 import { asRecord, asString } from "../exec.ts";
@@ -195,7 +195,7 @@ function sendNotification(method: string, params: unknown): void {
 // While an action runs, index.ts repaints its status line once a second. That is
 // the same cadence MCP progress wants, so the status text becomes the progress
 // message instead of being dropped. `hasUI` is what makes that ticker run at all.
-function makeCtx(progressToken: unknown): { ctx: ExtensionContextLike; close(): void } {
+function makeCtx(cwd: string, progressToken: unknown): { ctx: ExtensionContextLike; close(): void } {
   let step = 0;
   let active = true;
   const report = (text: string | undefined): void => {
@@ -207,7 +207,7 @@ function makeCtx(progressToken: unknown): { ctx: ExtensionContextLike; close(): 
   };
   return {
     ctx: {
-      cwd: process.cwd(),
+      cwd,
       agentDir: AGENT_DIR,
       hasUI: true,
       ui: {
@@ -234,6 +234,10 @@ function makeCtx(progressToken: unknown): { ctx: ExtensionContextLike; close(): 
 
 // Typebox attaches symbol metadata; JSON round-tripping leaves a plain schema.
 const inputSchema = JSON.parse(JSON.stringify(tool.parameters)) as Record<string, unknown>;
+const { properties } = inputSchema as { properties: Record<string, unknown> };
+properties.cwd = { type: "string", description: "Absolute path to the current project directory. Required for project actions in the Codex Marketplace installation." };
+
+const CWD_FREE_ACTIONS = { devices: true, logs: true, wait: true, history: true, status: true, stop: true };
 
 function reply(id: unknown, result: unknown): void {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
@@ -249,8 +253,15 @@ async function callTool(
   progressToken: unknown,
 ): Promise<ToolResult> {
   // Preserve invalid input for validation; spreading null or a number hides its type.
-  const args = input && typeof input === "object" && !Array.isArray(input)
-    ? input as Record<string, unknown> : validateParameters(input);
+  const { cwd, ...args } = input && typeof input === "object" && !Array.isArray(input)
+    ? input as Record<string, unknown> : { ...validateParameters(input), cwd: undefined };
+  if (cwd !== undefined && (typeof cwd !== "string" || !isAbsolute(cwd))) {
+    throw new Error("cwd must be an absolute project directory path.");
+  }
+  if (process.env.XCODEBUG_REQUIRE_PROJECT_CWD === "1" && cwd === undefined &&
+      (args.command !== undefined || !Object.hasOwn(CWD_FREE_ACTIONS, String(args.action)))) {
+    throw new Error("Pass cwd with the absolute path to your project directory.");
+  }
   // `defaultPushMode` defaults to "context", but this transport cannot deliver
   // pushed lines. Refusing an explicit request beats accepting it and going quiet.
   if (args.push === "context" || args.push === "wake") {
@@ -259,7 +270,7 @@ async function callTool(
       isError: true,
     };
   }
-  const progress = makeCtx(progressToken);
+  const progress = makeCtx(cwd ?? process.cwd(), progressToken);
   try {
     return await tool.execute("mcp", { ...args, push: args.push === undefined ? "off" : args.push }, signal, undefined, progress.ctx);
   } finally {
