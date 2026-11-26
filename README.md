@@ -1,5 +1,7 @@
 # xcodebug
 
+## Overview
+
 Drive a **physical iOS device** from the agent session: build/install/launch with
 Xcode, then read the app's console output (stdout/stderr + os_log) inside the
 session.
@@ -17,402 +19,94 @@ ships with:
 `devicectl --console` needs the app to be launched *by* it, so `launch` restarts
 the app. `syslog` attaches to an already-running process instead.
 
-## Install
+| Client | Recommended installation | In-session entry point |
+|---|---|---|
+| [pi/omp extension](#piomp-extension) | Native package | `/xcodebug` |
+| [Claude Code](#claude-code) | Marketplace plugin | `/xcodebug:xcodebug` |
+| [Codex](#codex) | Marketplace plugin | `xcodebug:xcodebug` in the `$` picker |
 
-The extension is a directory with `index.ts` plus a `pi` manifest; either install
-it as a package or drop the directory in place.
-
-```bash
-# from npm (writes to ~/.pi/agent/settings.json)
-pi install npm:xcodebug
-pi install npm:xcodebug -l      # project scope: .pi/settings.json
-
-# explicitly select the latest release, or install from a checkout
-pi install npm:xcodebug@latest
-pi install /path/to/xcodebug
-```
-
-**Upgrading from `xcodebug-extension`:** the package was renamed, so both names
-register the same `xcodebug` tool and the loader refuses to start the second one
-(`Tool "xcodebug" conflicts with ...`). Remove the old package first:
-
-```bash
-pi remove npm:xcodebug-extension
-pi install npm:xcodebug
-```
-
-Or copy the directory into the global extensions dir, which the engine discovers
-on startup:
-
-```text
-<agentDir>/extensions/xcodebug/index.ts
-```
-
-`<agentDir>` is whatever the host resolves (`~/.omo/agent` under OmO,
-`~/.omp/agent` under omp, `~/.senpi/agent` under senpi, `~/.pi/agent` under
-upstream pi): xcodebug is a generic pi extension and names no brand.
-
-**Restart the session** afterwards. Neither pi nor omp reloads an already-loaded
-extension: pi has no reload command at all, and omp's `/reload-plugins` only
-clears plugin discovery, not the imported module graph. Editing `index.ts` while
-a session is running therefore has no effect on that session.
-
-## Claude Code and Codex (MCP)
-
-The shared actions reach both clients through MCP. `mcp/server.ts` loads
-`index.ts` with a stub host and serves the tool it registers, so it exposes the
-same actions and arguments as the pi extension rather than a parallel
-implementation. Claude Code can also load the optional native display below.
-
-### Install from Marketplace
-
-With [Bun](https://bun.sh) on the client's `PATH`, choose one installation path per client.
-If you already have a manual setup, follow [the migration steps](#migrate-an-existing-manual-installation) after installing.
-
-**Claude Code** (2.1.331 verified):
-
-```bash
-claude plugin marketplace add sublimter/xcodebug
-claude plugin install xcodebug@sublimter-xcodebug --scope user
-```
-
-Open a new Claude session in your project and run `/xcodebug:xcodebug doctor`.
-The plugin bundles the skill, MCP server, and live display Mod.
-
-**Codex CLI** (0.172.0 verified):
-
-```bash
-codex plugin marketplace add sublimter/xcodebug
-codex plugin add xcodebug@sublimter-xcodebug
-```
-
-The plugin name is **xcodebug** (`xcodebug@sublimter-xcodebug`); its internal
-MCP server is `xcodebug_marketplace` so the old `xcodebug` registration cannot
-shadow it. In a new project session, select `xcodebug:xcodebug` in the `$`
-picker and ask for `doctor`. Its `source:` should point to the plugin copy.
-The plugin sets a 4200-second tool timeout. The skill passes the project
-directory as MCP `cwd`; direct project tool calls need an absolute path to an
-existing directory, except for `restart`, which reuses the last launch
-directory. Do not run `xcodebug-setup-codex` for the plugin.
-MCP resolves an explicit `cwd` before discovering config or starting commands.
-If a symlink and `..` make the path ambiguous, pass the resolved project directory.
-
-For a local checkout, pass its absolute path instead of `sublimter/xcodebug`
-to either `plugin marketplace add` command.
+Install using the section for your client. Claude Code and Codex need
+[Bun](https://bun.sh) on the client's `PATH` to run the TypeScript MCP server.
+After installing, open a new session in your project and run `doctor`. See the
+[practical guide](GUIDE.md) for worked examples.
 
 ### Migrate an existing manual installation
 
-Install the Marketplace plugin and verify it first. Finish or stop any old
-captures from the session that started them before removing the old registration;
-live captures do not transfer. Installation does not edit your manual settings.
-Save the old xcodebug entries before changing them. If a registration uses a
-custom command, environment, or timeout you still need, review the differences
-before removing it; the plugin does not import those settings.
+Install and verify the Marketplace plugin before retiring the manual setup.
+The plugin does not import or overwrite existing commands, environment
+variables, or timeouts. Save the settings you change. Finish or stop old
+captures in the session that started them; live captures do not transfer.
+Follow the steps for [Claude Code](#claude-code-migration) or
+[Codex](#codex-migration).
 
-#### Codex migration
+### MCP runtime and cancellation
 
-1. In a new project session, run `doctor` through `xcodebug:xcodebug` and
-   confirm `source:` points to the installed plugin, not the old checkout or npm
-   install. Inspect the old registration with `codex mcp get xcodebug`.
-2. If `tui.status_line_provider` is `{ server = "xcodebug", tool = "xcodebug_ui" }`,
-   save it, then change only `server` to `xcodebug_marketplace`. Leave other
-   providers and the default footer unchanged. This also applies when upgrading
-   an earlier Marketplace install that used the old provider name.
-3. For a confirmed xcodebug registration in the user `config.toml` (under
-   `${CODEX_HOME:-$HOME/.codex}`), save its entry and run `codex mcp remove xcodebug`.
-   For a project `.codex/config.toml` registration, review it with the project
-   owner and remove only the matching entry if no one still uses it. Reopen
-   Codex and verify `doctor` again.
-
-**Rollback:** Run `codex plugin remove xcodebug@sublimter-xcodebug`, restore
-the saved MCP entry and any changed footer selection in their original config
-files, then open a new session.
-
-#### Claude Code migration
-
-1. In a new project session, run `/xcodebug:xcodebug doctor`. Confirm `/mcp`
-   lists the bundled `plugin:xcodebug:xcodebug` as connected. Use
-   `claude mcp get xcodebug` to inspect the old registration and its scope.
-   Claude Code [hides duplicate endpoints](https://code.claude.com/docs/en/mcp.md#scope-hierarchy-and-precedence):
-   if both registrations use the same `mcp/server.ts` path, install the
-   Marketplace plugin from a separate checkout to verify it before removing
-   the manual registration.
-2. If `claude plugin list` shows the enabled standalone Mod, run
-   `claude plugin disable xcodebug-live@skills-dir`. For a confirmed user-scope
-   xcodebug registration, save its entry and run
-   `claude mcp remove --scope user xcodebug`. For a local-scope registration,
-   run the same command with `--scope local` from its project. Review shared
-   `.mcp.json` entries with the project owner before changing them.
-3. Reopen Claude Code. Verify `/xcodebug:xcodebug doctor` still works and `/mcp`
-   no longer lists the retired manual server in the migrated scope.
-
-**Rollback:** Run `claude plugin disable xcodebug@sublimter-xcodebug --scope user`,
-restore the saved MCP entry in its original scope, and, if you disabled the
-standalone Mod for this migration, run `claude plugin enable xcodebug-live@skills-dir`.
-Open a new session.
-
-If you no longer use a manually linked skill, move the matching user symlink
-(`~/.agents/skills/xcodebug` for Codex or `~/.claude/skills/xcodebug` for Claude
-Code) out of the skills directory so only the bundled entry is offered. Keep
-links used by other clients or projects; move any retired link back on rollback.
-
-### Set up manually (once per machine)
-
-```bash
-npm i -g xcodebug@latest   # installs the latest published release
-codex  mcp add xcodebug -- bun "$(npm root -g)/xcodebug/mcp/server.ts"
-claude mcp add --scope user xcodebug -- bun "$(npm root -g)/xcodebug/mcp/server.ts"
-```
-
-Working from a checkout instead? Point both at `mcp/server.ts` in the repo:
-
-```bash
-codex  mcp add xcodebug -- bun /path/to/xcodebug/mcp/server.ts
-claude mcp add --scope user xcodebug -- bun /path/to/xcodebug/mcp/server.ts
-```
-
-Bun is required ([bun.sh](https://bun.sh)). The sources are TypeScript, and Node
-refuses to strip types for files under `node_modules`
-(`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`) - which is exactly where npm
-installs the package, so `node` cannot start an installed copy. Bun loads the
-same file from either location, so one command covers both.
-
-Check that the client picked it up:
-
-```bash
-codex  mcp list     # xcodebug  bun …
-claude mcp list     # xcodebug: … ✔ Connected
-```
-
-After installing the package, run the setup command once to register the MCP
-server when missing and add the timeout without replacing an existing xcodebug
-command or argument list:
-
-```bash
-xcodebug-setup-codex
-```
-
-From a checkout, use `node bin/xcodebug-setup-codex.mjs`. The command uses the
-Codex app-server config API available in current Codex releases. It registers
-xcodebug with Bun if it is missing, writes `tool_timeout_sec = 4200` only when
-that field is absent, and preserves an existing custom timeout. On Codex CLI
-`0.171.0` or later it also enables `features.tui_extensions_statusline = true`
-and selects the xcodebug statusline provider when the user selection is missing
-or `default`. Existing custom providers are preserved with a warning. Older or
-unrecognized CLI versions receive a warning instead. It checks the
-running service with `codex app-server daemon version` and warns if its
-`appServerVersion` is too old or cannot be verified. Saving configuration does
-not upgrade the service; setup never updates or restarts a daemon automatically.
-The command warns about project-level xcodebug overrides and existing server
-paths pointing elsewhere, but preserves the registration and project files.
-Setup saves these fields together with one version-checked `config/batchWrite`
-request.
-If another process edits the user configuration during setup, Codex rejects
-stale writes; rerun setup after that edit rather than overwrite a new selection.
-It does not run automatically during npm install because package installation
-should not silently modify a user's Codex configuration. See the live display
-section below for provider selection. For manual setup on supported CLI and
-app-server versions, merge these fields into existing tables rather than add
-duplicate table headers:
-
-```toml
-[features]
-tui_extensions_statusline = true
-
-[tui]
-status_line_provider = { server = "xcodebug", tool = "xcodebug_ui" }
-
-[mcp_servers.xcodebug]
-tool_timeout_sec = 4200
-```
-
-The timeout leaves room for the default 15-minute pod install, 15-minute build
-and 30-minute command budgets, plus device operations. Increase it if you pass
-larger timeouts. This does not change xcodebug's stage deadlines or Codex's
-separate status-line resource read deadline.
-
-Claude Code needs no setting for this. Its default limit on a tool call is about
-28 hours. It also ends a call to a stdio server that has sent neither a reply
-nor a progress notification for 30 minutes; this server sends progress once a
-second to a client that asks for it.
-
-Cancelling an MCP request aborts that request. On SIGINT, SIGTERM or detected
-stdout loss, the server stops accepting work, cancels admitted requests and
-then cleans up captures. Closing only stdin lets admitted requests finish and
-sends their replies; a silent lost reader cannot be distinguished from this
-until stdout closes or a write fails.
+Cancelling an MCP request aborts that request. On SIGINT, SIGTERM, or detected
+stdout loss, the server stops accepting work, cancels admitted requests, and
+starts cleanup. Stdin EOF alone drains admitted requests and sends their replies
+before cleanup. A lost reader is not detected until stdout closes or a write fails.
 
 Bare `stop` cancels running and queued xcodebug actions in this session/server,
-then stops its active captures. It can interrupt a build, pod install, command,
-or wait even before any capture starts; MCP handles it outside the action queue.
-The `running` display can represent a build or command, not only capture.
-Stop requests cancellation first and waits for cleanup. Native stop waits up to
-five seconds; native session shutdown keeps its three-second cleanup deadline.
-MCP also bounds its preceding-request wait. If work cannot settle in time, the
-reply is an error with `cleanupPending=true`, not proof of a successful stop or
-verification. Pending native cleanup retains its stopping display until tracked
-resources settle; later ordinary work stays behind that resource barrier. A stopped request's
-appended command does not start after incomplete cleanup. Do not automatically
-restart stopped work.
-`stop captureId=...` only stops that capture and its companion. `keepApp=true`
-still leaves the app running. Cancellation is not a rollback: an interrupted
-pod install may leave generated files incomplete; rerun it before building.
+then stops its captures. It can interrupt a build, pod install, command, or
+wait before any capture starts. MCP handles it outside the action queue.
+`stop captureId=...` stops only that capture and its companion. `keepApp=true`
+leaves the app running.
 
-To run `npm test` from a checkout, use Node.js 22.18 or later and put Bun on PATH
-for the stdio integration tests.
+Native stop waits up to five seconds for cleanup; native session shutdown has
+a three-second cleanup deadline. MCP also bounds its wait for preceding
+requests. An error with `cleanupPending=true` means resources are still
+settling. Native pending cleanup retains the stopping display until tracked
+resources settle, and later ordinary work waits behind those resources. A
+stopped request's appended command does not start after incomplete cleanup.
+Do not automatically restart stopped work. An interrupted pod install can
+leave generated files incomplete; rerun it before building.
 
-### Codex live display (experimental)
-
-MCP registration alone makes the tool available. The live footer also needs
-`features.tui_extensions_statusline` and the `tui.status_line_provider` selection.
-`tui.status_line` controls which supported fields are shown while idle; it does
-not select the provider.
-
-Both Codex CLI and the connected app server must be `0.171.0` or later. Setup
-enables the feature persistently and selects xcodebug for a missing or default
-provider. Alternatively start Codex with `codex --enable tui_extensions_statusline`.
-If setup reports an older running
-service, finish active Codex tasks and captures before running
-`codex app-server daemon update --from-cli --yes`, then
-`codex app-server daemon restart`. Opening a new TUI alone does not upgrade it.
-
-Start a new Codex session after setup or after updating the service or MCP
-server. To change providers, open `/statusline`, enter **Choose a status line
-provider**, then select `xcodebug_marketplace / xcodebug_ui` for Marketplace or
-`xcodebug / xcodebug_ui` for a manual installation. A project-level override of
-the same MCP server name can make the provider unavailable.
-
-Codex 0.171.0 has a five-second provider discovery deadline. If the global MCP
-inventory stalls, the picker can show only the default provider even though
-xcodebug itself is available. Specify the provider directly for one session:
-
-```bash
-# Marketplace (for manual installs, use server="xcodebug" instead)
-codex --enable tui_extensions_statusline -c 'tui.status_line_provider={server="xcodebug_marketplace",tool="xcodebug_ui"}'
-```
-
-Setup persists the provider selection for missing/default user settings. To
-replace another custom provider explicitly, use the manual settings above.
-Provider selection is supported configuration, not an MCP server setting.
-See Codex's
-[provider configuration](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/app/status_line_settings.rs)
-and [discovery deadline](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/statusline_provider.rs).
-
-The footer shows xcodebug's operation or one running capture's line count and
-latest log line, including between tool calls. The count is per capture, not a
-total across channels. A new `launch` or `syslog` that replaces a capture for
-the same app starts a new count.
-
-If elapsed time and `quiet Ns` advance while the count and latest line stay
-unchanged, the footer is refreshing but that capture has no new lines to show.
-This does not distinguish app silence from a stalled bridge. In the **same
-Codex session**, use `action=status` to identify the running capture and
-`action=logs captureId=<id>` to inspect what it received. A new session does
-not inherit the live capture.
-
-When no operation or capture remains, the footer restores the configured
-`model-with-reasoning`, `current-dir`, `context-remaining`, and `fast-mode`
-content from Codex's current statusline snapshot, in order. Unavailable
-context usage or tier information is omitted rather than guessed.
-The provider stays selected; xcodebug does not rewrite global settings at each
-start or stop. Codex does not delegate to its native default renderer, so other
-built-in items and styling are not mirrored. Clients that do not supply a
-statusline snapshot receive empty idle content. The footer does not stream
-logs into the model; use `action=logs` or `action=wait` for log evidence.
-Long status text is shortened in the footer without changing the command or
-its output.
+To run `npm test` from a checkout, use Node.js 22.18 or later and put Bun on
+`PATH` for the stdio integration tests.
 
 ### Install the manual entry point
 
-Connecting MCP makes the tool available to the model; it does not register a
-`/xcodebug` command in either client. The shared
-[xcodebug skill](mcp/skills/xcodebug/SKILL.md) adds an explicit entry point:
-`/xcodebug` in Claude Code, `$xcodebug` in Codex, or Codex's `/skills` picker.
+Marketplace plugins already include the [xcodebug skill](mcp/skills/xcodebug/SKILL.md).
+For manual MCP setup, link it to get `/xcodebug` in Claude Code or `xcodebug` in
+the Codex `$` picker. The skill uses your existing MCP registration; it does
+not start a server.
 
-Native pi/omp needs only the extension, not this skill or an MCP connection.
-Both hosts register `extensions: ["./index.ts"]`; `pi.skills: []` disables pi's
-package skill loading. The shared skill lives under `mcp/skills/`, outside the
-root `skills/` directory that omp scans independently of manifest fields.
-Native `/xcodebug` runs
-the registered extension handler directly; it does not ask the model to select
-a skill. A normal model tool call uses the registered native `xcodebug` tool.
-If pi/omp also discovers the shared user-level skill through `.agents/skills`
-or `.claude/skills`, its instructions select that native tool before MCP.
-This shared-skill selection is model-driven, not a substitute for the native
-command's deterministic dispatch. The extension must be installed, enabled and
-loaded in the session; explicitly disabling it is not overridden.
+Set `XCODEBUG_DIR` to the absolute path of your checkout or to
+`"$(npm root -g)/xcodebug"`. Set `dest` for the client you are setting up:
 
-Both clients can read the same skill directory through user-level symlinks:
+- Claude Code: `dest="$HOME/.claude/skills/xcodebug"`
+- Codex: `dest="$HOME/.agents/skills/xcodebug"`
+
+Run this in the same shell:
 
 ```bash
-XCODEBUG_DIR="/absolute/path/to/xcodebug"  # a checkout containing the skill
-# For an npm package that includes the skill, use this instead:
-# XCODEBUG_DIR="$(npm root -g)/xcodebug"
-
 (
+  : "${XCODEBUG_DIR:?Set XCODEBUG_DIR to the package or checkout root}"
+  : "${dest:?Set dest for the selected client}"
   source="$XCODEBUG_DIR/mcp/skills/xcodebug"
-  legacy="$XCODEBUG_DIR/skills/xcodebug"
   test -f "$source/SKILL.md" || { printf 'Skill not found: %s\n' "$source/SKILL.md" >&2; exit 1; }
-  for dest in "$HOME/.agents/skills/xcodebug" "$HOME/.claude/skills/xcodebug"; do
-    if test -e "$dest" || test -L "$dest"; then
-      if ! test -L "$dest" || { ! test "$dest" -ef "$source" && ! test "$(readlink "$dest")" = "$legacy"; }; then
-        printf 'Existing skill path: %s; inspect it before installing.\n' "$dest" >&2
-        exit 1
-      fi
-    fi
-  done
-  mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills" || exit 1
-  for dest in "$HOME/.agents/skills/xcodebug" "$HOME/.claude/skills/xcodebug"; do
-    if test -L "$dest" && test "$(readlink "$dest")" = "$legacy"; then
-      rm "$dest" || exit 1
-    fi
-    test -L "$dest" || ln -s "$source" "$dest" || exit 1
-  done
+  if test -L "$dest" && test "$dest" -ef "$source"; then
+    exit 0
+  fi
+  if test -e "$dest" || test -L "$dest"; then
+    printf 'Existing skill path: %s; inspect it before installing.\n' "$dest" >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$dest")" && ln -s "$source" "$dest"
 )
 ```
 
-If the installed package does not contain `mcp/skills/xcodebug/SKILL.md`, use a
-checkout that contains it. The commands check both target paths before installing,
-skip symlinks already pointing to this skill, and migrate links to this checkout's
-old `skills/xcodebug` source. They stop on other existing files, directories or
-symlinks, including unrelated broken links. After updating an older checkout or
-upgrading an npm package that used the old root `skills/` path, rerun these
-commands to relink both clients; npm upgrade alone does not migrate those links.
-Keep the checkout or npm package at the linked path. Once relinked, updates to
-the maintained source update the shared skill for both clients.
-
-Start a new Claude Code or Codex session after installing. The skill uses the
-MCP connection already configured above in those clients; it does not start a
-separate server. Native pi/omp uses its extension command and native tool instead.
-Both manual and model-selected invocation remain available. See the clients'
-[Claude Code skill documentation](https://code.claude.com/docs/en/skills)
-and [Codex skill documentation](https://learn.chatgpt.com/docs/build-skills).
+If an old link points to `skills/xcodebug`, inspect it and move it aside before
+rerunning the recipe. An npm upgrade does not move the link. If the package
+lacks `mcp/skills/xcodebug/SKILL.md`, use a checkout that contains it. Keep the
+linked source in place and open a new client session.
 
 ### Use
 
-Start the client **in the project directory or a source subdirectory**. The
-Codex Marketplace skill passes this directory as `cwd`; other installations
-use the inherited working directory by default. See [project discovery](#one-shot-xcodebug-what-to-verify).
-
-```bash
-cd ~/myapp          # holds the .xcworkspace or .xcodeproj
-codex               # or: claude
-```
-
-Enter these in the client's chat input, not in your shell, after installing the skill:
-
-| Operation | Claude Code | Codex |
-|---|---|---|
-| Build, install and launch with defaults | `/xcodebug` | `$xcodebug` |
-| Show capture status | `/xcodebug status` | `$xcodebug status` |
-| Check the toolchain | `/xcodebug doctor` | `$xcodebug doctor` |
-| List devices | `/xcodebug devices` | `$xcodebug devices` |
-| Build, install and launch | `/xcodebug launch scheme=MyApp` | `$xcodebug launch scheme=MyApp` |
-| Read filtered logs | `/xcodebug logs grep="Weather Sync" limit=100` | `$xcodebug logs grep="Weather Sync" limit=100` |
-| Wait for an event | `/xcodebug wait match="sync complete" timeoutSeconds=30` | `$xcodebug wait match="sync complete" timeoutSeconds=30` |
-| Inspect recorded runs | `/xcodebug history limit=5` | `$xcodebug history limit=5` |
-| Rebuild and rerun the last launch | `/xcodebug restart` | `$xcodebug restart` |
-| Cancel running work and stop captures, leave the app running | `/xcodebug stop` | `$xcodebug stop` |
+Start the client in the project directory or a source subdirectory. Enter
+actions in the client's chat input, not in the shell. Use the entry point in
+the [overview](#overview) and see [project discovery](#one-shot-xcodebug-what-to-verify)
+for how xcodebug chooses a workspace and scheme.
 
 A bare skill invocation calls `{"action":"launch"}`: it builds as needed, installs,
 launches and starts capturing using the server's project/device defaults. Use
@@ -445,178 +139,27 @@ action=status                   captures, line counts, log paths
 action=stop                     cancel executing/queued actions and stop captures
 ```
 
-If the entry point is missing, check the symlink and restart the client. If the
-skill is found but the MCP tool is missing, check `claude mcp list` or Codex's
-`/mcp`; installing the skill alone does not connect MCP. A `Called
-xcodebug.xcodebug` line is a tool-call record, not a command to type.
+If a Marketplace skill is missing, check that the plugin is enabled and open a
+new session. For manual setup, check the skill link and MCP registration
+separately. A `Called xcodebug.xcodebug` line records a tool call; it is not a
+command to type.
 
 Live captures, cursors and the last launch belong to one server process. Stay
 in the same client session for `launch` → `logs`/`wait` → `restart`/`stop`.
 `history` can look up earlier runs stored under the same log directory, but it
 does not restore a live capture or cursor in another client.
 
-### Claude Code live display
+### MCP logs and display
 
-The [Marketplace plugin](#install-from-marketplace) includes the live band. For
-manual installations only, add the `xcodebug-live` Mod to the existing MCP
-connection and [shared skill](#install-the-manual-entry-point). Connecting MCP
-or installing the skill alone does not load the Mod.
+MCP accepts `push=off` only. Read logs with `logs` or `wait`; neither the
+Claude live band nor the Codex footer sends logs into the model's context.
+See [Reading logs from a cursor](#reading-logs-from-a-cursor) for what a limited
+read may omit.
 
-#### Prerequisites
+MCP logs default to `~/.xcodebug/logs/xcodebug/`. To change the base directory,
+set `XCODEBUG_AGENT_DIR`. The tool reports the exact log path.
 
-Use Claude Code **2.1.323 or later** in an interactive terminal. Choose a checkout
-or installed package that contains both the Mod and the updated MCP adapter:
-
-```bash
-XCODEBUG_DIR=/path/to/xcodebug
-# For an npm package containing this feature:
-# XCODEBUG_DIR="$(npm root -g)/xcodebug"
-claude --version
-test -f "$XCODEBUG_DIR/claude/.claude-plugin/plugin.json"
-test -f "$XCODEBUG_DIR/mcp/server.ts"
-```
-
-If either file check fails, use a checkout containing the Mod and its updated
-MCP adapter. Keep the MCP registration named `xcodebug` and point it at
-`mcp/server.ts` from this same
-root, using Bun. Follow [manual setup](#set-up-manually-once-per-machine) to register it, or
-inspect an existing registration with `claude mcp get xcodebug`.
-
-#### Install once for ordinary Claude sessions
-
-Claude loads personal skills-directory plugins on startup. The display plugin
-uses its own path, separate from the `xcodebug` skill. Run this in your shell
-after setting `XCODEBUG_DIR` above:
-
-```bash
-(
-  source="$XCODEBUG_DIR/claude"
-  dest="$HOME/.claude/skills/xcodebug-live"
-  test -f "$source/.claude-plugin/plugin.json" || {
-    printf 'Missing Mod manifest: %s\n' "$source" >&2
-    exit 1
-  }
-  if test -e "$dest" || test -L "$dest"; then
-    test -L "$dest" && test "$dest" -ef "$source" || {
-      printf 'Existing plugin path: %s\n' "$dest" >&2
-      exit 1
-    }
-  else
-    mkdir -p "$(dirname "$dest")" && ln -s "$source" "$dest" || exit 1
-  fi
-)
-```
-
-This skips a correct existing link and refuses to overwrite another file,
-directory, wrong link or broken link. Keep the source directory in place.
-Check discovery, then start a new session normally:
-
-```bash
-claude plugin list     # xcodebug-live@skills-dir, enabled
-claude
-```
-
-If this plugin was previously disabled, enable it with
-`claude plugin enable xcodebug-live@skills-dir`. In the new session, `/plugin`
-should list it and `/mcp` should show `xcodebug` connected. The official
-[personal plugin loading rules](https://code.claude.com/docs/en/plugins/create#make-a-plugin-load-in-every-session)
-describe this installation mechanism.
-
-#### Use and expected display
-
-From your app's working directory, use the installed skill in the same Claude
-session:
-
-```text
-/xcodebug launch scheme=MyApp
-/xcodebug status
-/xcodebug logs limit=100
-/xcodebug stop
-```
-
-During build, install, launch, and the rebuild within `restart`, the band shows
-the current phase and elapsed time. An operation's phase takes priority over
-an existing capture; capture continues in the background. When the operation
-finishes, fails, or is cancelled, the band returns to the running capture's
-line count and latest four log lines.
-
-It refreshes every second, between turns too, from a build, install, launch,
-restart, syslog or await call until no operation or capture is running, then
-clears and stops reading. A session that starts or reloads the Mod reads once
-and resumes a capture already running. Calls that only read or end something
-(`doctor`, `devices`, `changes`, `history`, `status`, `logs`, `wait`, `stop`, `terminate`)
-do not start it unless they carry a `command`, and an idle session makes no
-reads. An empty band is normal in
-that idle state. Build
-percentages are estimates; installation shows elapsed time, not an installation
-percentage. These lines are displayed to you without entering model context
-or starting model turns; use `logs`/`wait` when Claude needs to analyze them.
-
-The Mod calls the read-only `xcodebug_ui` tool on the existing connection once
-when a display starts. That in-memory read bypasses the action queue, so a
-build or `wait` cannot block it. A tool call runs the session's `PreToolUse`
-and `PostToolUse` hooks, so the reads after it come from a file instead: the
-server keeps the same snapshot in `~/.xcodebug/ui/<pid>.json`, names it in the
-`xcodebug_ui` answer and removes it when it exits; one left by a server that
-was killed is removed by the next server to start. Each call that starts a
-display asks the server again, as does a file that is missing or stops
-changing; with an older server that names no file the Mod calls the tool on
-every read. After three failed reads in a row it
-stops and clears the band until the next such call. Reading does not change the
-active capture or log cursors, and request progress still stops when its
-originating call returns. No second server is started. The Mod leaves an
-existing statusLine alone;
-Codex does not load this Claude-only Mod.
-
-#### If the band is missing
-
-1. Run `claude plugin list` and check `/plugin` in the affected session.
-   `xcodebug-live` must be loaded; seeing the `/xcodebug` skill or a connected
-   MCP server does not establish that. Check `/plugin`'s Errors tab if loading
-   failed. Safe mode, disabled Mods/hooks or managed settings can prevent it.
-2. Check `/mcp` for the server named exactly `xcodebug`. An unavailable band or
-   unknown `xcodebug_ui` tool usually means a missing connection or an older
-   adapter. Inspect `claude mcp get xcodebug` to check the path.
-3. Use `/xcodebug status` to check that a capture is running in this session.
-   Captures in another client/session cannot populate this band's snapshot.
-   With no running capture or published phase, the band is intentionally empty.
-4. After updating the package, changing the server path or installing the Mod,
-   restart Claude so both components load together. `/reload-plugins` can reload
-   the Mod's files but does not restart the existing MCP server. `-p` sessions
-   do not draw the band.
-
-To disable the persistent display, run
-`claude plugin disable xcodebug-live@skills-dir` and restart Claude; enable it
-again with the matching `enable` command. Capturing and the shared skill
-remain available without the display.
-
-### What differs from pi
-
-| | pi / omp / omo | Claude Code / Codex |
-|---|---|---|
-| how the tool is exposed | registered in-process | MCP server process |
-| manual entry point | native `/xcodebug` | shared skill: `/xcodebug` in Claude, `$xcodebug` in Codex |
-| status line, widget | yes | [Claude live Mod](#claude-code-live-display) or [Codex status line](#codex-live-display-experimental), both opt-in |
-| `push` | mirrors new lines into the session | `off` only; `context` and `wake` refused |
-| capture state | in the session | in the server process |
-| lifetime | the session | the client process |
-
-- **The adapter refuses `push=context` and `push=wake`.** It does not implement
-  background log delivery into model context. Read with `action=logs` or
-  `action=wait`; these pull reads are separate from both clients' live displays.
-  Cursor reads exclude earlier indices, but a limited read can omit
-  lines; see [Reading logs from a cursor](#reading-logs-from-a-cursor).
-- **Captures end with the server.** The server is a child of Codex/Claude.
-  Stdin EOF drains admitted calls and their replies before cleanup; it does not
-  cancel ordinary work. SIGINT, SIGTERM or detected stdout loss cancels admitted
-  work and starts bounded backend cleanup without waiting indefinitely on the
-  request queue. Unabortable I/O can remain unfinished and is reported honestly.
-
-Logs land in `~/.xcodebug/logs/xcodebug/`, or under `XCODEBUG_AGENT_DIR` when set.
-Every response also reports the exact path, so the model can read the file once a
-run is over.
-
-## Xcode's own MCP
+### Xcode's own MCP
 
 Xcode 27.1 ships an MCP server of its own (`xcrun mcpbridge`) with 54 tools:
 workspace and project editing, build/run/stop, tests, previews, the debugger,
@@ -650,7 +193,7 @@ nobody launched from Xcode.
 They target whatever run destination Xcode has selected; `launch` takes a udid
 directly.
 
-## Requirements
+### Requirements
 
 | Need | Why |
 |---|---|
@@ -663,7 +206,7 @@ directly.
 `xcodebug action=doctor` reports the Xcode toolchain, the capture tools, the
 active config and the log directory.
 
-## Imports
+### Imports
 
 The only engine import is a type import, erased at compile time:
 
@@ -692,7 +235,7 @@ agent directory to the session directory's parent (every brand stores sessions a
 override. If none of those exist the extension fails naming what was missing
 rather than writing logs to a guessed path.
 
-## Configure (optional)
+### Configure (optional)
 
 Optional `.xcodebug.json`: the nearest file from the invocation directory up to
 the Git worktree root wins. Outside Git, only the invocation directory is checked.
@@ -726,7 +269,7 @@ reports the selected path or error. `devices`, `logs`, `wait`, `history`,
 (and Git revision when available). If the installed source changes, replies
 tell you to restart the client even when the package version did not change.
 
-## Change detection and pod install
+### Change detection and pod install
 
 Every `build` and `launch` first inspects the working tree with
 `git status --porcelain -uall`:
@@ -786,7 +329,7 @@ pod install needed: no
 Automatic `pod install` for new files runs once per change set per Podfile
 directory, not on every run. Set `installPods=false` to skip it deliberately.
 
-## One-shot: `/xcodebug <what to verify>`
+### One-shot: `/xcodebug <what to verify>`
 
 ```text
 /xcodebug verify adding a city in Weather
@@ -834,7 +377,7 @@ the next restart only rebuilds and relaunches.
 Restart reads configuration, rebuilds, and reruns the command from the last
 launch's working directory. Use a new `launch` to switch directories.
 
-## `command=`: run a shell line alongside a capture
+### `command=`: run a shell line alongside a capture
 
 `command=` is a general primitive, not a test-runner hook: **any** shell line,
 run to completion after the app is up, with the capture recording the whole time.
@@ -858,7 +401,7 @@ The app must already be running for this to mean anything, so `command=` is a
 **second phase appended to the main action** - `/xcodebug command="..."` on its
 own still launches first. Use `action=await` when the app is already up.
 
-### Worked case: the automation stands in for the user
+#### Worked case: the automation stands in for the user
 
 The most common use is replacing a human's taps. A capture alone only records
 what the app does while **a person** drives the phone: slow to reproduce and
@@ -880,7 +423,7 @@ So the shape of a verification run is: **goal** (what to prove) + **command**
 the UI reached the expected state; the log says what the app did to get there -
 which is the part a test assertion cannot see.
 
-### The mechanics
+#### The mechanics
 
 That single line does the whole linkage run:
 
@@ -938,7 +481,7 @@ happened, because either one changes what the log means: that it was no longer
 capturing when the command finished (with the reason, or the last line logged),
 and that a console reattach relaunched the app during the run.
 
-### What the model does with it
+#### What the model does with it
 
 The command's exit code answers "did the UI reach the expected state". The log
 answers "what did the app actually do", which no assertion can see. The cursor in
@@ -994,7 +537,7 @@ ends there and says the app was restarted outside it; it does not relaunch over
 the runner's instance. A command that does not touch the app (a curl, a fixture
 import, a codegen step) has no such constraint.
 
-### Run semantics
+#### Run semantics
 
 Verification is a loop: run, read the log, conclude, stop, edit the code, run
 again. Each `launch` or `syslog` retires the previous cycle's capture for that same
@@ -1073,7 +616,7 @@ session.
   with no capture yet. An ID scopes the stop to that capture and its companion,
   leaving unrelated work alone. `keepApp=false` also terminates the app.
 
-## Usage
+### Usage
 
 ```text
 xcodebug action=devices
@@ -1121,7 +664,7 @@ xcodebug action=await command="cd /repo && npm run test:weather"
 /xcodebug await command="cd /repo && npm run test:weather"
 ```
 
-### Reading logs from a cursor
+#### Reading logs from a cursor
 
 Every `logs` read returns a cursor: the latest absolute line index in that
 capture. Pass it as `since` to exclude lines at or before that index. Reads
@@ -1169,7 +712,7 @@ evidence. A match from before the wait is labeled, not presented as a new event.
 match and no known coverage gap. A match fails the assertion; missing data,
 cancellation, a disconnected bridge or an ended capture cannot prove absence.
 
-### Run history
+#### Run history
 
 `history` reads private JSON records under `<agentDir>/logs/xcodebug/runs/`.
 Filter by exact `captureId`, `device` (name or ID), or `bundleId`; default limit
@@ -1180,7 +723,7 @@ raw shell line, arguments or output. Finished records are retained for up to
 30 days and at most 100 ended runs. `history` does not reattach to a capture.
 
 
-### `syslog`: attach without relaunching
+#### `syslog`: attach without relaunching
 
 `launch` restarts the app because `devicectl --console` has to start it. When the
 app is already running and the state you want to observe would not survive a
@@ -1195,20 +738,7 @@ This runs `idevicesyslog -p <ProcessName>` and leaves the app running. It needs
 present), and it reads the device log for that process - `print` output still
 only comes from the console bridge, per the table at the top.
 
-### Pushing logs into the conversation
-
-In native pi/omp, `push` controls whether new lines are mirrored into the session.
-The MCP adapter accepts only `off`; Claude Code and Codex use `logs`/`wait`.
-
-- `context` (default) — new lines are queued for the next turn (does not start one).
-- `off` — pull with `logs`/`wait` only.
-- `wake` — new lines start a turn.
-
-A device console is a firehose; the push carries at most 80 lines per tick and
-reports how many older lines it dropped. Combine it with `match` to keep it
-useful, e.g. `xcodebug action=launch match=MySDK push=wake`.
-
-### Files
+#### Files
 
 Every capture writes timestamped logs under
 `<agentDir>/logs/xcodebug/<mode>-<bundleId>-<timestamp>-<random suffix>.log`.
@@ -1260,7 +790,7 @@ directory, never recursively deleting a directory based on its prefix.
 A successful build clears `<agentDir>/logs/xcodebug/archive/` first, so snapshots
 from a previous binary cannot be mistaken for the run that is starting.
 
-### Device archiving is off
+#### Device archiving is off
 
 Pulling the device unified log on a timer is disabled. Measured on an 18-minute
 run it cost ~208 MB per snapshot (each covers the whole previous hour) with no
@@ -1268,3 +798,367 @@ reader, and it cannot serve its stated purpose: `log show --archive ... | grep
 MySDK` returns nothing, because `NSLog`/`print` never enters the unified log.
 Only framework records (RunningBoard, CFNetwork, WebKit) come back, so a dropped
 console bridge is recovered by reconnecting, not by replaying an archive.
+
+## pi/omp extension
+
+pi and omp load `index.ts` in-process. They do not need an MCP registration
+or the shared skill.
+
+```bash
+# from npm (writes to ~/.pi/agent/settings.json)
+pi install npm:xcodebug
+pi install npm:xcodebug -l      # project scope: .pi/settings.json
+
+# explicitly select the latest release, or install from a checkout
+pi install npm:xcodebug@latest
+pi install /path/to/xcodebug
+```
+
+For omp, use its native plugin manager:
+
+```bash
+omp plugin install npm:xcodebug
+```
+
+Upgrading from `xcodebug-extension` requires removing the old package first;
+both names register the same `xcodebug` tool.
+
+```bash
+pi remove npm:xcodebug-extension
+pi install npm:xcodebug
+```
+
+On omp, the removal command is `omp plugin uninstall npm:xcodebug-extension`.
+
+Alternatively, copy the extension directory to `<agentDir>/extensions/xcodebug/`.
+The host resolves `<agentDir>` (`~/.omp/agent`, `~/.pi/agent`, `~/.omo/agent`,
+or `~/.senpi/agent`). Use one installation method. Start a new session after
+installing or updating, then run `/xcodebug doctor`.
+
+### Pushing logs into the conversation
+
+In native pi/omp, `push` controls whether new lines are mirrored into the session.
+The MCP adapter accepts only `off`; Claude Code and Codex use `logs`/`wait`.
+
+- `context` (default) — new lines are queued for the next turn (does not start one).
+- `off` — pull with `logs`/`wait` only.
+- `wake` — new lines start a turn.
+
+A device console is a firehose; the push carries at most 80 lines per tick and
+reports how many older lines it dropped. Combine it with `match` to keep it
+useful, e.g. `xcodebug action=launch match=MySDK push=wake`.
+
+Native pi/omp needs only the extension, not this skill or an MCP connection.
+Both hosts register `extensions: ["./index.ts"]`; `pi.skills: []` disables pi's
+package skill loading. The shared skill lives under `mcp/skills/`, outside the
+root `skills/` directory that omp scans independently of manifest fields.
+Native `/xcodebug` runs
+the registered extension handler directly; it does not ask the model to select
+a skill. A normal model tool call uses the registered native `xcodebug` tool.
+If pi/omp also discovers the shared user-level skill through `.agents/skills`
+or `.claude/skills`, its instructions select that native tool before MCP.
+This shared-skill selection is model-driven, not a substitute for the native
+command's deterministic dispatch. The extension must be installed, enabled and
+loaded in the session; explicitly disabling it is not overridden.
+
+## Claude Code
+
+### Claude Code Marketplace installation
+
+```bash
+claude plugin marketplace add sublimter/xcodebug
+claude plugin install xcodebug@sublimter-xcodebug --scope user
+```
+
+Open a new Claude session in the project and run `/xcodebug:xcodebug doctor`.
+The plugin bundles the skill, MCP server, and live display Mod. Check `/plugin`
+for the enabled plugin. In `/mcp`, confirm `plugin:xcodebug:xcodebug` is
+connected. For a local checkout, pass its absolute path to `plugin marketplace
+add` instead of `sublimter/xcodebug`. Verified on Claude Code 2.1.331.
+
+### Claude Code manual MCP fallback
+
+Use the npm package or a local checkout. Set `XCODEBUG_DIR` to its root:
+
+```bash
+npm i -g xcodebug@latest
+XCODEBUG_DIR="$(npm root -g)/xcodebug"
+# For a checkout, skip npm and use XCODEBUG_DIR=/absolute/path/to/xcodebug.
+claude mcp add --scope user xcodebug -- bun "$XCODEBUG_DIR/mcp/server.ts"
+```
+
+Check the connection with `claude mcp list`. For `/xcodebug`,
+[link the shared skill](#install-the-manual-entry-point) and open a new session.
+To add a live band to this manual setup, install the
+[standalone Mod](#install-once-for-ordinary-claude-sessions).
+
+### Claude Code migration
+
+1. In a new session, run `/xcodebug:xcodebug doctor` and confirm `/mcp` shows
+   `plugin:xcodebug:xcodebug` connected. Claude Code
+   [deduplicates endpoints](https://code.claude.com/docs/en/mcp.md#scope-hierarchy-and-precedence).
+   If both registrations use the same `mcp/server.ts` path and the bundled
+   endpoint is hidden, test the Marketplace plugin from a separate checkout.
+2. Inspect the old registration and its scope with `claude mcp get xcodebug`.
+   Save the old entry. If the old standalone Mod is enabled, run
+   `claude plugin disable xcodebug-live@skills-dir`. Remove only the confirmed
+   manual registration: `claude mcp remove --scope user xcodebug`, or run
+   `claude mcp remove --scope local xcodebug` from its project. Review shared
+   `.mcp.json` entries with the project owner before editing them.
+3. If no other client or project uses your manual `~/.claude/skills/xcodebug`
+   symlink, move it out of the skills directory. Reopen Claude Code and verify
+   `/xcodebug:xcodebug doctor` and `/mcp` again.
+
+**Rollback:** Run `claude plugin disable xcodebug@sublimter-xcodebug --scope user`.
+Restore the saved MCP entry and any moved skill link. If migration disabled the
+standalone Mod, run `claude plugin enable xcodebug-live@skills-dir`. Open a new session.
+
+### Claude Code live display
+
+The [Marketplace plugin](#claude-code-marketplace-installation) includes the
+live band. It needs Claude Code 2.1.323 or later in an interactive terminal.
+If you use [manual MCP](#claude-code-manual-mcp-fallback), install the standalone
+`xcodebug-live` Mod separately. The steps below apply only to that setup.
+
+#### Standalone Mod prerequisites
+
+Use a checkout or package containing both the Mod and MCP adapter:
+
+```bash
+XCODEBUG_DIR=/path/to/xcodebug
+# For an npm package containing this feature:
+# XCODEBUG_DIR="$(npm root -g)/xcodebug"
+claude --version
+test -f "$XCODEBUG_DIR/claude/.claude-plugin/plugin.json"
+test -f "$XCODEBUG_DIR/mcp/server.ts"
+```
+
+If either file is missing, use a checkout that contains both. The standalone
+Mod uses the manual server named `xcodebug`. Check its path with
+`claude mcp get xcodebug` and keep both on the same release.
+
+#### Install once for ordinary Claude sessions
+
+Claude loads personal skills-directory plugins on startup. The display plugin
+uses its own path, separate from the `xcodebug` skill. Run this in your shell
+after setting `XCODEBUG_DIR` above:
+
+```bash
+(
+  source="$XCODEBUG_DIR/claude"
+  dest="$HOME/.claude/skills/xcodebug-live"
+  test -f "$source/.claude-plugin/plugin.json" || {
+    printf 'Missing Mod manifest: %s\n' "$source" >&2
+    exit 1
+  }
+  if test -e "$dest" || test -L "$dest"; then
+    test -L "$dest" && test "$dest" -ef "$source" || {
+      printf 'Existing plugin path: %s\n' "$dest" >&2
+      exit 1
+    }
+  else
+    mkdir -p "$(dirname "$dest")" && ln -s "$source" "$dest" || exit 1
+  fi
+)
+```
+
+This skips a correct existing link and refuses to overwrite another file,
+directory, wrong link or broken link. Keep the source directory in place.
+Check discovery, then start a new session normally:
+
+```bash
+claude plugin list     # xcodebug-live@skills-dir, enabled
+claude
+```
+
+If this plugin was previously disabled, enable it with
+`claude plugin enable xcodebug-live@skills-dir`. In the new session, `/plugin`
+should list it and `/mcp` should show `xcodebug` connected. The official
+[personal plugin loading rules](https://code.claude.com/docs/en/plugins/create#make-a-plugin-load-in-every-session)
+describe this installation mechanism.
+
+#### Use and expected display
+
+In your project session, run `/xcodebug:xcodebug launch scheme=MyApp` for
+Marketplace, or `/xcodebug launch scheme=MyApp` for manual setup.
+
+During build, install, launch, and the rebuild within `restart`, the band shows
+the current phase and elapsed time. An operation's phase takes priority over
+an existing capture; capture continues in the background. When the operation
+finishes, fails, or is cancelled, the band returns to the running capture's
+line count and latest four log lines.
+
+The band refreshes once a second between and during turns, then clears when
+no operation or capture is running. When the Mod starts, it checks the current
+MCP connection once and resumes polling if there is active work. A new Claude
+session does not inherit an old server's captures. Read-only and cleanup
+actions do not start polling unless they carry a `command`. Build percentages
+are estimates; installation shows elapsed time. Use `logs` or `wait` to give
+the model log evidence.
+
+The Mod calls the read-only `xcodebug_ui` tool on the existing connection once
+when a display starts. That in-memory read bypasses the action queue, so a
+build or `wait` cannot block it. A tool call runs the session's `PreToolUse`
+and `PostToolUse` hooks, so the reads after it come from a file instead: the
+server keeps the same snapshot in `~/.xcodebug/ui/<pid>.json`, names it in the
+`xcodebug_ui` answer and removes it when it exits; one left by a server that
+was killed is removed by the next server to start. Each call that starts a
+display asks the server again, as does a file that is missing or stops
+changing; with an older server that names no file the Mod calls the tool on
+every read. After three failed reads in a row it
+stops and clears the band until the next such call. Reading does not change the
+active capture or log cursors, and request progress still stops when its
+originating call returns. No second server is started. The Mod leaves an
+existing statusLine alone;
+Codex does not load this Claude-only Mod.
+
+#### If the band is missing
+
+1. In `/plugin`, check `xcodebug@sublimter-xcodebug` for Marketplace or
+   `xcodebug-live@skills-dir` for manual setup. Check the Errors tab if it did
+   not load. Safe mode, disabled Mods or hooks, and managed settings can block it.
+2. In `/mcp`, check `plugin:xcodebug:xcodebug` for Marketplace or `xcodebug` for
+   manual setup. If the manual server lacks `xcodebug_ui`, inspect its path with
+   `claude mcp get xcodebug`; the adapter may be out of date.
+3. Run `/xcodebug:xcodebug status` for Marketplace or `/xcodebug status` for
+   manual setup in that session. The band is empty when there is no active
+   capture or operation to show.
+4. After updating the plugin, server, or Mod, restart Claude Code. Reloading
+   the plugin files does not restart an existing MCP server. `claude -p`
+   sessions do not draw the band.
+
+For manual setup, `claude plugin disable xcodebug-live@skills-dir` disables
+only the band after reopening Claude Code. Disabling the Marketplace plugin
+also disables its bundled skill and MCP server.
+
+## Codex
+
+### Codex Marketplace installation
+
+```bash
+codex plugin marketplace add sublimter/xcodebug
+codex plugin add xcodebug@sublimter-xcodebug
+```
+
+Open a new project session, select `xcodebug:xcodebug` in the `$` picker, and
+ask for `doctor`. Confirm `source:` points to the installed plugin. The plugin
+registers `xcodebug_marketplace` with a 4200-second tool timeout. The skill
+passes the project directory as `cwd`. For direct project-scoped calls, pass
+the absolute path of an existing project directory. `restart` reuses the last
+launch directory. If a symlink and `..` make the path ambiguous, pass the
+resolved directory.
+
+Do not run `xcodebug-setup-codex` for a Marketplace installation. The live
+footer is optional; see [Codex live display](#codex-live-display-experimental).
+For a local checkout, use its absolute path instead of `sublimter/xcodebug` in
+`plugin marketplace add`. The Marketplace flow was verified on Codex CLI 0.172.0.
+
+### Codex manual MCP fallback
+
+```bash
+npm i -g xcodebug@latest
+xcodebug-setup-codex
+# For a checkout, skip npm and run node bin/xcodebug-setup-codex.mjs from its root.
+```
+
+Setup registers `xcodebug` with Bun if absent and adds a 4200-second tool
+timeout only if none is set. It preserves custom server commands and warns about
+project overrides. On CLI 0.171.0 or later, it enables the statusline feature
+and selects `xcodebug / xcodebug_ui` only when the user-level selection is
+missing or `default`. It checks the running app-server version but does not
+update or restart it. If Codex rejects a stale configuration write, rerun setup
+after the other edit has finished.
+
+Check `codex mcp get xcodebug`. To select the skill through `$`,
+[link the shared skill](#install-the-manual-entry-point) before opening a new
+session. Increase the MCP timeout if you need larger pod-install, build, or
+command budgets. This does not change the stage deadlines or the separate
+status-line deadlines.
+
+### Codex migration
+
+1. In a new session, run `doctor` through `xcodebug:xcodebug` and confirm
+   `source:` points to the plugin. Inspect the old registration with
+   `codex mcp get xcodebug`.
+2. If `tui.status_line_provider` is `{ server = "xcodebug", tool = "xcodebug_ui" }`,
+   save it and change only `server` to `xcodebug_marketplace`. This also applies
+   to earlier Marketplace installs that used the old server name. Leave other
+   providers and the default footer unchanged.
+3. Save a confirmed old registration from the user `config.toml` under
+   `${CODEX_HOME:-$HOME/.codex}`, then run `codex mcp remove xcodebug`. Review
+   project `.codex/config.toml` entries with the project owner before editing them.
+4. If no other client or project uses your manual `~/.agents/skills/xcodebug`
+   symlink, move it out of the skills directory. Reopen Codex and verify `doctor`.
+
+**Rollback:** Run `codex plugin remove xcodebug@sublimter-xcodebug`. Restore the
+saved registration and footer selection in their original files, and restore
+any moved skill link. Open a new session.
+
+### Codex live display (experimental)
+
+Marketplace installation makes the MCP tool available, but does not select a
+status-line provider. The optional footer requires Codex CLI and app server
+0.171.0 or later. Enable `features.tui_extensions_statusline` in your Codex
+configuration, or pass `--enable tui_extensions_statusline` for one session.
+`xcodebug-setup-codex` enables the feature only on the manual setup path.
+
+If your running app server is too old, finish active tasks and captures before
+running `codex app-server daemon update --from-cli --yes`, then
+`codex app-server daemon restart`. Opening a new TUI does not update the server.
+
+Start a new Codex session after setup or after updating the service or MCP
+server. To change providers, open `/statusline`, enter **Choose a status line
+provider**, then select `xcodebug_marketplace / xcodebug_ui` for Marketplace or
+`xcodebug / xcodebug_ui` for a manual installation. A project-level override of
+the same MCP server name can make the provider unavailable.
+
+Codex 0.171.0 has a five-second provider discovery deadline. If the global MCP
+inventory stalls, the picker can show only the default provider even though
+xcodebug itself is available. Specify the provider directly for one session:
+
+```bash
+# Marketplace (for manual installs, use server="xcodebug" instead)
+codex --enable tui_extensions_statusline -c 'tui.status_line_provider={server="xcodebug_marketplace",tool="xcodebug_ui"}'
+```
+
+For a persistent selection, merge these keys into your existing `config.toml`
+tables. For manual MCP, use `server = "xcodebug"` instead. The manual setup
+script preserves a custom provider; leave it unchanged unless you intend to
+replace it. `tui.status_line` controls idle fields, not the provider selection.
+
+```toml
+[features]
+tui_extensions_statusline = true
+
+[tui]
+status_line_provider = { server = "xcodebug_marketplace", tool = "xcodebug_ui" }
+```
+
+See Codex's
+[provider configuration](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/app/status_line_settings.rs)
+and [discovery deadline](https://github.com/openai/codex/blob/rust-v0.171.0/codex-rs/tui/src/statusline_provider.rs).
+
+The footer shows xcodebug's operation or one running capture's line count and
+latest log line, including between tool calls. The count is per capture, not a
+total across channels. A new `launch` or `syslog` that replaces a capture for
+the same app starts a new count.
+
+If elapsed time and `quiet Ns` advance while the count and latest line stay
+unchanged, the footer is refreshing but that capture has no new lines to show.
+This does not distinguish app silence from a stalled bridge. In the **same
+Codex session**, use `action=status` to identify the running capture and
+`action=logs captureId=<id>` to inspect what it received. A new session does
+not inherit the live capture.
+
+When no operation or capture remains, the footer restores the configured
+`model-with-reasoning`, `current-dir`, `context-remaining`, and `fast-mode`
+content from Codex's current statusline snapshot, in order. Unavailable
+context usage or tier information is omitted rather than guessed.
+The provider stays selected; xcodebug does not rewrite global settings at each
+start or stop. Codex does not delegate to its native default renderer, so other
+built-in items and styling are not mirrored. Clients that do not supply a
+statusline snapshot receive empty idle content. The footer does not stream
+logs into the model; use `action=logs` or `action=wait` for log evidence.
+Long status text is shortened in the footer without changing the command or
+its output.
+

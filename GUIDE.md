@@ -1,48 +1,18 @@
 # xcodebug — practical guide
 
-Task-oriented walkthrough. [README.md](README.md) is the authoritative reference
-for every parameter, the change-detection rules and the capture internals; this
-file only shows the flows you will actually type.
+## Overview
 
-The `/xcodebug` examples use the native pi/omp command or the manually installed
-Claude Code skill. With the [Marketplace plugin](README.md#install-from-marketplace),
-use `/xcodebug:xcodebug` in Claude Code or select the plugin's xcodebug skill
-with `$` in Codex. For a manual MCP connection, install the
-[shared skill](README.md#install-the-manual-entry-point) separately.
-A bare invocation builds as needed, installs, launches and starts capturing.
-Add `status` to inspect the current captures without launching.
+Install xcodebug for [pi/omp](README.md#piomp-extension),
+[Claude Code](README.md#claude-code), or [Codex](README.md#codex). Then open a
+new session in the Xcode project and run `doctor` using the entry point for
+your client. [README.md](README.md) also has the configuration and action reference.
 
-Switching from a manual setup? Follow [the migration steps](README.md#migrate-an-existing-manual-installation)
-to verify the plugin before retiring the old registration.
+Examples below use pi/omp's `/xcodebug` syntax. For Claude Code and Codex, use
+the same action and arguments with the skill listed in the client sections
+at the end of this guide. A bare invocation launches the app. Use `status`
+if you only want to inspect an existing capture.
 
-For a manual installation only, run `xcodebug-setup-codex` once. It registers
-the server when missing, adds the 4200-second timeout only when no custom
-timeout exists, enables the statusline feature on Codex CLI 0.171.0+, and selects
-the xcodebug provider when the user selection is missing or `default`. Other
-custom providers are preserved with a warning.
-It also checks the running app-server version; both CLI and service must support
-the feature. An old or unverifiable service gets a warning, not an automatic
-upgrade or restart that could interrupt active tasks and captures.
-From a checkout, use `node bin/xcodebug-setup-codex.mjs`. Open a new Codex session
-after setup. If another custom provider was preserved, select `xcodebug_ui`
-(`xcodebug / xcodebug_ui`) through `/statusline` → **Choose a status line provider**
-or set `tui.status_line_provider` explicitly. If another process changes the
-configuration while setup runs, the stale write is rejected; rerun setup.
-See [README.md § Codex live display](README.md#codex-live-display-experimental)
-for the configuration and global inventory discovery timeout details.
-
-Native pi/omp `/xcodebug` dispatches directly to the loaded extension handler,
-without skill/model selection for that dispatch. The package excludes its
-bundled skill from native package discovery; Claude/Codex share `mcp/skills/xcodebug/SKILL.md`.
-If a native host also discovers that user-level shared skill, it routes to the native tool
-when available. Reading a skill alone never executes an action; model-selected
-requests still require a tool call, while the native command runs its handler.
-
-Debug a real iOS device: build, install, launch, and read the app's console
-(stdout/stderr + os_log) inside the agent session. No jailbreak, no LLDB attach,
-no paid account.
-
-## The one-liner
+### The one-liner
 
 ```text
 /xcodebug verify adding a weather city
@@ -52,9 +22,9 @@ From the current directory it finds the workspace, rebuilds if the tree changed,
 installs, launches, and starts capturing. The trailing phrase is the goal the
 model must answer — not a log filter.
 
-## Two surfaces
+### Commands and tool calls
 
-**User entry point** (native command in pi/omp; installed skill in Claude Code/Codex)
+**Native command examples**
 
 ```text
 /xcodebug
@@ -91,46 +61,15 @@ with nonobvious behavior:
 - `restart` replays the last launch of this session, rebuilding and rerunning
   any saved `command=` from that launch's working directory.
 
-## How logs reach the conversation
+### How logs reach the conversation
 
-In pi/omp, `push` decides whether new lines are mirrored into the session: `context`
-(default, queued for the next turn), `off` (pull with `logs`/`wait`), `wake`
-(starts a turn). A device console is a firehose; each push carries at most 80
-lines and reports how many older lines it dropped. Narrow it with `match`, e.g.
-`action=launch match=MySDK push=wake`.
+In Claude Code and Codex, use `logs` to read new lines or `wait` to look for
+an expected line. MCP only accepts `push=off`. Neither client's live display
+sends logs to the model.
 
-Claude Code and Codex use pull reads through MCP: `logs` for an incremental read,
-or `wait` for an expected line. `push=context` and `push=wake` are refused there;
-installing the skill does not add background log delivery.
+### Running a command alongside a capture
 
-Claude Code's Marketplace plugin includes the live display Mod. For a manual
-installation, add the separate `xcodebug-live` Mod with
-[the one-time installation recipe](README.md#install-once-for-ordinary-claude-sessions).
-Keep the MCP server and Mod on the same release. In a new session, check
-`/plugin` for the enabled plugin and `/mcp` for the connected server.
-
-The band shows build/install/launch phases, including the rebuild within
-`restart`, even when a capture is already running. Capture continues in the
-background; after the operation finishes, fails, or is cancelled, the band
-returns to the running capture's line count and latest four console lines.
-It refreshes once a second, between turns too, while an operation or capture is
-running, then clears and stops reading; an idle session makes no reads. It does
-not send those lines to the model; use `logs`/`wait`
-for analysis.
-See [Claude Code live display](README.md#claude-code-live-display) for version
-requirements, upgrade/disable steps and missing-display troubleshooting.
-
-For the optional footer, follow the
-[Codex live display setup](README.md#codex-live-display-experimental). When
-`quiet` advances but the count and latest line stay unchanged, the footer is
-still refreshing. Use `$xcodebug status` and `$xcodebug logs captureId=<id>` in
-the same Codex session to check the capture. A new session does not inherit it.
-When idle, the footer mirrors the supported fields from Codex's current
-snapshot without switching providers.
-
-## Running a command alongside a capture
-
-### What it is for
+#### What it is for
 
 `command=` is a general primitive: any shell line, run to completion after the app
 is up, with the capture recording the whole time. When it exits you get the exit
@@ -159,7 +98,7 @@ So a verification run is **goal** (what to prove) + **command** (how to provoke
 it) + **capture** (what the app did). The exit code says the UI reached the
 expected state; the log says what the app did to get there.
 
-### The shape of it
+#### The shape of it
 
 Scenario: bring the app up under capture, run an automated case, then read the
 app side of that run. xcodebug knows nothing about any test framework — you put
@@ -178,8 +117,8 @@ the command in `command`.
 
 What happens after `command`:
 
-1. `/bin/sh -lc` runs the whole line from the invocation directory (`ctx.cwd`
-   → `pi.cwd` → process cwd).
+1. `/bin/sh -lc` runs the whole line from the invocation directory. `restart`
+   uses the last launch directory.
 2. It waits for the process to exit.
 3. It stops **the capture it targeted** and cancels its queued reconnect — other
    apps' captures keep streaming.
@@ -204,7 +143,7 @@ Let the repo pick its own config through an npm script
 Running `myrunner test <file>` against the wrong config exits 1 with
 `No tests found`, which is indistinguishable from a failing case.
 
-### Why this does not disturb other debugging
+#### Why this does not disturb other debugging
 
 `await` is not a mode, just an explicit call. Nothing changes for runs that do
 not pass `command=` or `action=await`.
@@ -221,7 +160,7 @@ not pass `command=` or `action=await`.
   error.
 - With no capture running it still runs the case and reports the exit code.
 
-### Prerequisite: the test must not relaunch the app
+#### Prerequisite: the test must not relaunch the app
 
 Many UI-test fixtures terminate and relaunch the app before every test unless
 `autoAppLaunch: false` is set. That kills the very launch xcodebug is capturing,
@@ -240,7 +179,7 @@ A cold launch can also restore a child page instead of the tab bar. If a case
 starts by tapping a tab, it has to handle that state itself — xcodebug launches
 the app and nothing more.
 
-## Everyday commands
+### Everyday commands
 
 ```text
 # environment
@@ -271,7 +210,7 @@ xcodebug action=terminate
 xcodebug action=await command="cd /repo && npm run test:weather"
 ```
 
-## Where files land
+### Where files land
 
 Every capture is mirrored to
 `<agentDir>/logs/xcodebug/<mode>-<bundleId>-<timestamp>-<random suffix>.log`.
@@ -300,7 +239,7 @@ and bounds startup/result cleanup as well as log drainage. Incomplete cleanup
 is reported. Ownership-checked stale-result reclamation and its conservative
 exceptions are documented under [disk files](README.md#files).
 
-## Three rules of use
+### Three rules of use
 
 1. **Stop a completed goal's capture with `captureId`.** Do not stop unrelated
    execution or other captures; do not leave the completed capture streaming.
@@ -311,3 +250,26 @@ exceptions are documented under [disk files](README.md#files).
    report is, if the device wrote one. A standalone `syslog` capture is not
    bound to the app's lifetime and keeps reconnecting; stop it explicitly when
    finished.
+
+## pi/omp extension
+
+Run `/xcodebug doctor` or `/xcodebug launch scheme=MyApp` in the project session.
+The native command calls the extension directly. To send new logs to the model
+in the next turn, use `push=context` (the default). Use `push=wake` to start a
+turn or `push=off` to read logs explicitly. See [native push modes](README.md#pushing-logs-into-the-conversation).
+
+## Claude Code
+
+With Marketplace, run `/xcodebug:xcodebug doctor` and then
+`/xcodebug:xcodebug launch scheme=MyApp`. The manual skill uses `/xcodebug`
+instead. The [live band](README.md#claude-code-live-display) shows the current
+operation or recent capture lines. An empty band during idle is normal.
+
+## Codex
+
+Select `xcodebug:xcodebug` in the `$` picker (or `xcodebug` for the manual
+skill), then ask for `doctor` or `launch scheme=MyApp`. The
+[live footer](README.md#codex-live-display-experimental) is optional. If
+`quiet` advances while the line count stays unchanged, the footer is still
+refreshing. Run `status` and `logs captureId=<id>` through the same skill in
+the same session to inspect the capture.
