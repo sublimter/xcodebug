@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { appendFile, chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import test from "node:test";
@@ -9,8 +9,8 @@ import { join } from "node:path";
 const exec = promisify(execFile);
 const setup = new URL("../bin/xcodebug-setup-codex.mjs", import.meta.url).pathname;
 
-async function runSetup(root, cwd = root, env = {}) {
-  return exec(process.execPath, [setup], {
+async function runSetup(root, cwd = root, env = {}, args = []) {
+  return exec(process.execPath, [setup, ...args], {
     cwd,
     env: { ...process.env, CODEX_HOME: join(root, "home"), ...env },
     maxBuffer: 100_000,
@@ -193,4 +193,141 @@ test("setup preserves statusline choices when the CLI version command fails", as
   const saved = await readConfig(root);
   assert.equal(saved.features.tui_extensions_statusline, false);
   assert.equal(saved.tui.status_line_provider, "default");
+});
+
+test("Marketplace migration switches only the old xcodebug statusline provider", async t => {
+  const root = await fixture(t);
+  const env = { ...process.env, HOME: join(root, "home"), CODEX_HOME: join(root, "home") };
+  const runCodex = (...args) => exec("codex", args, { cwd: root, env });
+  const config = join(root, "home", "config.toml");
+  const original = `[features]
+tui_extensions_statusline = true
+
+[mcp_servers.xcodebug]
+command = "bun"
+args = ["custom.ts"]
+tool_timeout_sec = 9000
+
+[mcp_servers.xcodebug.env]
+CUSTOM_SETTING = "keep"
+`;
+  const oldFooter = '\n[tui]\nstatus_line_provider = { server = "xcodebug", tool = "xcodebug_ui" }\n';
+  await writeFile(config, original + oldFooter);
+  let migrationScript = setup;
+  const migrate = () => exec(process.execPath, [migrationScript, "--migrate-marketplace"], { cwd: root, env });
+  await assert.rejects(migrate(), /Install and enable/);
+  assert.equal(await readFile(config, "utf8"), original + oldFooter);
+  await writeFile(config, original);
+
+  await runCodex("plugin", "marketplace", "add", new URL("..", import.meta.url).pathname);
+  const { stdout } = await runCodex("plugin", "add", "xcodebug@sublimter-xcodebug", "--json");
+  const installed = await readFile(config, "utf8");
+  migrationScript = join(JSON.parse(stdout).installedPath, "bin", "xcodebug-setup-codex.mjs");
+  await appendFile(config, oldFooter);
+  const before = await readConfig(root);
+  await migrate();
+  assert.deepEqual(await readConfig(root), {
+    ...before,
+    tui: { ...before.tui, status_line_provider: { server: "xcodebug_marketplace", tool: "xcodebug_ui" } },
+  });
+  const saved = await readFile(config, "utf8");
+  await migrate();
+  assert.equal(await readFile(config, "utf8"), saved);
+
+  for (const selection of ['"default"', '{ server = "work", tool = "footer" }']) {
+    const custom = `${installed}\n[tui]\nstatus_line_provider = ${selection}\n`;
+    await writeFile(config, custom);
+    await migrate();
+    assert.equal(await readFile(config, "utf8"), custom);
+  }
+
+  const overridden = `${installed}${oldFooter}\n[mcp_servers.xcodebug_marketplace]\ncommand = "bun"\nargs = ["other.ts"]\n`;
+  await writeFile(config, overridden);
+  await assert.rejects(migrate(), /overridden in Codex config/);
+  assert.equal(await readFile(config, "utf8"), overridden);
+
+  await exec("git", ["init", "--quiet", root]);
+  await mkdir(join(root, ".codex"));
+  const trusted = `${installed}${oldFooter}\n[projects.${JSON.stringify(await realpath(root))}]\ntrust_level = "trusted"\n`;
+  await writeFile(config, trusted);
+  const projectConfig = join(root, ".codex", "config.toml");
+  const projectProvider = '[tui]\nstatus_line_provider = { server = "work", tool = "footer" }\n';
+  await writeFile(projectConfig, projectProvider);
+  await assert.rejects(migrate(), /project or profile/);
+  assert.equal(await readFile(config, "utf8"), trusted);
+  assert.equal(await readFile(projectConfig, "utf8"), projectProvider);
+
+  const projectOverride = '[mcp_servers.xcodebug_marketplace]\ncommand = "bun"\nargs = ["project.ts"]\n';
+  await writeFile(projectConfig, projectOverride);
+  await assert.rejects(migrate(), /overridden in Codex config/);
+  assert.equal(await readFile(config, "utf8"), trusted);
+  assert.equal(await readFile(projectConfig, "utf8"), projectOverride);
+});
+
+test("Marketplace migration rejects a project-only plugin enable", async t => {
+  const root = await fixture(t);
+  const project = join(root, "project");
+  await mkdir(project);
+  await exec("git", ["init", "--quiet", project]);
+  const env = { ...process.env, HOME: join(root, "home"), CODEX_HOME: join(root, "home") };
+  const options = { cwd: project, env };
+  const config = join(root, "home", "config.toml");
+  await writeFile(config, '[tui]\nstatus_line_provider = { server = "xcodebug", tool = "xcodebug_ui" }\n');
+  await exec("codex", ["plugin", "marketplace", "add", new URL("..", import.meta.url).pathname], options);
+  const { stdout } = await exec("codex", ["plugin", "add", "xcodebug@sublimter-xcodebug", "--json"], options);
+  const migrationScript = join(JSON.parse(stdout).installedPath, "bin", "xcodebug-setup-codex.mjs");
+  const disabled = (await readFile(config, "utf8")).replace("enabled = true", "enabled = false") +
+    `\n[projects.${JSON.stringify(await realpath(project))}]\ntrust_level = "trusted"\n`;
+  await writeFile(config, disabled);
+  assert.equal((await readConfig(root)).plugins["xcodebug@sublimter-xcodebug"].enabled, false);
+  await mkdir(join(project, ".codex"));
+  const projectConfig = join(project, ".codex", "config.toml");
+  const enabled = '[plugins."xcodebug@sublimter-xcodebug"]\nenabled = true\n';
+  await writeFile(projectConfig, enabled);
+  const info = await exec("codex", ["mcp", "get", "xcodebug_marketplace", "--json"], options);
+  assert.equal(JSON.parse(info.stdout).enabled, true);
+  await assert.rejects(exec(process.execPath, [migrationScript, "--migrate-marketplace"], options), /user level/);
+  assert.equal(await readFile(config, "utf8"), disabled);
+  assert.equal(await readFile(projectConfig, "utf8"), enabled);
+});
+
+test("Marketplace migration rejects an uninstall after preflight", async t => {
+  const root = await fixture(t);
+  const env = { ...process.env, HOME: join(root, "home"), CODEX_HOME: join(root, "home") };
+  const options = { cwd: root, env };
+  const config = join(root, "home", "config.toml");
+  await writeFile(config, '[tui]\nstatus_line_provider = { server = "xcodebug", tool = "xcodebug_ui" }\n');
+  await exec("codex", ["plugin", "marketplace", "add", new URL("..", import.meta.url).pathname], options);
+  const { stdout } = await exec("codex", ["plugin", "add", "xcodebug@sublimter-xcodebug", "--json"], options);
+  const migrationScript = join(JSON.parse(stdout).installedPath, "bin", "xcodebug-setup-codex.mjs");
+  const shim = join(root, "codex-race.mjs");
+  const marker = join(root, "uninstalled");
+  await writeFile(shim, `#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args.join(" ") === "mcp get xcodebug_marketplace --json") {
+  const result = spawnSync("codex", args, { encoding: "utf8" });
+  if (result.status === 0) {
+    const removed = spawnSync("codex", ["plugin", "remove", "xcodebug@sublimter-xcodebug"], { encoding: "utf8" });
+    if (removed.status !== 0) throw new Error(removed.stderr || removed.stdout);
+    writeFileSync(${JSON.stringify(marker)}, "done");
+  }
+  process.stdout.write(result.stdout);
+  process.stderr.write(result.stderr);
+  process.exitCode = result.status ?? 1;
+} else {
+  const result = spawnSync("codex", args, { stdio: "inherit" });
+  if (result.error) throw result.error;
+  process.exitCode = result.status ?? 1;
+}
+`);
+  await chmod(shim, 0o755);
+  await assert.rejects(exec(process.execPath, [migrationScript, "--migrate-marketplace"], {
+    ...options, env: { ...env, CODEX_BIN: shim },
+  }), /version/i);
+  assert.equal(await readFile(marker, "utf8"), "done");
+  const saved = await readConfig(root);
+  assert.deepEqual(saved.tui.status_line_provider, { server: "xcodebug", tool: "xcodebug_ui" });
+  assert.equal(saved.plugins?.["xcodebug@sublimter-xcodebug"], undefined);
 });

@@ -9,6 +9,9 @@ import { spawn, spawnSync } from "node:child_process";
 const TOOL_TIMEOUT_SECONDS = 4_200;
 const STATUSLINE_MIN_CODEX_VERSION = [0, 171, 0];
 const STATUSLINE_FEATURE = "features.tui_extensions_statusline";
+const MARKETPLACE = "sublimter-xcodebug";
+const MARKETPLACE_SERVER = "xcodebug_marketplace";
+const PROVIDER_KEY = "tui.status_line_provider";
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const serverPath = join(packageRoot, "mcp", "server.ts");
 const codex = process.env.CODEX_BIN ?? "codex";
@@ -127,7 +130,26 @@ function checkAppServerVersion() {
   }
 }
 
-async function writeConfig(values) {
+function requireMarketplaceServer(globalConfig) {
+  if (globalConfig?.plugins?.[`xcodebug@${MARKETPLACE}`]?.enabled !== true) {
+    throw new Error("Install and enable xcodebug@sublimter-xcodebug at the user level in Codex first.");
+  }
+  const plugins = run(codex, ["plugin", "list", "--marketplace", MARKETPLACE, "--json"]);
+  const installed = plugins.status === 0 && JSON.parse(plugins.stdout).installed;
+  if (!installed || !installed.some(plugin => plugin.pluginId === `xcodebug@${MARKETPLACE}` && plugin.enabled === true)) {
+    throw new Error("Install and enable xcodebug@sublimter-xcodebug in Codex first.");
+  }
+  const server = run(codex, ["mcp", "get", MARKETPLACE_SERVER, "--json"]);
+  if (server.status !== 0 || JSON.parse(server.stdout).enabled !== true) {
+    throw new Error(`Enable the bundled ${MARKETPLACE_SERVER} MCP server first.`);
+  }
+}
+
+function isManualProvider(provider) {
+  return provider?.server === "xcodebug" && provider.tool === "xcodebug_ui";
+}
+
+async function writeConfig(values, migrateMarketplace = false) {
   const app = startAppServer();
   try {
     await app.request("initialize", { clientInfo: { name: "xcodebug-setup-codex", version: "1" } });
@@ -139,7 +161,7 @@ async function writeConfig(values) {
     let providerSelected = false;
     let filePath;
     let expectedVersion;
-    if (values[STATUSLINE_FEATURE] === true) {
+    if (migrateMarketplace || values[STATUSLINE_FEATURE] === true) {
       const response = await app.request("config/read", { includeLayers: true });
       const userLayer = Array.isArray(response?.layers)
         ? response.layers.find(layer => layer.name?.type === "user" && layer.name.profile === null && !layer.disabledReason)
@@ -151,8 +173,38 @@ async function writeConfig(values) {
       filePath = userLayer.name.file;
       expectedVersion = userLayer.version;
       const provider = userLayer.config.tui?.status_line_provider;
-      if (provider === undefined || provider === null || provider === "default") {
-        edits.push({ keyPath: "tui.status_line_provider", value: { server: "xcodebug", tool: "xcodebug_ui" }, mergeStrategy: "upsert" });
+      if (migrateMarketplace) {
+        // Capture the user version before preflight so plugin changes invalidate the write.
+        requireMarketplaceServer(response.config);
+        const scoped = await app.request("config/read", { includeLayers: true, cwd: process.cwd() });
+        const userIndex = Array.isArray(scoped?.layers)
+          ? scoped.layers.findIndex(layer => layer.name?.type === "user" && layer.name.profile === null &&
+              layer.name.file === filePath && !layer.disabledReason)
+          : -1;
+        if (userIndex < 0) {
+          throw new Error("Codex did not return project configuration metadata; no user settings changed.");
+        }
+        // The merged config can omit project fields; inspect the raw layers too.
+        if (Object.hasOwn(response.config?.mcp_servers ?? {}, MARKETPLACE_SERVER) ||
+            scoped.layers.some(layer => !layer.disabledReason &&
+              Object.hasOwn(layer.config?.mcp_servers ?? {}, MARKETPLACE_SERVER))) {
+          throw new Error(`${MARKETPLACE_SERVER} is overridden in Codex config; resolve the override before migrating.`);
+        }
+        if (!isManualProvider(provider)) {
+          console.log("No matching user-level xcodebug statusline selection changed.");
+          return;
+        }
+        if (scoped.layers.some((layer, index) => index < userIndex && !layer.disabledReason &&
+            Object.hasOwn(layer.config?.tui ?? {}, "status_line_provider"))) {
+          throw new Error("A project or profile defines a statusline provider; review that setting before migrating the user selection.");
+        }
+        if (!isManualProvider(response.config?.tui?.status_line_provider)) {
+          console.log("Effective provider selection differs; no user settings changed.");
+          return;
+        }
+        edits.push({ keyPath: PROVIDER_KEY, value: { ...provider, server: MARKETPLACE_SERVER }, mergeStrategy: "replace" });
+      } else if (provider === undefined || provider === null || provider === "default") {
+        edits.push({ keyPath: PROVIDER_KEY, value: { server: "xcodebug", tool: "xcodebug_ui" }, mergeStrategy: "upsert" });
         providerSelected = true;
       } else if (provider.server !== "xcodebug" || provider.tool !== "xcodebug_ui") {
         console.error("Warning: existing custom Codex statusline provider preserved; choose xcodebug_ui under /statusline or set tui.status_line_provider explicitly.");
@@ -162,6 +214,7 @@ async function writeConfig(values) {
     const result = await app.request("config/batchWrite", { edits, filePath, expectedVersion });
     if (result?.status !== "ok") throw new Error(`Codex rejected the config write: ${JSON.stringify(result)}`);
     if (providerSelected) console.log("Configured Codex statusline provider: xcodebug / xcodebug_ui");
+    if (migrateMarketplace) console.log(`Migrated Codex statusline provider to ${MARKETPLACE_SERVER} / xcodebug_ui.`);
   } finally {
     await app.close();
   }
@@ -220,9 +273,16 @@ function startAppServer() {
 
 }
 try {
-  const registration = ensureServerRegistration();
-  reportWarnings(registration);
-  await configureCodex(registration);
+  const args = process.argv.slice(2);
+  if (args.length === 1 && args[0] === "--migrate-marketplace") {
+    await writeConfig({}, true);
+  } else if (args.length === 0) {
+    const registration = ensureServerRegistration();
+    reportWarnings(registration);
+    await configureCodex(registration);
+  } else {
+    throw new Error("Usage: xcodebug-setup-codex [--migrate-marketplace]");
+  }
 } catch (error) {
   console.error(`xcodebug setup-codex failed: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;

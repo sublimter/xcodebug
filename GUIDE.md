@@ -3,14 +3,15 @@
 ## Overview
 
 Install xcodebug for [pi/omp](README.md#piomp-extension),
-[Claude Code](README.md#claude-code), or [Codex](README.md#codex). Then open a
-new session in the Xcode project and run `doctor` using the entry point for
-your client. [README.md](README.md) also has the configuration and action reference.
+[Claude Code](README.md#claude-code), or [Codex](README.md#codex). Open a new
+session in your Xcode project and run `doctor` using that client's entry point.
+The [installation guide](README.md) covers setup and migration; the
+[reference](REFERENCE.md) has settings and action details.
 
-Examples below use pi/omp's `/xcodebug` syntax. For Claude Code and Codex, use
-the same action and arguments with the skill listed in the client sections
-at the end of this guide. A bare invocation launches the app. Use `status`
-if you only want to inspect an existing capture.
+Examples below use pi/omp's `/xcodebug` syntax. Use the same action and arguments
+with the entry point for [pi/omp](#piomp-extension), [Claude Code](#claude-code),
+or [Codex](#codex). A bare invocation launches the app. Use `status` to inspect
+an existing capture without launching.
 
 ### The one-liner
 
@@ -45,7 +46,7 @@ xcodebug action=launch scheme=MyApp
 xcodebug action=logs limit=200
 ```
 
-Actions and examples are in [README.md § Usage](README.md#usage). Two actions
+Actions and examples are in [REFERENCE.md](REFERENCE.md#usage). Two actions
 with nonobvious behavior:
 
 - `stop` without `captureId` cancels running/queued xcodebug actions and closes
@@ -54,8 +55,8 @@ with nonobvious behavior:
   unrelated execution alone. `keepApp=true` is the default and leaves the app running.
   Cancelling pod install does not roll back generated files; rerun it before building.
   Stop waits up to five seconds for native cleanup; shutdown keeps its three-second
-  deadline. `cleanupPending=true` is an error: resources remain unfinished, pending
-  native cleanup retains its stopping display, and later work waits for settlement.
+  deadline. `cleanupPending=true` is an error: cleanup is not finished. The native
+  stopping display remains until resources close, and later work waits for them.
   An appended command is skipped when cleanup is incomplete.
   Do not restart cancelled work unless the user requests it.
 - `restart` replays the last launch of this session, rebuilding and rerunning
@@ -71,38 +72,22 @@ sends logs to the model.
 
 #### What it is for
 
-`command=` is a general primitive: any shell line, run to completion after the app
-is up, with the capture recording the whole time. When it exits you get the exit
-code plus the app-side log for exactly that window. xcodebug never parses the
-line and assumes no framework.
+`command=` runs a shell line after the app is up. xcodebug reports its exit
+status. If a capture is active, it also returns the log path and a query starting
+at the command's cursor. Logs may be omitted as the capture fills or rotates.
 
-That makes it how you *provoke* something and watch the app react — an automated
-case tapping through a flow, a backend push, a fixture import, a CLI driving the
-phone, a codegen step the app reloads, a benchmark.
+The command can provoke something on the device and let you inspect the app's
+response. For example, it can run an automated case that taps through a flow,
+send a backend push, import a fixture, or start a benchmark.
 
-The most common use is replacing a human's taps: a capture alone only records
-what the app does while **a person** drives the phone — slow to reproduce and
-never quite identical twice. `command=` hands the driving to an automated case:
-the case performs the taps, the capture records the app's response, and the model
-reads that delta.
-
-```text
-without command=                      with command=
-  a person opens the weather page       the case taps the same path
-  the log holds whatever they did       the log holds exactly that path, every run
-  the agent waits, then reads           the agent reads as soon as the case exits
-  "it worked when I tried it"           exit code + app-side log for one run
-```
-
-So a verification run is **goal** (what to prove) + **command** (how to provoke
-it) + **capture** (what the app did). The exit code says the UI reached the
-expected state; the log says what the app did to get there.
+- `command=` lets an automated test drive the UI while xcodebug records console output.
+- The command's exit status is evidence about that command, not a test assertion.
+- The capture log shows app output during the run, subject to its retention limits.
 
 #### The shape of it
 
-Scenario: bring the app up under capture, run an automated case, then read the
-app side of that run. xcodebug knows nothing about any test framework — you put
-the command in `command`.
+Run the test command while the app is being captured. xcodebug does not interpret
+the command as a test framework or check whether its assertions passed.
 
 ```text
 # one line: build + install + launch -> run the case -> stop the capture -> hand back the log
@@ -125,8 +110,8 @@ What happens after `command`:
 4. When collecting exit diagnostics, it waits for the owned console-launch
    result and matching crash-report collection independently of the stopped
    capture; caller cancellation still interrupts that wait.
-5. It hands back the exit code, elapsed time, how many new lines arrived, the
-   log path, and the `logs` call (with the right `since`) for the app side.
+5. It reports the exit status, elapsed time, number of new log lines, the log
+   path, and a `logs` query starting at the command's cursor.
 
 **Quote the whole line.** `command="cd /repo && npm run test"`. Unquoted, the
 slash command splits on whitespace before it reads the value, so only `cd`
@@ -221,23 +206,10 @@ session directory), so each brand writes under its own prefix (`.pi` / `.omp` /
 `XCODEBUG_AGENT_DIR`. The bundle id separates apps, and the timestamp includes
 milliseconds to separate runs.
 
-Memory retains at most 20k lines and 4 MiB of text. Disk logging rotates through
-the base path plus `.1` and `.2`, retaining three segments targeting 50 MiB each;
-older segments are overwritten. Complete lines are kept, so a single oversized
-line can exceed a segment's target size. Shutdown allows two seconds to drain
-pending writes; a drain timeout can truncate logs. Neither memory nor disk is
-a lossless archive of the whole run. See [retention](README.md#reading-logs-from-a-cursor)
-and [disk files](README.md#files) for details and the `logFiles` path list.
-
-A filtered read (`logs grep=`, `wait`) looks in those files for the lines memory
-has dropped and says in its reply that it did. Logs are deleted 30 days after
-their last write.
-
-Console launch-result JSON is temporary metadata, not a log. Ordinary `stop`
-preserves pending exit diagnostics; session exit instead cancels result reads
-and bounds startup/result cleanup as well as log drainage. Incomplete cleanup
-is reported. Ownership-checked stale-result reclamation and its conservative
-exceptions are documented under [disk files](README.md#files).
+Memory holds up to 20,000 lines and 4 MiB. Disk logs rotate across three files
+of about 50 MiB each. Old data can be dropped, and a blocked shutdown can leave
+the last log incomplete. See [REFERENCE.md](REFERENCE.md#files) for retention
+details and the list of log paths.
 
 ### Three rules of use
 
@@ -256,20 +228,19 @@ exceptions are documented under [disk files](README.md#files).
 Run `/xcodebug doctor` or `/xcodebug launch scheme=MyApp` in the project session.
 The native command calls the extension directly. To send new logs to the model
 in the next turn, use `push=context` (the default). Use `push=wake` to start a
-turn or `push=off` to read logs explicitly. See [native push modes](README.md#pushing-logs-into-the-conversation).
+turn or `push=off` to read logs. See [native push modes](README.md#pushing-logs-into-the-conversation).
 
 ## Claude Code
 
-With Marketplace, run `/xcodebug:xcodebug doctor` and then
-`/xcodebug:xcodebug launch scheme=MyApp`. The manual skill uses `/xcodebug`
-instead. The [live band](README.md#claude-code-live-display) shows the current
-operation or recent capture lines. An empty band during idle is normal.
+With Marketplace, run `/xcodebug:xcodebug doctor`, then
+`/xcodebug:xcodebug launch scheme=MyApp`. The manual skill uses `/xcodebug`.
+The [live band](README.md#claude-code-live-display) shows work and recent lines;
+it is empty when the session has nothing to show.
 
 ## Codex
 
-Select `xcodebug:xcodebug` in the `$` picker (or `xcodebug` for the manual
-skill), then ask for `doctor` or `launch scheme=MyApp`. The
-[live footer](README.md#codex-live-display-experimental) is optional. If
-`quiet` advances while the line count stays unchanged, the footer is still
-refreshing. Run `status` and `logs captureId=<id>` through the same skill in
-the same session to inspect the capture.
+Select `xcodebug:xcodebug` in the `$` picker, or select the `xcodebug` skill for
+a manual install. Ask it to run `doctor` or `launch scheme=MyApp`. The
+[optional live footer](README.md#codex-live-display-experimental) shows work and
+capture state. If `quiet` advances without a new line, use `status` and
+`logs captureId=<id>` in the same session to inspect that capture.

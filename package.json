@@ -35,6 +35,7 @@
     "claude/",
     "README.md",
     "GUIDE.md",
+    "REFERENCE.md",
     "LICENSE"
   ],
   "engines": {
