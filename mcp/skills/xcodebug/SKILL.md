@@ -35,6 +35,7 @@ Both explicit invocation and a matching natural-language request can use this sk
 - With no arguments, call `{"action":"launch"}` once to build as needed, install,
   launch and start capturing with the selected tool's defaults. Keep the capture running;
   report a launch error without substituting a status query or another action.
+  Only the pre-execution argument correction below permits a second call.
 - For `status`, call `{"action":"status"}` to inspect captures without launching.
 - For an explicit action, call the selected tool with that action and the supplied
   parameters immediately. Do not replace execution with instructions for the user.
@@ -47,21 +48,38 @@ Both explicit invocation and a matching natural-language request can use this sk
   numeric `since`/`limit`/`timeoutSeconds`, booleans, JSON `args` arrays and
   `environment` objects. Keep a supplied `command` shell line intact.
 - Omit unspecified parameters so the selected tool can apply its project configuration.
+  Do not fill unrelated optional fields with `0`, `false`, empty strings, arrays or objects.
+  On MCP only, if the client requires a value for an unused optional field,
+  use `null` as advertised by its schema; the adapter treats it as omitted.
+  Native arguments remain non-nullable: omit unused fields there.
+  Numeric `context` is only for `action="logs"` with a non-empty `grep`;
+  omit it for `launch` and other actions, even when its value would be `0`.
   For Codex Marketplace, pass the session's absolute project working directory
   as MCP `cwd` for project actions unless the user supplied it. `restart` uses
   the last launch's directory and does not need `cwd`. Do not send `cwd` to the
   native tool.
-- Only on MCP, use pull reads: omit `push` or use `push="off"`; `context` and
-  `wake` are unsupported. Explain an unsupported explicit value instead of changing it silently.
-  Native tools retain their live schema's push modes.
-- For an explicit action, make exactly one selected-tool call, report its result,
-  and stop, including on error. Do not add diagnostic `status` calls or retry
-  with another action unless the user asks. `logs` never authorizes launching
-  an app, and `launch` does not imply an immediate `stop`.
+- Only on MCP, use pull reads: omit `push` or use `push="off"`.
+  `push="context"` and `push="wake"` are unsupported; this does not prohibit
+  the numeric `context` option on filtered `logs` calls. Explain an unsupported
+  explicit push value instead of changing it silently. Native tools retain their push modes.
+- For an explicit action, make one selected-tool call, report its result, and stop.
+  Do not add diagnostic `status` calls or retry a failed operation.
+  `logs` never authorizes launching an app, and `launch` does not imply an immediate `stop`.
+- Exception: if your call is rejected with an error beginning
+  `xcodebug <version>: invalid arguments (no action started):`, correct only
+  invalid arguments you introduced and retry the same tool and action once.
+  Do not change user-supplied values, switch backends, or query status to do so.
+  If the incompatible argument came from the user, explain it instead of guessing.
+  A second rejection, runtime failure, build/install/launch failure, or cancellation
+  ends the attempt; this exception never authorizes repeating an operation that started.
 - For a natural-language verification goal, use `launch` with known project/device
   parameters, then collect evidence for that goal. The goal describes what to
   verify; do not use the entire sentence as a literal log filter. If the app must
   keep running, use `syslog` with its known process name instead of `launch`.
+- If the client moves a long call to a background task, await that original task's
+  result in the same session. Report build/launch as pending, not capturing,
+  until the tool returns a capture ID. Do not issue a second launch while it is pending.
+  Background handoff does not change the backend's per-stage timeouts.
 
 ## Examples
 

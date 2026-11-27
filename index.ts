@@ -2311,7 +2311,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
         cleanupPending = asRecord(result.details)?.cleanupPending === true || asRecord(asRecord(result.details)?.primary)?.cleanupPending === true;
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        text = `xcodebug${parsed ? ` ${parsed.action}` : ""} failed: ${reason}`;
+        text = reason.startsWith(`xcodebug ${runtimeVersion.identity.version}: invalid arguments (no action started):`)
+          ? reason : `xcodebug${parsed ? ` ${parsed.action}` : ""} failed: ${reason}`;
         isError = true;
       }
       // The phrase the user typed is what the run is for; without it the model
@@ -2335,13 +2336,11 @@ export default function xcodebug(pi: ExtensionAPI): void {
             display: true,
             details: { action: parsed?.action, goal, isError, command: parsed?.command, ...(cleanupPending ? { cleanupPending: true } : {}) },
           },
-          // A finished command run always steers: its whole point is that the
-          // run is over and the log is ready to analyse, so waiting for the next
-          // user turn would strand the result. A bare launch stays `nextTurn` -
-          // the user still has to drive the phone and there is nothing to analyse.
-          isError || ranCommand
-            ? { deliverAs: "steer", triggerTurn: true }
-            : { deliverAs: "nextTurn" },
+          // A successful command run is the explicit analysis boundary. A bare
+          // launch stays queued while the user drives the phone. Failures remain
+          // visible and queued unless `push=wake` explicitly requests a turn.
+          isError ? (parsed?.push === "wake" ? { deliverAs: "steer", triggerTurn: true } : { deliverAs: "nextTurn", triggerTurn: false })
+            : (ranCommand || parsed?.push === "wake" ? { deliverAs: "steer", triggerTurn: true } : { deliverAs: "nextTurn" }),
         );
       } catch {
         // Session teardown; the toast already reported it.

@@ -124,6 +124,26 @@ done
       assert.match(result.content[0].text, invalid?.typo ? /unknown.*typo/i : /object/i);
     }
   });
+  await t.test("nullable MCP optionals leave defaults unset without erasing invalid explicit values", async () => {
+    const schema = tools.find(tool => tool.name === "xcodebug").inputSchema;
+    const optional = Object.fromEntries(Object.keys(schema.properties)
+      .filter(key => !schema.required.includes(key)).map(key => [key, null]));
+    const doctor = await action({ ...optional, action: "doctor" });
+    assert.ok(!doctor.isError, doctor.content[0].text);
+    assert.match(doctor.content[0].text, /Xcode fake/);
+    for (const args of [
+      { ...optional, action: "doctor", context: 0 },
+      { ...optional, action: "doctor", cwd: "" },
+      { ...optional, action: "doctor", typo: null },
+      { ...optional, action: null },
+    ]) {
+      const rejected = await action(args);
+      assert.equal(rejected.isError, true);
+      assert.match(rejected.content[0].text, /invalid arguments \(no action started\)/);
+    }
+    await assert.rejects(access(join(root, "build-started")), { code: "ENOENT" });
+    await assert.rejects(access(join(root, "install-started")), { code: "ENOENT" });
+  });
   await t.test("MCP rejects missing and non-directory cwd before discovering parent config", async () => {
     const config = join(root, ".xcodebug.json");
     await writeFile(config, "{}");
@@ -616,7 +636,7 @@ for (const operation of ["command", "build"]) {
     const pids = await Promise.all([fixturePid(root, operation), fixturePid(root, `${operation}-child`)]);
     const queued = action({ action: "await", command: `'${join(bin, "queued-command")}'` });
     await request("tools/call", { name: "xcodebug_ui", arguments: {} });
-    const stopped = await action({ action: "stop" });
+    const stopped = await action({ action: "stop", captureId: null, command: null, cwd: null });
     assert.ok(!stopped.isError, stopped.content[0].text);
     assert.match(stopped.content[0].text, /cancel/i);
     assert.doesNotMatch(stopped.content[0].text, /nothing to stop/i);
@@ -785,7 +805,7 @@ test("MCP keepApp=false sets console termination intent before aborting an activ
   const launching = action({ action: "launch", build: false, appPath: join(root, "Probe.app"),
     device: "test-device", bundleId: "test.probe", processName: "Probe", command: `'${join(bin, "long-command")}'` });
   const pids = await Promise.all(["console", "capture", "command", "command-child"].map(name => fixturePid(root, name)));
-  const result = await action({ action: "stop", keepApp: false });
+  const result = await action({ action: "stop", keepApp: false, captureId: null, command: null, cwd: null });
   assert.ok(!result.isError, result.content[0].text);
   assert.equal((await readFile(join(root, "console-signals"), "utf8")).split("\n")[0], "SIGTERM",
     "the adapter must not forward a default keepApp=true abort before backend stop applies keepApp=false");

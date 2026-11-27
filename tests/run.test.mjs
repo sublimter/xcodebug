@@ -185,7 +185,7 @@ exec /bin/sleep 120`);
   const hooks = new Map();
   const messages = [];
   xcodebug({ cwd: repo, registerTool(value) { tool = value; }, on(name, fn) { hooks.set(name, fn); },
-    registerCommand(_name, value) { command = value; }, sendMessage(message) { messages.push(message); } });
+    registerCommand(_name, value) { command = value; }, sendMessage(message, options) { messages.push({ ...message, options }); } });
   const notifications = [];
   const uiState = {};
   const context = { cwd: repo, agentDir: agent, hasUI: true, ui: {
@@ -221,6 +221,39 @@ exec /bin/sleep 120`);
     prebuilt: { device: "test-device", appPath: app, bundleId: "test.probe" },
   };
 }
+
+test("native command results retain failures without waking an unsolicited model turn", { timeout: 30_000 }, async t => {
+  const s = await session(t);
+
+  await s.native("stop keepApp=invalid");
+  let message = s.messages.at(-1);
+  assert.equal(message.details.isError, true);
+  assert.deepEqual(message.options, { deliverAs: "nextTurn", triggerTurn: false });
+
+  await s.native("stop keepApp=invalid push=wake");
+  message = s.messages.at(-1);
+  assert.equal(message.details.isError, true);
+  assert.deepEqual(message.options, { deliverAs: "nextTurn", triggerTurn: false });
+
+  await s.native(`launch device="${s.prebuilt.device}" appPath="${s.prebuilt.appPath}" bundleId="${s.prebuilt.bundleId}" command="exit 1" push=off`);
+  message = s.messages.at(-1);
+  assert.equal(message.details.isError, true);
+  assert.deepEqual(message.options, { deliverAs: "nextTurn", triggerTurn: false });
+
+  await s.native(`launch device="${s.prebuilt.device}" appPath="${s.prebuilt.appPath}" bundleId="${s.prebuilt.bundleId}" command="exit 0" push=off`);
+  message = s.messages.at(-1);
+  assert.equal(message.details.isError, false);
+  assert.deepEqual(message.options, { deliverAs: "steer", triggerTurn: true });
+
+  await s.native('await command="exit 1" push=wake');
+  message = s.messages.at(-1);
+  assert.equal(message.details.isError, true);
+  assert.deepEqual(message.options, { deliverAs: "steer", triggerTurn: true });
+
+  await s.native("status push=wake");
+  message = s.messages.at(-1);
+  assert.deepEqual(message.options, { deliverAs: "steer", triggerTurn: true });
+});
 
 test("restart uses the original directory for config, build and the replayed command", { timeout: 30_000 }, async t => {
   const s = await session(t);

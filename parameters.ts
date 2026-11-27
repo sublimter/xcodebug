@@ -7,7 +7,7 @@ const text = (description?: string) => Type.Optional(Type.String({ description }
 const flag = (description: string) => Type.Optional(Type.Boolean({ description }));
 const strings = (description: string) => Type.Optional(Type.Array(Type.String(), { description }));
 
-export const parameters = Type.Object({
+const parameterType = Type.Object({
   action: Type.Enum(actions),
   goal: text("What the caller wants to verify during this launch"),
   device: text("Device name, UDID, ECID or CoreDevice UUID. Defaults to the configured device or the only connected physical device."),
@@ -22,11 +22,11 @@ export const parameters = Type.Object({
   limit: Type.Optional(Type.Integer({ minimum: 1, description: "Maximum log lines (default 200) or history records" })),
   grep: text("logs: return lines containing this text"),
   match: text("wait: pattern to observe. Also filters native pushes or standalone syslog."),
-  context: Type.Optional(Type.Integer({ minimum: 0, maximum: 20, description: "logs with grep: include up to this many lines before and after each match" })),
+  context: Type.Optional(Type.Integer({ minimum: 0, maximum: 20, description: "Only action=logs with a non-empty grep: include neighboring lines around each match. Omit for other actions, including launch; 0 is not an unset value." })),
   absent: flag("wait: succeed only after the complete interval if no matching line was observed"),
   regex: flag("logs/wait: interpret grep or match as a regular expression"),
   times: flag("logs/wait: prefix each line with the local host time it arrived (HH:MM:SS.mmm)"),
-  timeoutSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "wait/build timeout in seconds. await defaults to 1800 seconds." })),
+  timeoutSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Per-stage timeout in seconds for scheme discovery, build/pod install, install action or wait. Discovery defaults to 120s; build/pod install 900s; install 180s; wait 30s; await 1800s. Not an overall launch deadline." })),
   command: text("Shell line to run to completion for await or after an action, e.g. cd /repo && npm test. A restart replays the last launch's command unless overridden."),
   push: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("context"), Type.Literal("wake")], {
     description: "Native: context queues lines for the next turn (default), wake starts a turn, off uses pull reads. MCP uses off.",
@@ -39,10 +39,15 @@ export const parameters = Type.Object({
   environment: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Extra app launch environment variables" })),
 }, { additionalProperties: false });
 
+// OMP's TypeBox facade uses IR internally; `json` is IR, not JSON Schema.
+export const parameters = (parameterType as typeof parameterType & {
+  toJsonSchema?: (options: { target: "draft-07" }) => typeof parameterType;
+}).toJsonSchema?.({ target: "draft-07" }) ?? parameterType;
+
 export type ToolParams = Static<typeof parameters>;
 
-function invalid(reason: string): never {
-  throw new Error(`xcodebug ${runtimeVersion.identity.version}: ${reason}`);
+export function invalid(reason: string): never {
+  throw new Error(`xcodebug ${runtimeVersion.identity.version}: invalid arguments (no action started): ${reason}`);
 }
 
 export function validateParameters(input: unknown): ToolParams {
@@ -54,7 +59,7 @@ export function validateParameters(input: unknown): ToolParams {
     invalid(`${error?.instancePath || "arguments"} ${error?.message ?? "failed validation"}`);
   }
   if (input.absent && input.action !== "wait") invalid("absent requires action=wait");
-  if (input.context !== undefined && (input.action !== "logs" || !input.grep)) invalid("context requires action=logs with grep");
+  if (input.context !== undefined && (input.action !== "logs" || !input.grep)) invalid("context requires action=logs with grep; omit context for other actions, even when it is 0");
   if (input.command !== undefined && input.action === "history") invalid("history is read-only and does not accept command");
   return input;
 }

@@ -54,8 +54,14 @@ remove. Keep the npm package if pi/omp or another client still uses it.
 | CocoaPods | optional; only projects with a `Podfile` |
 | Bun | only for the MCP clients (Claude Code, Codex); pi runs the extension itself |
 
-`xcodebug action=doctor` reports the Xcode toolchain, the capture tools, the
-active config and the log directory.
+`xcodebug action=doctor` reports the Xcode toolchain, capture tools, active
+configuration, log directory, loaded package version, source path and source digest.
+
+For live development, use a native local installation for pi/omp or manual MCP
+pointing to the checkout for Claude Code/Codex. A Marketplace installation from
+a local checkout can still use a cached copy. Verify the path and digest with
+`doctor`, not the version alone. Restart the client after changing source files:
+already-loaded extensions and MCP servers do not hot-reload the checkout.
 
 ## pi/omp extension
 
@@ -101,6 +107,8 @@ The MCP adapter accepts only `off`; Claude Code and Codex use `logs`/`wait`.
 - `context` (default) — new lines are queued for the next turn (does not start one).
 - `off` — pull with `logs`/`wait` only.
 - `wake` — new lines start a turn.
+
+Native slash-command results stay in the transcript and UI. Failed commands are queued for the next user turn and do not wake the model, including malformed arguments, preflight failures, and runtime failures. A command that completes successfully starts an analysis turn so its result can be interpreted. `push=wake` explicitly starts a turn for a valid parsed request, including when that request later fails during preflight or runtime. Malformed arguments cannot establish push intent and always remain queued.
 
 A device console is a firehose; the push carries at most 80 lines per tick and
 reports how many older lines it dropped. Combine it with `match` to keep it

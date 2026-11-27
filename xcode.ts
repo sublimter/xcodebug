@@ -179,13 +179,15 @@ export async function buildForDevice(
   const dropped = result.truncated
     ? "[xcodebug] output exceeded the size cap; the beginning was dropped and this log keeps the tail.\n\n"
     : "";
-  await writeFile(logFile, `$ xcodebuild ${args.join(" ")}\n\n${dropped}${result.stdout}\n${result.stderr}`);
+  await writeFile(logFile, `$ xcodebuild ${args.join(" ")}\n[xcodebug] build timeout budget: ${options.timeoutMs / 1000}s\n\n${dropped}${result.stdout}\n${result.stderr}`);
 
   const durationMs = Date.now() - started;
   if (result.code !== 0) {
     const final = tracker.finish("failed");
     options.onProgress?.(formatProgress(final));
-    const reason = result.timedOut ? "build timed out" : `build failed (exit ${result.code})`;
+    const reason = result.timedOut
+      ? `build timed out (budget ${options.timeoutMs / 1000}s; elapsed ${(durationMs / 1000).toFixed(1)}s)`
+      : `build failed (exit ${result.code})`;
     const found = [diagnostics.stdout.result(), diagnostics.stderr.result()];
     const errors = found.flatMap((each) => each.lines);
     const omitted = found.reduce((sum, each) => sum + each.omitted, 0);

@@ -23,7 +23,7 @@ import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { validateParameters } from "../parameters.ts";
+import { invalid, validateParameters } from "../parameters.ts";
 import { asRecord, asString, settlesWithin } from "../exec.ts";
 import { runtimeVersion } from "../version.ts";
 
@@ -238,6 +238,20 @@ function makeCtx(cwd: string, progressToken: unknown): { ctx: ExtensionContextLi
 const inputSchema = JSON.parse(JSON.stringify(tool.parameters)) as Record<string, unknown>;
 const { properties } = inputSchema as { properties: Record<string, unknown> };
 properties.cwd = { type: "string", description: "Absolute path to an existing project directory. Required for Codex Marketplace project actions except restart, which uses the last launch directory." };
+// Strict tool clients need a value for each optional field; null means omitted.
+const requiredFields = new Set(inputSchema.required as string[]);
+const nullableFields = new Set<string>();
+for (const name in properties) {
+  if (requiredFields.has(name)) continue;
+  const schema = asRecord(properties[name]);
+  const description = asString(schema.description);
+  delete schema.description;
+  properties[name] = {
+    anyOf: [schema, { type: "null" }],
+    description: `${description ? `${description} ` : ""}Omit or use null when unset.`,
+  };
+  nullableFields.add(name);
+}
 
 const CWD_FREE_ACTIONS = { devices: true, logs: true, wait: true, history: true, status: true, stop: true };
 
@@ -267,7 +281,7 @@ async function callTool(
   let projectCwd: string | undefined;
   if (cwd !== undefined) {
     if (typeof cwd !== "string" || !isAbsolute(cwd)) {
-      throw new Error("cwd must be an absolute project directory path.");
+      invalid("cwd must be an absolute project directory path.");
     }
     const statDirectory = (path: string) => stat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
@@ -275,29 +289,26 @@ async function callTool(
     });
     const directory = await statDirectory(cwd);
     if (!directory?.isDirectory()) {
-      throw new Error(`cwd must be an existing directory: ${cwd}`);
+      invalid(`cwd must be an existing directory: ${cwd}`);
     }
     const normalized = resolve(cwd);
     // Collapsing `..` before following a symlink can select a different directory.
     if (cwd.split("/").includes("..")) {
       const target = await statDirectory(normalized);
       if (target?.dev !== directory.dev || target.ino !== directory.ino) {
-        throw new Error(`cwd is ambiguous: ${cwd}. Pass the resolved project directory.`);
+        invalid(`cwd is ambiguous: ${cwd}. Pass the resolved project directory.`);
       }
     }
     projectCwd = await realpath(normalized);
   }
   if (process.env.XCODEBUG_REQUIRE_PROJECT_CWD === "1" && cwd === undefined && args.action !== "restart" &&
       (args.command !== undefined || !Object.hasOwn(CWD_FREE_ACTIONS, String(args.action)))) {
-    throw new Error("Pass cwd with the absolute path to your project directory.");
+    invalid("Pass cwd with the absolute path to your project directory.");
   }
   // `defaultPushMode` defaults to "context", but this transport cannot deliver
   // pushed lines. Refusing an explicit request beats accepting it and going quiet.
   if (args.push === "context" || args.push === "wake") {
-    return {
-      content: [{ type: "text", text: 'MCP has no push channel; use push=off and read with action=logs.' }],
-      isError: true,
-    };
+    invalid("MCP has no push channel; use push=off and read with action=logs.");
   }
   if (signal.aborted) throw new Error("Request cancelled");
   let cancelled = 0;
@@ -512,6 +523,12 @@ input.on("line", (line) => {
     ? new AbortController() : undefined;
   if (controller) inflight.set(message.id, controller);
   const params = asRecord(message.params);
+  if (message.method === "tools/call" && params.name === "xcodebug") {
+    const args = asRecord(params.arguments);
+    for (const key in args) {
+      if (Object.hasOwn(args, key) && args[key] === null && nullableFields.has(key)) delete args[key];
+    }
+  }
   const stop = controller && params?.name === "xcodebug" && asRecord(params.arguments)?.action === "stop";
   const stopBoundary = stop ? { controllers: [...pendingActions], settled: queue } : undefined;
   if (controller && params.name === "xcodebug" && (!stop || asRecord(params.arguments).command !== undefined)) {

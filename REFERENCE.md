@@ -86,6 +86,19 @@ native command text.
 The skill is a model instruction, not a direct RPC command: the model makes the
 tool call and the client's permission rules still apply. It should execute the
 requested action and report its result, rather than just explain how to do it.
+
+Only pass options applicable to the requested action; do not populate unrelated
+optional fields with default-looking values. Argument rejection is marked
+`xcodebug <version>: invalid arguments (no action started):`. The skill may correct
+arguments it introduced and retry the same tool/action once after that rejection.
+It must not change user-supplied arguments or repeat an operation that started.
+
+MCP optional parameters accept `null` as an explicit unset value for strict tool
+clients. The adapter removes only known optional nulls before dispatch; it does not
+erase `0`, `false`, empty strings, unknown fields or an invalid required `action`.
+Native parameters remain non-nullable. On MCP, `stop captureId=null` is a **bare
+stop**, equivalent to omitting the selector; use a real capture ID for scoped cleanup.
+
 Natural-language goals can also select the skill:
 
 ```text
@@ -220,6 +233,25 @@ reports the selected path or error. `devices`, `logs`, `wait`, `history`,
 (and Git revision when available). If the installed source changes, replies
 tell you to restart the client even when the package version did not change.
 
+## Xcode stage timeouts
+
+| Stage | Default budget |
+|---|---|
+| Automatic scheme list and iOS app probing | 120 seconds per Xcode query |
+| Build | 900 seconds |
+
+`timeoutSeconds` overrides these budgets per invocation, not for the whole launch.
+Pod install runs before compilation with a separate clock. Other stages, including
+post-build product lookup and automatic app installation, have independent limits.
+MCP client timeouts and promotion of long calls to background tasks are separate
+from these backend deadlines. A background launch is pending until its original
+task returns a capture ID; it is not evidence that log capture has started.
+
+A build-timeout reply reports the effective budget and elapsed build time; its log
+header also records the build budget. Build logs store stdout followed by stderr,
+not one chronologically merged stream. A warning timestamp at the end of that file
+does not necessarily mark the build's last activity.
+
 ## Change detection and pod install
 
 Every `build` and `launch` first inspects the working tree with
@@ -297,15 +329,23 @@ for the user. The phrase is a goal, not a log filter.
   stopping at the Git worktree root. In a directory, workspaces outrank projects.
   If none is found, search a bounded depth below that root, skipping dependency,
   build and nested Git directories. Multiple candidates require explicit selection.
-- A scheme passed explicitly or configured wins. Otherwise inspect runnable app
-  schemes in the container and the workspace's referenced projects, then probe
-  a bounded list of Xcode schemes if needed. No name-based guess: pass `scheme=`
-  when the choice is ambiguous. A pure Swift package needs a host iOS app.
+- A scheme passed explicitly or configured wins. Otherwise filter Xcode schemes
+  by the current user's **Show** entries in the container and the workspace's
+  referenced projects before bounded probing. Workspace entries override matching
+  project entries; an entry without `isShown` is shown, but unrecorded schemes are
+  ignored when management maps exist. With no current-user management metadata,
+  retain Xcode's default-visible fallback.
+  Prefer a shown iOS app scheme with the same name as its owning `.xcodeproj`.
+  If the remaining schemes all build the same project target and app, choose the
+  scheme named for that target. When multiple choices remain, pass `scheme=`.
+  A pure Swift package needs a host iOS app.
 - Scheme probes and builds receive the configured build arguments. Product
   lookup uses the build's flags and destination and rejects ambiguous or
   non-iOS app products. Build reuse keys include ordered flags and invocation cwd.
 - **The outcome reaches the session**, including a failed build or install - not
   just a UI toast.
+
+Native slash-command outcomes remain in the transcript and UI. Failed malformed-argument, preflight, and runtime commands are queued for the next user turn without waking the model. A successful `command=` run starts an analysis turn. `push=wake` explicitly starts a turn for a valid parsed request, including when that request later fails during preflight or runtime. Malformed arguments cannot establish push intent and always remain queued.
 
 A leading action word is still honoured: `/xcodebug logs`, `/xcodebug stop`.
 
@@ -653,8 +693,10 @@ cover both outcomes of a step: `match="sync (done|failed)"`. `times=true`
 prefixes each returned line with the host time it arrived, for lining the log
 up with a test runner's own output.
 
-Filtered `logs` accepts `context=0..20` to include neighboring lines without
-counting them as matches. Evidence replies cap text at 48 KiB and indicate
+Filtered `logs` accepts `context=0..20` only with a non-empty `grep`; it includes
+neighboring lines without counting them as matches. Do not send it with `launch`
+or other actions, even as `0`. It is unrelated to `push="context"`.
+Evidence replies cap text at 48 KiB and indicate
 omissions; use the returned log paths for more. `wait` defaults to the most
 recent query cursor for that capture; `since=0` deliberately replays old
 evidence. A match from before the wait is labeled, not presented as a new event.

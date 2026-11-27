@@ -168,3 +168,24 @@ test("a failed build reports its errors, not the build commands its output ends 
   assert.doesNotMatch(outcome.summary, /filler|CompileC/);
   assert.match(await readFile(outcome.logFile, "utf8"), /filler 199/, "the log still holds the whole build");
 });
+
+test("a build timeout reports the effective budget instead of treating normal progress as a compiler error", { timeout: 5_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), "xcodebug-build-timeout-"));
+  const bin = join(root, "bin");
+  await mkdir(bin);
+  await writeFile(join(bin, "xcodebuild"), "#!/bin/sh\nprintf 'ProcessInfoPlistFile normal build progress\\n'\nexec /bin/sleep 1\n", { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  t.after(async () => {
+    process.env.PATH = oldPath;
+    await rm(root, { recursive: true, force: true });
+  });
+  const outcome = await buildForDevice(
+    { scheme: "Probe", configuration: "Debug", project: join(root, "Probe.xcodeproj") },
+    { id: "test-device", udid: "test-udid", name: "Test", state: "connected", physical: true },
+    { logDir: join(root, "logs"), cwd: root, timeoutMs: 50 },
+  );
+  assert.equal(outcome.ok, false);
+  assert.match(outcome.summary, /build timed out \(budget 0\.05s; elapsed /);
+  assert.match(await readFile(outcome.logFile, "utf8"), /build timeout budget: 0\.05s/);
+});

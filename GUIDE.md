@@ -23,6 +23,12 @@ From the current directory it finds the workspace, rebuilds if the tree changed,
 installs, launches, and starts capturing. The trailing phrase is the goal the
 model must answer — not a log filter.
 
+Without an explicit or configured `scheme`, xcodebug filters the selected
+container's schemes using the current user's Show entries. It prefers a shown
+iOS app scheme named after its owning `.xcodeproj`; an ambiguous choice still
+requires `scheme=...`. See [project discovery](REFERENCE.md#one-shot-xcodebug-what-to-verify)
+for workspace overrides, fallback behavior and probe limits.
+
 ### Commands and tool calls
 
 **Native command examples**
@@ -177,6 +183,7 @@ xcodebug action=launch scheme=MyApp
 xcodebug action=launch force=true          # rebuild even with no changes
 xcodebug action=launch installPods=false   # skip the automatic pod install
 xcodebug action=restart                    # after editing: rebuild + relaunch + reuse params
+xcodebug action=launch timeoutSeconds=1800  # explicitly allow longer discovery/build stages
 
 # read logs
 xcodebug action=logs limit=200
@@ -194,6 +201,10 @@ xcodebug action=terminate
 # run a command alongside the capture
 xcodebug action=await command="cd /repo && npm run test:weather"
 ```
+
+`timeoutSeconds` sets per-stage budgets, not a total launch deadline. For larger
+workspaces, request a longer budget explicitly rather than repeatedly rerunning
+a timed-out build. See [Xcode stage timeouts](REFERENCE.md#xcode-stage-timeouts).
 
 ### Where files land
 
