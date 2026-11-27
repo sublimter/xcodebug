@@ -241,6 +241,7 @@ tell you to restart the client even when the package version did not change.
 | Build | 900 seconds |
 
 `timeoutSeconds` overrides these budgets per invocation, not for the whole launch.
+The maximum is `2147483.647` seconds, matching Node's timer limit.
 Pod install runs before compilation with a separate clock. Other stages, including
 post-build product lookup and automatic app installation, have independent limits.
 MCP client timeouts and promotion of long calls to background tasks are separate

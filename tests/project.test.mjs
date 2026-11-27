@@ -362,5 +362,7 @@ test("automatic discovery honors the caller's query budget and can finish with a
   });
   await assert.rejects(withContainer(root, {}, { timeoutSeconds: 0 }), /timeoutSeconds must be a positive finite number/);
   await assert.rejects(withContainer(root, {}, { timeoutSeconds: 0.05 }), /xcodebuild -list timed out after 0\.05s/);
+  await assert.rejects(withContainer(root, {}, { scheme: "App", timeoutSeconds: 2_147_483.648 }),
+    /timeoutSeconds must be a positive finite number no greater than 2147483.647/);
   assert.equal((await withContainer(root, {}, { timeoutSeconds: 3 })).scheme, "App");
 });

@@ -6,6 +6,7 @@
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
+export const MAX_COMMAND_TIMEOUT_MS = 2_147_483_647;
 
 export interface CommandResult {
   stdout: string;
@@ -58,6 +59,9 @@ export function runCommand(
   options: CommandOptions = {},
 ): Promise<CommandResult> {
   const { cwd, timeoutMs = 120_000, maxBytes = 2_000_000, signal: explicitSignal, onChunk } = options;
+  if (!Number.isFinite(timeoutMs) || timeoutMs > MAX_COMMAND_TIMEOUT_MS) {
+    throw new RangeError(`timeoutMs must be finite and no greater than ${MAX_COMMAND_TIMEOUT_MS}.`);
+  }
   const inheritedSignal = commandSignals.getStore();
   const signal = inheritedSignal && explicitSignal && inheritedSignal !== explicitSignal
     ? AbortSignal.any([inheritedSignal, explicitSignal])

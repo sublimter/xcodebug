@@ -23,6 +23,18 @@ async function started(path) {
   assert.fail(`command did not start: ${path}`);
 }
 
+test("runCommand rejects a timeout beyond the Node timer limit before spawning", () => {
+  assert.throws(() => runCommand("not-started", [], { timeoutMs: 2_147_483_648 }),
+    /timeoutMs must be finite and no greater than 2147483647/);
+});
+
+test("runCommand accepts the maximum Node timer value for a short command", { timeout: 5_000 }, async () => {
+  const result = await runCommand(process.execPath, ["-e", "process.stdout.write('done')"], { timeoutMs: 2_147_483_647 });
+  assert.equal(result.code, 0);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.stdout, "done");
+});
+
 test("action cancellation reaches nested commands without stopping another action", { timeout: 20_000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), "xcodebug-command-stop-"));
   const first = new AbortController();

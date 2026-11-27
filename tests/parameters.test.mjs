@@ -45,6 +45,11 @@ test("zero context is rejected unless it is a filtered logs request", () => {
   assert.doesNotThrow(() => validateParameters({ action: "logs", grep: "x", context: 0 }));
 });
 
+test("timeoutSeconds rejects values beyond the Node timer limit", () => {
+  assert.throws(() => validateParameters({ action: "status", timeoutSeconds: 2_147_483.648 }), /timeoutSeconds/);
+  assert.doesNotThrow(() => validateParameters({ action: "status", timeoutSeconds: 2_147_483.647 }));
+});
+
 test("the tool advertises the same shape the native handler validates", async () => {
   let tool;
   xcodebug({ registerTool(value) { tool = value; }, registerCommand() {}, on() {} });

@@ -2,7 +2,7 @@ import { lstat, readdir, readFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { userInfo } from "node:os";
 import type { BuildTarget } from "./xcode.ts";
-import { runCommand } from "./exec.ts";
+import { MAX_COMMAND_TIMEOUT_MS, runCommand } from "./exec.ts";
 
 export interface ProjectOptions {
   workspace?: string;
@@ -404,8 +404,9 @@ export async function withContainer(cwd: string, config: ProjectConfig, params: 
   validateOptions(params, "Parameters");
   validateOptions(config, ".xcodebug.json");
   if (params.timeoutSeconds !== undefined &&
-      (typeof params.timeoutSeconds !== "number" || !Number.isFinite(params.timeoutSeconds) || params.timeoutSeconds <= 0)) {
-    throw new Error("Parameters timeoutSeconds must be a positive finite number.");
+      (typeof params.timeoutSeconds !== "number" || !Number.isFinite(params.timeoutSeconds) || params.timeoutSeconds <= 0 ||
+        params.timeoutSeconds > MAX_COMMAND_TIMEOUT_MS / 1000)) {
+    throw new Error(`Parameters timeoutSeconds must be a positive finite number no greater than ${MAX_COMMAND_TIMEOUT_MS / 1000}.`);
   }
   const timeoutMs = params.timeoutSeconds === undefined ? XCODE_QUERY_TIMEOUT : params.timeoutSeconds * 1000;
   const chosen = await selection(cwd, config, params);

@@ -1,5 +1,6 @@
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
+import { MAX_COMMAND_TIMEOUT_MS } from "./exec.ts";
 import { runtimeVersion } from "./version.ts";
 
 const actions = ["devices", "changes", "build", "install", "launch", "syslog", "logs", "wait", "history", "status", "stop", "terminate", "doctor", "restart", "await"] as const;
@@ -26,7 +27,7 @@ const parameterType = Type.Object({
   absent: flag("wait: succeed only after the complete interval if no matching line was observed"),
   regex: flag("logs/wait: interpret grep or match as a regular expression"),
   times: flag("logs/wait: prefix each line with the local host time it arrived (HH:MM:SS.mmm)"),
-  timeoutSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, description: "Per-stage timeout in seconds for scheme discovery, build/pod install, install action or wait. Discovery defaults to 120s; build/pod install 900s; install 180s; wait 30s; await 1800s. Not an overall launch deadline." })),
+  timeoutSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: MAX_COMMAND_TIMEOUT_MS / 1000, description: "Per-stage timeout in seconds for scheme discovery, build/pod install, install action or wait. Maximum 2147483.647s. Discovery defaults to 120s; build/pod install 900s; install 180s; wait 30s; await 1800s. Not an overall launch deadline." })),
   command: text("Shell line to run to completion for await or after an action, e.g. cd /repo && npm test. A restart replays the last launch's command unless overridden."),
   push: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("context"), Type.Literal("wake")], {
     description: "Native: context queues lines for the next turn (default), wake starts a turn, off uses pull reads. MCP uses off.",
