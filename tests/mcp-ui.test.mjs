@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { platformPreload } from "./platform-host.mjs";
 
 // Exercise the real stdio adapter and real child pipes; only device CLIs are fake.
 test("UI snapshots show operation phases and resume live capture between actions", { timeout: 30_000 }, async t => {
@@ -48,8 +49,8 @@ done
   const liveFile = join(root, "ui", `${process.pid}.json`);
   await mkdir(join(root, "ui"));
   await Promise.all([deadFile, liveFile].map(path => writeFile(path, '{"rows":["left behind"],"seq":1}')));
-  const child = spawn("bun", [new URL("../mcp/server.ts", import.meta.url).pathname], {
-    cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, XCODEBUG_AGENT_DIR: root },
+  const child = spawn("bun", ["--preload", platformPreload, new URL("../mcp/server.ts", import.meta.url).pathname], {
+    cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, XCODEBUG_AGENT_DIR: root, XCODEBUG_TEST_PLATFORM: "darwin" },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let id = 0;
@@ -441,8 +442,8 @@ for (const [how, end, code] of [
     for (const [name, marker] of [["long-command", "command"], ["queued-command", "queued"]]) {
       await writeFile(join(bin, name), `#!/bin/sh\nprintf '%s' "$$" > '${root}/${marker}.pid'\nexec /bin/sleep 120\n`, { mode: 0o755 });
     }
-    const child = spawn("bun", [new URL("../mcp/server.ts", import.meta.url).pathname], {
-      cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, XCODEBUG_AGENT_DIR: root },
+    const child = spawn("bun", ["--preload", platformPreload, new URL("../mcp/server.ts", import.meta.url).pathname], {
+      cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, XCODEBUG_AGENT_DIR: root, XCODEBUG_TEST_PLATFORM: "darwin" },
       stdio: ["pipe", "pipe", "inherit"],
     });
     let started = [];
@@ -572,8 +573,8 @@ if (hold) {
   syncBuiltinESMExports();
 }
 `);
-  const child = spawn("bun", ["--preload", preload, new URL("../mcp/server.ts", import.meta.url).pathname], {
-    cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, XCODEBUG_AGENT_DIR: root },
+  const child = spawn("bun", ["--preload", platformPreload, "--preload", preload, new URL("../mcp/server.ts", import.meta.url).pathname], {
+    cwd: root, env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, XCODEBUG_AGENT_DIR: root, XCODEBUG_TEST_PLATFORM: "darwin" },
     stdio: ["pipe", "pipe", "pipe"],
   });
   const replies = [];

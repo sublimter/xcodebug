@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import xcodebug from "../index.ts";
+import { mockPlatform } from "./platform-host.mjs";
 
 const device = { identifier: "fixture-device", properties: {
   hardware: { udid: "fixture-udid", reality: "physical" },
@@ -12,6 +13,7 @@ const device = { identifier: "fixture-device", properties: {
 } };
 
 async function session(t) {
+  mockPlatform(t, "darwin");
   const root = await realpath(await mkdtemp(join(tmpdir(), "xcodebug-project-actions-")));
   const repo = join(root, "repo");
   const bin = join(root, "bin");

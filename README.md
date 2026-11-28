@@ -48,14 +48,22 @@ remove. Keep the npm package if pi/omp or another client still uses it.
 
 | Need | Why |
 |---|---|
-| macOS + Xcode (command-line tools) | `xcodebuild`, `xcrun devicectl` |
+| macOS + Xcode (command-line tools) | only Xcode/device actions: `xcodebuild`, `xcrun devicectl` |
 | `idevicesyslog` from libimobiledevice | optional; only `syslog` and the dual-channel safety net |
 | git | change detection; without a repo every run rebuilds |
 | CocoaPods | optional; only projects with a `Podfile` |
 | Bun | only for the MCP clients (Claude Code, Codex); pi runs the extension itself |
+| GitHub CLI (`gh`) | only for `feedback`; authenticate with `gh auth login --hostname github.com` |
 
 `xcodebug action=doctor` reports the Xcode toolchain, capture tools, active
 configuration, log directory, loaded package version, source path and source digest.
+
+Shared configurations can stay installed on Linux/Windows. Xcode/device actions
+return `unsupported_platform` before project discovery; `doctor`, feedback and
+local controls remain available. The execution host's OS is checked, not the
+client's OS. Commands require `/bin/sh`; Windows returns `unsupported_shell`.
+An explicit `stop` still completes cleanup before rejecting its appended command.
+See [host availability](REFERENCE.md#host-availability) for action coverage.
 
 For live development, use a native local installation for pi/omp or manual MCP
 pointing to the checkout for Claude Code/Codex. A Marketplace installation from

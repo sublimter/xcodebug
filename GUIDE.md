@@ -13,6 +13,16 @@ with the entry point for [pi/omp](#piomp-extension), [Claude Code](#claude-code)
 or [Codex](#codex). A bare invocation launches the app. Use `status` to inspect
 an existing capture without launching.
 
+### Non-macOS execution hosts
+
+Keep shared configurations installed. Native interactive sessions warn once when
+Xcode/device actions are unavailable; `doctor` reports host capabilities without
+probing Xcode on non-Mac hosts. A Windows/Linux client can use a Mac-hosted MCP server.
+Local controls and explicitly requested feedback remain usable. Commands require
+an executable `/bin/sh`; `stop` still cleans up before reporting an unsupported command.
+See [host availability](REFERENCE.md#host-availability) for the exact action policy.
+
+
 ### The one-liner
 
 ```text
@@ -40,6 +50,7 @@ for workspace overrides, fallback behavior and probe limits.
 /xcodebug logs grep=MySDK
 /xcodebug stop
 /xcodebug analyse weather command="cd /repo && npm run test:xxx"
+/xcodebug feedback title="Log read timed out" body="Steps and actual error"
 ```
 
 Native command text uses `action key=value ...`. JSON parameter objects are for
@@ -67,6 +78,20 @@ with nonobvious behavior:
   Do not restart cancelled work unless the user requests it.
 - `restart` replays the last launch of this session, rebuilding and rerunning
   any saved `command=` from that launch's working directory.
+
+### Send feedback
+
+`/xcodebug feedback <short problem description>` creates a public issue in
+`sublimter/xcodebug`. Use `title="..." body="..."` for more detail. It requires
+an authenticated GitHub CLI and never attaches logs or configuration automatically.
+In description mode, `scheme=MiDong`, unknown `key=value` fragments and flags remain text.
+Actual `title`, `body` or `timeoutSeconds` options select parameter mode, which requires
+an explicit title and rejects free-text descriptions. Values such as `--grep title=missing`
+do not select this mode. Quote the entire description to send literal feedback-option fragments.
+The first declared action is fixed, including quoted action words and actions after leading
+options; conflicting `action=` or `--action` parameters are rejected before execution.
+See [feedback](REFERENCE.md#feedback) for prerequisites and failure handling.
+
 
 ### How logs reach the conversation
 

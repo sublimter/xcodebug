@@ -26,6 +26,7 @@ import { createInterface } from "node:readline";
 import { invalid, validateParameters } from "../parameters.ts";
 import { asRecord, asString, settlesWithin } from "../exec.ts";
 import { runtimeVersion } from "../version.ts";
+import { availabilityError, shellUnavailable } from "../platform.ts";
 
 /** Only the fields index.ts reads off its context. */
 interface ExtensionContextLike {
@@ -253,7 +254,7 @@ for (const name in properties) {
   nullableFields.add(name);
 }
 
-const CWD_FREE_ACTIONS = { devices: true, logs: true, wait: true, history: true, status: true, stop: true };
+const CWD_FREE_ACTIONS = { devices: true, logs: true, wait: true, history: true, status: true, stop: true, feedback: true };
 
 function reply(id: unknown, result: unknown): void {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, result })}\n`);
@@ -278,11 +279,13 @@ async function callTool(
   const { cwd, ...args } = input && typeof input === "object" && !Array.isArray(input)
     ? input as Record<string, unknown> : { ...validateParameters(input), cwd: undefined };
   if (stopBoundary) validateParameters(args);
+  const deferredShell = args.action === "stop" && args.command && process.platform === "win32"
+    ? shellUnavailable("stop") : undefined;
   let projectCwd: string | undefined;
-  if (cwd !== undefined) {
-    if (typeof cwd !== "string" || !isAbsolute(cwd)) {
-      invalid("cwd must be an absolute project directory path.");
-    }
+  if (cwd !== undefined && (typeof cwd !== "string" || !isAbsolute(cwd))) {
+    invalid("cwd must be an absolute project directory path.");
+  }
+  if (cwd !== undefined && !deferredShell) {
     const statDirectory = (path: string) => stat(path, { bigint: true }).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
       throw error;
@@ -302,6 +305,7 @@ async function callTool(
     projectCwd = await realpath(normalized);
   }
   if (process.env.XCODEBUG_REQUIRE_PROJECT_CWD === "1" && cwd === undefined && args.action !== "restart" &&
+      !(args.action === "doctor" && process.platform !== "darwin") && !deferredShell &&
       (args.command !== undefined || !Object.hasOwn(CWD_FREE_ACTIONS, String(args.action)))) {
     invalid("Pass cwd with the absolute path to your project directory.");
   }
@@ -345,7 +349,7 @@ async function callTool(
         };
       } else if (appendedCommand && !result.isError) {
         signal.throwIfAborted();
-        const command = await tool.execute("mcp", { ...args, action: "await", push: args.push === undefined ? "off" : args.push }, signal, undefined, progress.ctx);
+        const command = deferredShell ?? await tool.execute("mcp", { ...args, action: "await", push: args.push === undefined ? "off" : args.push }, signal, undefined, progress.ctx);
         result = {
           content: [{ type: "text", text: `${result.content[0]?.text ?? ""}\n\n${command.content[0]?.text ?? ""}` }],
           details: { primary: result.details, command: command.details },
@@ -416,7 +420,11 @@ async function handle(message: Record<string, unknown>, controller?: AbortContro
         reply(id, { content: [{ type: "text", text: "Request cancelled" }], isError: true });
         return;
       }
-      reply(id, await callTool(params.arguments === undefined ? {} : params.arguments, controller!.signal, params._meta?.progressToken, stopBoundary));
+      const result = await callTool(params.arguments === undefined ? {} : params.arguments, controller!.signal, params._meta?.progressToken, stopBoundary);
+      const details = asRecord(result.details), command = asRecord(details?.command);
+      const availability = details?.code === "unsupported_platform" || details?.code === "unsupported_shell" ? details
+        : command?.code === "unsupported_platform" || command?.code === "unsupported_shell" ? command : undefined;
+      reply(id, availability ? { ...result, structuredContent: availability } : result);
     } catch (error) {
       reply(id, { content: [{ type: "text", text: (error as Error).message }], isError: true });
     }
@@ -527,6 +535,21 @@ input.on("line", (line) => {
     const args = asRecord(params.arguments);
     for (const key in args) {
       if (Object.hasOwn(args, key) && args[key] === null && nullableFields.has(key)) delete args[key];
+    }
+    const unavailable = availabilityError(typeof args.action === "string" ? args.action : "",
+      typeof args.command === "string" ? args.command : undefined);
+    if (controller && unavailable) {
+      try {
+        const { cwd, ...nativeArgs } = args;
+        validateParameters(nativeArgs);
+        if (cwd !== undefined && typeof cwd !== "string") invalid("cwd must be an absolute project directory path.");
+        reply(message.id, { ...unavailable, structuredContent: unavailable.details });
+      } catch (error) {
+        reply(message.id, { content: [{ type: "text", text: (error as Error).message }], isError: true });
+      } finally {
+        if (inflight.get(message.id) === controller) inflight.delete(message.id);
+      }
+      return;
     }
   }
   const stop = controller && params?.name === "xcodebug" && asRecord(params.arguments)?.action === "stop";

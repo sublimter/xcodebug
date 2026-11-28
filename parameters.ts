@@ -3,7 +3,7 @@ import { Value } from "typebox/value";
 import { MAX_COMMAND_TIMEOUT_MS } from "./exec.ts";
 import { runtimeVersion } from "./version.ts";
 
-const actions = ["devices", "changes", "build", "install", "launch", "syslog", "logs", "wait", "history", "status", "stop", "terminate", "doctor", "restart", "await"] as const;
+const actions = ["devices", "changes", "build", "install", "launch", "syslog", "logs", "wait", "history", "status", "stop", "terminate", "doctor", "restart", "await", "feedback"] as const;
 const text = (description?: string) => Type.Optional(Type.String({ description }));
 const flag = (description: string) => Type.Optional(Type.Boolean({ description }));
 const strings = (description: string) => Type.Optional(Type.Array(Type.String(), { description }));
@@ -11,6 +11,8 @@ const strings = (description: string) => Type.Optional(Type.Array(Type.String(),
 const parameterType = Type.Object({
   action: Type.Enum(actions),
   goal: text("What the caller wants to verify during this launch"),
+  title: text("feedback only: title of the public issue submitted to sublimter/xcodebug"),
+  body: text("feedback only: issue body, using only text explicitly supplied by the user; no logs or files are attached automatically"),
   device: text("Device name, UDID, ECID or CoreDevice UUID. Defaults to the configured device or the only connected physical device."),
   scheme: text(), workspace: text(), project: text(), configuration: text("Defaults to Debug"), derivedDataPath: text(),
   xcodebuildArgs: strings("Additional xcodebuild arguments, one argv element per item"),
@@ -27,7 +29,7 @@ const parameterType = Type.Object({
   absent: flag("wait: succeed only after the complete interval if no matching line was observed"),
   regex: flag("logs/wait: interpret grep or match as a regular expression"),
   times: flag("logs/wait: prefix each line with the local host time it arrived (HH:MM:SS.mmm)"),
-  timeoutSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: MAX_COMMAND_TIMEOUT_MS / 1000, description: "Per-stage timeout in seconds for scheme discovery, build/pod install, install action or wait. Maximum 2147483.647s. Discovery defaults to 120s; build/pod install 900s; install 180s; wait 30s; await 1800s. Not an overall launch deadline." })),
+  timeoutSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: MAX_COMMAND_TIMEOUT_MS / 1000, description: "Per-stage timeout in seconds for scheme discovery, build/pod install, install action, wait or feedback. Maximum 2147483.647s. Discovery defaults to 120s; build/pod install 900s; install 180s; wait 30s; await 1800s; feedback 60s. Not an overall launch deadline." })),
   command: text("Shell line to run to completion for await or after an action, e.g. cd /repo && npm test. A restart replays the last launch's command unless overridden."),
   push: Type.Optional(Type.Union([Type.Literal("off"), Type.Literal("context"), Type.Literal("wake")], {
     description: "Native: context queues lines for the next turn (default), wake starts a turn, off uses pull reads. MCP uses off.",
@@ -62,6 +64,12 @@ export function validateParameters(input: unknown): ToolParams {
   if (input.absent && input.action !== "wait") invalid("absent requires action=wait");
   if (input.context !== undefined && (input.action !== "logs" || !input.grep)) invalid("context requires action=logs with grep; omit context for other actions, even when it is 0");
   if (input.command !== undefined && input.action === "history") invalid("history is read-only and does not accept command");
+  if ((input.title !== undefined || input.body !== undefined) && input.action !== "feedback") invalid("title and body require action=feedback");
+  if (input.action === "feedback") {
+    if (!input.title?.trim()) invalid('feedback requires a nonempty title; use feedback title="..." body="..."');
+    if (input.title.includes("\0") || input.body?.includes("\0")) invalid("feedback title and body cannot contain NUL characters");
+    if (input.command !== undefined) invalid("feedback does not accept command");
+  }
   return input;
 }
 
@@ -108,28 +116,84 @@ function argument(key: string, raw: string): unknown {
   return value;
 }
 
+// Share flag-value boundaries so values cannot select an action or feedback mode.
+function optionEnd(parts: readonly string[], index: number): number {
+  const token = parts[index]!;
+  if (!token.startsWith("--") || token.indexOf("=") > 2) return index;
+  const key = token.slice(2);
+  if (!Object.hasOwn(parameters.properties, key)) return index;
+  const next = parts[index + 1];
+  if (next === undefined || next.startsWith("--")) return index;
+  const spec = parameters.properties[key as keyof ToolParams];
+  if ("type" in spec && spec.type === "boolean" && next !== "true" && next !== "false") return index;
+  return index + 1;
+}
+
 export function parseCommandArgs(raw: string): ToolParams {
   const args: Record<string, unknown> = Object.create(null);
   const words: string[] = [];
   const parts = tokens(raw);
+  let actionStart = -1, actionEnd = -1;
+  let firstWord = true, feedbackParameters = false;
   for (let i = 0; i < parts.length; i++) {
+    const start = i;
     const token = parts[i]!;
     const isFlag = token.startsWith("--");
     const body = isFlag ? token.slice(2) : token;
     const eq = body.indexOf("=");
+    const key = eq > 0 ? body.slice(0, eq) : body;
+    i = optionEnd(parts, i);
+    let action: unknown;
+    if (eq > 0 || isFlag) {
+      if (key === "action") {
+        if (eq <= 0 && i === start) invalid("--action needs a value");
+        action = argument("action", eq > 0 ? body.slice(eq + 1) : parts[i]!);
+      } else if (key === "title" || key === "body" || key === "timeoutSeconds") feedbackParameters = true;
+    } else {
+      const word = unquote(token);
+      if (firstWord && args.action === undefined && (actions as readonly string[]).includes(word)) action = word;
+      firstWord = false;
+    }
+    if (action !== undefined) {
+      if (args.action !== undefined && args.action !== action) invalid("conflicting action declarations");
+      if (args.action === undefined) {
+        args.action = action;
+        actionStart = start;
+        actionEnd = i;
+      }
+    }
+  }
+  args.action ??= "launch";
+  const feedbackDescription = args.action === "feedback" && !feedbackParameters;
+  for (let i = 0; i < parts.length; i++) {
+    if (i === actionStart) { i = actionEnd; continue; }
+    const token = parts[i]!;
+    if (feedbackDescription && i > actionEnd) {
+      words.push(unquote(token));
+      continue;
+    }
+    const start = i;
+    const isFlag = token.startsWith("--");
+    const body = isFlag ? token.slice(2) : token;
+    const eq = body.indexOf("=");
+    i = optionEnd(parts, i);
     if (eq > 0) {
-      args[body.slice(0, eq)] = argument(body.slice(0, eq), body.slice(eq + 1));
+      const key = body.slice(0, eq);
+      if (key === "action") continue;
+      args[key] = argument(key, body.slice(eq + 1));
     } else if (isFlag) {
+      if (body === "action") continue;
       if (!Object.hasOwn(parameters.properties, body)) invalid(`unknown parameter "${body.slice(0, 120)}"`);
       const spec = parameters.properties[body as keyof ToolParams];
-      const next = parts[i + 1];
-      if ("type" in spec && spec.type === "boolean" && next !== "false" && next !== "true") args[body] = true;
-      else if (next === undefined || next.startsWith("--")) invalid(`--${body} needs a value`);
-      else args[body] = argument(body, parts[++i]!);
+      if (i > start) args[body] = argument(body, parts[i]!);
+      else if ("type" in spec && spec.type === "boolean") args[body] = true;
+      else invalid(`--${body} needs a value`);
     } else words.push(unquote(token));
   }
-  if (words[0] && (actions as readonly string[]).includes(words[0])) args.action = words.shift();
-  args.action ??= "launch";
-  if (words.length) args.goal = words.join(" ");
+  if (feedbackDescription) args.title = words.join(" ");
+  else if (words.length) {
+    if (args.action === "feedback") invalid("use either a feedback description or title=, not both");
+    args.goal = words.join(" ");
+  }
   return validateParameters(args);
 }

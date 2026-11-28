@@ -14,6 +14,69 @@ test("slash arguments preserve quoted shell commands, typed JSON and explicit ac
   assert.equal(parseCommandArgs("验证启动日志").goal, "验证启动日志");
   assert.equal(parseCommandArgs("history --limit 2").limit, 2);
   assert.equal(parseCommandArgs("wait match=ok --absent").absent, true);
+  assert.deepEqual({ ...parseCommandArgs("--scheme feedback --action launch feedback screen") },
+    { action: "launch", scheme: "feedback", goal: "feedback screen" });
+  assert.deepEqual({ ...parseCommandArgs('scheme=MiDong "status"') }, { action: "status", scheme: "MiDong" });
+});
+
+test("feedback descriptions become issue titles without stealing explicit launch goals", () => {
+  assert.deepEqual({ ...parseCommandArgs("feedback 读取日志时超时") }, { action: "feedback", title: "读取日志时超时" });
+  assert.deepEqual({ ...parseCommandArgs('feedback title="Log failed" body="line one\nline two"') },
+    { action: "feedback", title: "Log failed", body: "line one\nline two" });
+  assert.deepEqual({ ...parseCommandArgs("action=launch feedback screen") }, { action: "launch", goal: "feedback screen" });
+  for (const args of ["feedback", 'feedback title=" "', 'feedback description title="Title"',
+    'feedback title="Title" command="exit 0"']) assert.throws(() => parseCommandArgs(args), /invalid arguments \(no action started\)/);
+});
+
+test("feedback descriptions preserve configuration and error fragments as literal text", () => {
+  for (const prefix of ["feedback", '"feedback"', "'feedback'", "action=feedback", "--action feedback", "--action=feedback"]) {
+    for (const description of ["scheme=MiDong 运行失败", "foo=bar --force 读取失败", '"scheme=MiDong 运行失败"']) {
+      assert.deepEqual({ ...parseCommandArgs(`${prefix} ${description}`) },
+        { action: "feedback", title: description.replace(/^"|"$/g, "") });
+    }
+  }
+  assert.deepEqual({ ...parseCommandArgs('feedback --title "Log failed" --body "scheme=MiDong"') },
+    { action: "feedback", title: "Log failed", body: "scheme=MiDong" });
+  assert.deepEqual({ ...parseCommandArgs('feedback body="Steps" title="Log failed" timeoutSeconds=5') },
+    { action: "feedback", body: "Steps", title: "Log failed", timeoutSeconds: 5 });
+});
+
+test("feedback descriptions keep control names used as flag values", () => {
+  for (const description of ["查询失败 --grep title=missing scheme=MiDong", "查询失败 --grep title=missing foo=bar",
+    "查询失败 --grep action=launch foo=bar", "查询失败 --grep body=missing foo=bar",
+    "查询失败 --grep timeoutSeconds=5 foo=bar", "查询失败 --force false --grep title=missing foo=bar"]) {
+    assert.deepEqual({ ...parseCommandArgs(`feedback ${description}`) }, { action: "feedback", title: description });
+  }
+  assert.deepEqual({ ...parseCommandArgs("feedback --body title=missing --title action=launch") },
+    { action: "feedback", body: "title=missing", title: "action=launch" });
+});
+
+test("feedback parameter mode requires an explicit title and rejects free descriptions", () => {
+  for (const input of ['feedback 读取失败 body="Steps" timeoutSeconds=5', 'feedback 读取失败 --body "Steps"',
+    "feedback 读取失败 timeoutSeconds=5", 'feedback body="Steps"', "feedback --timeoutSeconds 5",
+    'feedback --grep title=missing title="Report" 查询失败']) {
+    assert.throws(() => parseCommandArgs(input), /invalid arguments \(no action started\)/, input);
+  }
+  assert.deepEqual({ ...parseCommandArgs('feedback title="读取失败" body="Steps" timeoutSeconds=5') },
+    { action: "feedback", title: "读取失败", body: "Steps", timeoutSeconds: 5 });
+  assert.deepEqual({ ...parseCommandArgs(`feedback '读取失败 body="Steps" timeoutSeconds=5'`) },
+    { action: "feedback", title: '读取失败 body="Steps" timeoutSeconds=5' });
+});
+
+test("declared actions cannot be overridden by later action parameters", () => {
+  for (const input of ["feedback 读取日志失败 action=launch", "feedback 读取日志失败 --action launch",
+    '"feedback" 读取日志失败 action=launch', "'feedback' 读取日志失败 --action launch",
+    'timeoutSeconds=5 "feedback" 读取日志失败 action=launch', "--scheme MiDong feedback --action=launch",
+    "scheme=MiDong status action=launch", "goal text action=feedback action=launch",
+    'feedback title="Log failed" --action=launch', "status action=launch", "action=feedback action=launch"]) {
+    assert.throws(() => parseCommandArgs(input), /conflicting action declarations/, input);
+  }
+});
+
+test("feedback fields are action-specific and reject text that cannot be passed to a command", () => {
+  assert.throws(() => validateParameters({ action: "status", title: "Report" }), /title and body require action=feedback/);
+  assert.throws(() => validateParameters({ action: "launch", body: "Report" }), /title and body require action=feedback/);
+  assert.throws(() => validateParameters({ action: "feedback", title: "Report", body: "bad\0text" }), /cannot contain NUL/);
 });
 
 test("malformed slash arguments reach the user before an action starts", async () => {
@@ -28,6 +91,8 @@ test("malformed slash arguments reach the user before an action starts", async (
     ["launch context=0", /context requires action=logs with grep/],
     ["status args='{}'", /args/], ["status environment='{'", /environment/],
     ['status grep="unterminated', /quote/i], ["await command=cd /missing", /quoted/i],
+    ["feedback 读取日志失败 action=launch", /conflicting action declarations/],
+    ['feedback description title="Title"', /use either a feedback description or title=/],
   ]) {
     await slash(input, ctx);
     const message = sent.at(-1);

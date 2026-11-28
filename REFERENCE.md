@@ -3,6 +3,28 @@
 For client setup and migration, see the [installation guide](README.md). For
 examples of running a test and reading its logs, see the [practical guide](GUIDE.md).
 
+## Host availability
+
+Availability is checked on the xcodebug execution host, not the client. Shared
+configurations may remain installed on Linux/Windows; a Windows/Linux client can
+use a server running on a Mac. Native interactive sessions warn once per loaded
+extension. MCP exposes the notice in the tool description, never as a stdout banner.
+
+| Action | Non-macOS behavior |
+|---|---|
+| `devices`, `changes`, `build`, `install`, `launch`, `syslog`, `terminate`, `restart` | `unsupported_platform` before the execution queue, project/cwd checks or Xcode/device commands. `changes` currently resolves a device/target too. |
+| `doctor` | Reports platform and shell capabilities without Xcode probes; project cwd is not required when omitted. Missing optional metadata, such as the log directory, is reported without losing the rest of the diagnosis. |
+| `feedback`, `history`, `status`, `stop` | Remain available with their usual dependencies and session constraints. Feedback still needs authenticated `gh`; stop still cancels work and cleans up. |
+| `logs`, `wait` | Still require a valid capture; no platform restriction is added to local capture queries. |
+| `await` or `command=` | Requires executable `/bin/sh`. Windows returns `unsupported_shell`; Linux/POSIX hosts are not blanket-disabled. |
+
+Availability failures return `isError=true` and a machine-readable code in `details`;
+MCP also exposes the error metadata in `structuredContent`. Rejections do not wait
+behind running work or cancel it. Use a Mac execution host for Xcode/device actions.
+An explicit `stop command=...` finishes cancellation and cleanup before reporting
+an unsupported shell; its unusable command does not require project cwd lookup.
+
+
 ## MCP runtime and cancellation
 
 Cancelling an MCP request aborts that request. On SIGINT, SIGTERM, or detected
@@ -228,7 +250,7 @@ shell string. Explicit options take precedence over configuration.
 
 Invalid JSON or invalid field types are errors, not absent config. `doctor`
 reports the selected path or error. `devices`, `logs`, `wait`, `history`,
-`status`, `stop` and `await` do not read the config and still work.
+`status`, `stop`, `await` and `feedback` do not read the config and still work.
 `doctor` also reports the loaded package version, source path and source digest
 (and Git revision when available). If the installed source changes, replies
 tell you to restart the client even when the package version did not change.
@@ -252,6 +274,39 @@ A build-timeout reply reports the effective budget and elapsed build time; its l
 header also records the build budget. Build logs store stdout followed by stderr,
 not one chronologically merged stream. A warning timestamp at the end of that file
 does not necessarily mark the build's last activity.
+
+## Feedback
+
+`feedback` submits a **public GitHub issue** to `sublimter/xcodebug`, not the
+current app's repository. It works without an Xcode project or connected device.
+Install GitHub CLI (`gh`) and authenticate with `gh auth login --hostname github.com`.
+
+```text
+/xcodebug feedback Log read timed out
+/xcodebug feedback title="Log read timed out" body="Steps and actual error"
+```
+In short-description mode, configuration fragments such as `scheme=MiDong`, unknown
+`key=value` text and flags are kept in the issue title, not interpreted as options.
+Actual `title`, `body` or `timeoutSeconds` options select parameter mode. It requires
+an explicit title (`title=` or `--title`) and rejects free-text descriptions. These names
+inside other flag values, such as `--grep title=missing`, do not select parameter mode.
+Use `feedback title="..." body="..." timeoutSeconds=5` instead of combining a short
+description with body or timeout options; mixed forms are rejected, not silently rewritten.
+Quote the whole description to send these fragments as text, e.g. `feedback 'body="literal"'`.
+The first declared action, including a quoted action word or one after leading options,
+cannot be overwritten by a conflicting `action=` or `--action` parameter.
+
+For MCP, pass `{"action":"feedback","title":"Log read timed out","body":"Steps and actual error"}`.
+`title` must be nonempty; `body` is optional and preserves Markdown and line breaks.
+Only this supplied text is submitted. No logs, local files, configuration or
+credentials are attached automatically. Review feedback for secrets before sending.
+
+The result includes the created issue URL. The default request timeout is 60 seconds;
+`timeoutSeconds` overrides it. Feedback follows the ordinary operation queue and
+cancellation rules, but never starts or stops a device capture and rejects `command=`.
+No submission is retried automatically. A timeout or cancellation may happen after
+GitHub created the issue: inspect the issue URL or repository before submitting again.
+
 
 ## Change detection and pod install
 

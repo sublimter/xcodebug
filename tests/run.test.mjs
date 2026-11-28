@@ -10,6 +10,7 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import xcodebug from "../index.ts";
 import { pullCrashReport } from "../devices.ts";
+import { mockPlatform } from "./platform-host.mjs";
 
 const DEVICE = { identifier: "test-device", properties: {
   hardware: { udid: "test-udid", reality: "physical" },
@@ -36,6 +37,7 @@ const INFO_PLIST = `<?xml version="1.0" encoding="UTF-8"?>
 //   builds      one line per xcodebuild build
 //   edit-during-build  the build finds the sources changed under it
 async function session(t) {
+  const setPlatform = mockPlatform(t, "darwin");
   const root = await mkdtemp(join(tmpdir(), "xcodebug-run-test-"));
   const bin = join(root, "bin");
   const repo = join(root, "repo");
@@ -209,7 +211,7 @@ exec /bin/sleep 120`);
     }
   });
   return {
-    root, repo, app, git, call, ok, notifications, messages, context, uiState, tool,
+    root, repo, app, git, call, ok, notifications, messages, context, uiState, tool, setPlatform,
     native: args => command.handler(args, context),
     shutdown: () => hooks.get("session_shutdown")(),
     logs: join(agent, "logs", "xcodebug"),
@@ -253,6 +255,20 @@ test("native command results retain failures without waking an unsolicited model
   await s.native("status push=wake");
   message = s.messages.at(-1);
   assert.deepEqual(message.options, { deliverAs: "steer", triggerTurn: true });
+});
+
+test("local capture queries and cleanup remain available without a Mac execution host", { timeout: 10_000 }, async t => {
+  const s = await session(t);
+  const launched = await s.ok({ action: "launch", ...s.prebuilt });
+  const id = launched.details.capture.id;
+  s.setPlatform("linux");
+  const waited = await s.ok({ action: "wait", captureId: id, match: "instance 1 logging", timeoutSeconds: 2 });
+  assert.equal(waited.details.matched, 1);
+  assert.match((await s.ok({ action: "logs", captureId: id })).content[0].text, /instance 1 logging/);
+  assert.ok((await s.ok({ action: "history" })).details.runs.some(run => run.captureId === id));
+  assert.ok((await s.ok({ action: "status" })).details.captures.some(capture => capture.id === id));
+  const stopped = await s.ok({ action: "stop" });
+  assert.equal(stopped.details.captures.find(capture => capture.id === id).running, false);
 });
 
 test("restart uses the original directory for config, build and the replayed command", { timeout: 30_000 }, async t => {

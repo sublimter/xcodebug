@@ -27,6 +27,8 @@ import { buildForDevice, consoleLaunchArgs, installApp, terminateApp, type Build
 import { checkPodLockSync, describeChanges, detectChanges, directorySignature, runPodInstall, type ChangeReport } from "./changes.ts";
 import { clearArchives, pruneLogs } from "./archive.ts";
 import { detectContainer, readConfigDetails, withContainer, type ProjectConfig } from "./project.ts";
+import { submitFeedback } from "./feedback.ts";
+import { availabilityError, platformNotice, shellUnavailable } from "./platform.ts";
 
 const CAPTURE_PREFIX = "xcodebug";
 const PUSH_INTERVAL_MS = 4_000;
@@ -65,7 +67,7 @@ const LOG_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
  * defaults the file was written to override. Listed as exemptions so that an
  * action added later refuses too.
  */
-const CONFIG_FREE_ACTIONS = new Set(["doctor", "devices", "logs", "wait", "history", "status", "stop", "await"]);
+const CONFIG_FREE_ACTIONS = new Set(["doctor", "devices", "logs", "wait", "history", "status", "stop", "await", "feedback"]);
 
 interface SessionState {
   captures: Map<string, Capture>;
@@ -347,6 +349,8 @@ function replyText(text: string, action?: string): string {
 }
 
 export default function xcodebug(pi: ExtensionAPI): void {
+  const hostNotice = platformNotice();
+  let platformNotified = false;
   const history = new RunHistory(LOG_RETENTION_MS);
   // Only explicit log queries advance the next wait. Evicting a capture releases its cursor.
   const queryCursors = new WeakMap<Capture, number>();
@@ -1324,6 +1328,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
     if (!params.command) {
       throw new Error('await needs command="<shell line>".');
     }
+    const unavailable = shellUnavailable(params.action);
+    if (unavailable) return { text: unavailable.content[0]!.text, details: unavailable.details, isError: true };
     // A shell line, not an argv: the user pastes what they would type, which
     // includes the `cd` into whatever repo owns the test runner.
     bin = "/bin/sh";
@@ -1427,9 +1433,10 @@ export default function xcodebug(pi: ExtensionAPI): void {
     stopContext?: { targets: Capture[]; cancelledOperations: number; cleanupPending: boolean },
   ): Promise<ActionResult> => {
     const action = params.action;
+    const onMac = process.platform === "darwin";
     const control = action === "stop" || (action === "status" && params.command === undefined);
     if (!control || !activeOperation) state.uiCtx = ctx;
-    const configRead = (action === "doctor" || (action !== "restart" && !CONFIG_FREE_ACTIONS.has(action)))
+    const configRead = ((action === "doctor" && onMac) || (action !== "restart" && !CONFIG_FREE_ACTIONS.has(action)))
       ? await readConfigDetails(projectRoot).then(
         ({ config, path }) => ({ config, path, error: undefined }),
         (error: Error) => ({ config: {} as ProjectConfig, path: undefined, error }),
@@ -1446,23 +1453,37 @@ export default function xcodebug(pi: ExtensionAPI): void {
       catch (error) { console.error("[xcodebug] could not prune run history:", error); }
     }
 
+    if (action === "feedback") {
+      setRunPhase("submitting GitHub feedback");
+      return submitFeedback(params.title!, params.body ?? "", (params.timeoutSeconds ?? 60) * 1000);
+    }
+
     if (action === "doctor") {
-      const checks = await Promise.all([
+      const checks = onMac ? await Promise.all([
         runCommand("xcodebuild", ["-version"], { timeoutMs: 30_000 }),
         runCommand("xcrun", ["devicectl", "--version"], { timeoutMs: 30_000 }),
         runCommand("idevicesyslog", ["--version"], { timeoutMs: 20_000 }),
-      ]);
+      ]) : undefined;
       const configLine = configRead.error?.message ?? configRead.path ?? "(none)";
+      const shell = shellUnavailable(action);
+      let logDirectory: string;
+      try { logDirectory = logDir(ctx); }
+      catch (error) { logDirectory = `unavailable (${error instanceof Error ? error.message : String(error)})`; }
       const lines = [
         `xcodebug: ${runtimeVersion.identity.version} (${runtimeVersion.identity.sourceDigest.slice(0, 8)})`,
         `source: ${runtimeVersion.identity.sourcePath}${runtimeVersion.identity.revision ? ` · ${runtimeVersion.identity.revision}` : ""}`,
-        `xcodebuild: ${checks[0].code === 0 ? checks[0].stdout.split("\n")[0] : "missing"}`,
-        `devicectl: ${checks[1].code === 0 ? (checks[1].stdout || checks[1].stderr).trim().split("\n")[0] : "missing"}`,
-        `idevicesyslog: ${checks[2].code === 0 ? (checks[2].stdout || checks[2].stderr).trim().split("\n")[0] : "missing (optional, syslog action only)"}`,
+        `platform: ${process.platform}`,
+        ...(checks ? [
+          `xcodebuild: ${checks[0].code === 0 ? checks[0].stdout.split("\n")[0] : "missing"}`,
+          `devicectl: ${checks[1].code === 0 ? (checks[1].stdout || checks[1].stderr).trim().split("\n")[0] : "missing"}`,
+          `idevicesyslog: ${checks[2].code === 0 ? (checks[2].stdout || checks[2].stderr).trim().split("\n")[0] : "missing (optional, syslog action only)"}`,
+        ] : [hostNotice]),
+        `command shell: /bin/sh (${shell ? "unavailable" : "available"})`,
         `config: ${configLine}`,
-        `log dir: ${logDir(ctx)}`,
+        `log dir: ${logDirectory}`,
       ];
-      return { content: [{ type: "text", text: lines.join("\n") }], details: { runtime: runtimeVersion.identity } };
+      return { content: [{ type: "text", text: lines.join("\n") }],
+        details: { runtime: runtimeVersion.identity, platform: process.platform, macOSAvailable: onMac, shellAvailable: !shell } };
     }
 
     if (action === "changes") {
@@ -2177,6 +2198,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
     callerSignal: AbortSignal | undefined,
     onUpdate: ActionUpdate | undefined,
   ): Promise<OperationResult> => {
+    const unavailable = availabilityError(params.action, params.command);
+    if (unavailable) return Promise.resolve({ ...unavailable, ranCommand: false });
     if (params.action === "logs" || params.action === "wait") requireCapture(params.captureId);
     if (params.action === "status" && params.command === undefined) {
       callerSignal?.throwIfAborted();
@@ -2225,7 +2248,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
     label: "Xcode Device Debug",
     description:
       "Build/install/launch an iOS app on a physical device and stream its Xcode-console output into this session. " +
-      "Actions: devices, changes, build, install, launch, syslog, logs, wait, history, status, stop, terminate, doctor, restart, await. " +
+      "Actions: devices, changes, build, install, launch, syslog, logs, wait, history, status, stop, terminate, doctor, restart, await, feedback. " +
       "build and launch first check the working tree: any source change rebuilds, and a new file inside a pod runs " +
       "pod install first. An unchanged tree reuses this session's build (force=true overrides). " +
       "launch restarts the app and captures stdout/stderr + os_log (no jailbreak, no LLDB). " +
@@ -2233,8 +2256,9 @@ export default function xcodebug(pi: ExtensionAPI): void {
       "stop cancels this session's executing and queued operations, then stops captures, even with no capture yet. " +
       "Use captureId to stop only that capture; keepApp=true leaves the app running. " +
       "restart rebuilds, reinstalls and relaunches the last app in this session, for a mid-run code edit; a command= that launch carried runs again afterwards, so restart alone closes the edit→restart→test loop. " +
-      "await runs a shell command (command=\"...\") to completion, then stops the capture it was watching and reports the exit code, so an automated run and its app-side log arrive together. Passing command= to launch runs it after the app is already up, which is the one-command linkage run.",
-    promptSnippet: "Build/launch an iOS app on a real device and read its console logs",
+      "await runs a shell command (command=\"...\") to completion, then stops the capture it was watching and reports the exit code, so an automated run and its app-side log arrive together. Passing command= to launch runs it after the app is already up, which is the one-command linkage run." +
+      (hostNotice ? ` ${hostNotice}` : ""),
+    promptSnippet: hostNotice || "Build/launch iOS apps, read console logs, or submit explicitly requested xcodebug feedback to GitHub",
     promptGuidelines: [
       "Use xcodebug instead of raw xcodebuild/devicectl when debugging on a physical iOS device; it keeps a cursor so xcodebug action=logs returns only new output.",
       "xcodebug action=launch restarts the app; use action=syslog when the app must keep running.",
@@ -2248,6 +2272,7 @@ export default function xcodebug(pi: ExtensionAPI): void {
       "A stop-requested cancellation is intentional; do not restart that work unless the user asks.",
       "Do not stop merely because the user has not acted and logs are quiet; say what to do on the phone and keep capturing. Always honor an explicit stop request.",
       "A capture also ends on its own when the app process exits, or when something else relaunched the app; status and logs then say why, and name the crash report if the device wrote one. Do not reconnect a run whose app the user deliberately closed.",
+      "feedback creates a public GitHub issue in sublimter/xcodebug from title/body. Only submit when the user explicitly requests feedback; never automatically upload logs, configuration or credentials, and never retry an uncertain submission.",
     ],
     // Own the ordinary queue so the host can admit stop while a tool call executes.
     executionMode: "parallel",
@@ -2278,8 +2303,8 @@ export default function xcodebug(pi: ExtensionAPI): void {
   };
 
   pi.registerCommand("xcodebug", {
-    description: "Build, install and launch on a device, then stream its console; stop cancels executing work and captures. " +
-      "command=\"<shell line>\" runs a test command to completion and stops its capture",
+    description: "Build, install and launch on a device, then stream its console; stop cancels executing work and captures; feedback submits a public GitHub issue. " +
+      "command=\"<shell line>\" runs a test command to completion and stops its capture" + (hostNotice ? ` ${hostNotice}` : ""),
     ...commandExtras,
     handler: async (args, ctx) => {
 
@@ -2358,6 +2383,10 @@ export default function xcodebug(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     state.uiCtx = ctx;
     refreshStatus();
+    if (hostNotice && ctx.hasUI && !platformNotified) {
+      platformNotified = true;
+      ctx.ui.notify(hostNotice, "warning");
+    }
   });
 
   pi.on("session_shutdown", async () => {

@@ -1,6 +1,6 @@
 ---
 name: xcodebug
-description: "Builds, launches, and captures console logs from physical iOS devices using the registered native xcodebug tool or a connected xcodebug MCP server. Use when the user invokes xcodebug, requests its doctor/devices/status/logs/wait/stop/restart actions, or wants to verify an iOS app on a real device using its console."
+description: "Builds, launches, and captures console logs from physical iOS devices using the registered native xcodebug tool or a connected xcodebug MCP server. Also submits explicitly requested xcodebug feedback as public GitHub issues. Use when the user invokes xcodebug, requests its doctor/devices/status/logs/wait/stop/restart/feedback actions, or wants to verify an iOS app on a real device using its console."
 ---
 
 # xcodebug
@@ -37,11 +37,20 @@ Both explicit invocation and a matching natural-language request can use this sk
   report a launch error without substituting a status query or another action.
   Only the pre-execution argument correction below permits a second call.
 - For `status`, call `{"action":"status"}` to inspect captures without launching.
+- For `feedback`, submit a public GitHub issue to `sublimter/xcodebug` only when the
+  user explicitly asks. Pass `action="feedback"`, `title`, and optional `body`;
+  a description following `feedback` supplies the title. If no title was supplied,
+  ask for the problem title and optional details instead of launching or inventing text.
+  Submit only user-supplied feedback: never attach conversation history, device logs,
+  configuration, files or credentials automatically. `feedback` does not require
+  project `cwd` and does not accept `command`. It requires an authenticated `gh` CLI.
+  Report the returned issue URL. An uncertain submission may already have created
+  an issue; do not retry or substitute a shell/network operation.
 - For an explicit action, call the selected tool with that action and the supplied
   parameters immediately. Do not replace execution with instructions for the user.
 - Accept `action [key=value ...]`, `action=... [key=value ...]`, or a JSON parameter
   object. Actions: `doctor`, `devices`, `changes`, `build`, `install`, `launch`,
-  `syslog`, `logs`, `wait`, `history`, `status`, `stop`, `terminate`, `restart`, `await`.
+  `syslog`, `logs`, `wait`, `history`, `status`, `stop`, `terminate`, `restart`, `await`, `feedback`.
   Native registered command text uses action/key=value syntax; pass JSON objects
   as structured tool/MCP arguments, not stringified native command text.
 - Use the live tool schema for parameter names and types. Preserve quoted strings,
@@ -94,6 +103,7 @@ Both explicit invocation and a matching natural-language request can use this sk
 | `history limit=5` | `{"action":"history","limit":5}` |
 | `stop captureId=console-123 keepApp=true` | `{"action":"stop","captureId":"console-123","keepApp":true}` |
 | `restart` | `{"action":"restart"}` |
+| `feedback title="Log read timed out" body="Steps and actual error"` | `{"action":"feedback","title":"Log read timed out","body":"Steps and actual error"}` |
 
 ## Follow a capture
 

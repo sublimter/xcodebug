@@ -8,8 +8,10 @@ import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import xcodebug from "../index.ts";
+import { mockPlatform } from "./platform-host.mjs";
 
 test("ended history stays bounded without evicting active or reconnecting captures", { timeout: 60_000 }, async t => {
+  mockPlatform(t, "darwin");
   const root = await mkdtemp(join(tmpdir(), "xcodebug-session-test-"));
   const bin = join(root, "bin");
   await mkdir(bin);
@@ -81,7 +83,8 @@ exec /bin/sleep 60
   assert.ok(final.every(capture => !capture.running));
 });
 
-test("stopping console stops its companion before the console writer drains", { timeout: 20_000 }, async () => {
+test("stopping console stops its companion before the console writer drains", { timeout: 20_000 }, async t => {
+  mockPlatform(t, "darwin");
   const root = await mkdtemp(join(tmpdir(), "xcodebug-companion-test-"));
   const bin = join(root, "bin");
   const oldPath = process.env.PATH;
